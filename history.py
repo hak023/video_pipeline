@@ -276,6 +276,16 @@ class HistoryManager:
                 "last_attempt": datetime.now().isoformat(),
             })
 
+    def previous_output(self, url: str) -> str | None:
+        """이 항목이 이전에 성공적으로 받은 파일 경로 (--force 재다운로드 때 '자기 파일'만 덮어쓰기 위해 사용)."""
+        key = normalize_url(url)
+        with self._lock:
+            for d, rk in self._loc.get(key, {}).items():
+                rec = self._load_partition(d).get(rk) or {}
+                if rec.get("status") == "ok" and rec.get("output_file"):
+                    return rec["output_file"]
+        return None
+
     def in_cooldown(self, url: str, hours: float, min_attempts: int = 2) -> bool:
         """같은 글이 min_attempts 회 이상 실패했고 마지막 시도가 hours 시간 이내면 True (재탐색 보류용).
         성공/건너뜀 기록이 하나라도 있으면 False. 이 판정은 글 URL 의 기록만 본다."""

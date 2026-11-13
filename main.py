@@ -94,27 +94,59 @@ class Options:
 
 # ------------------------------------------------------------------ names
 _names_lock = threading.Lock()
-_names_in_use: set[str] = set()
+_names_claimed: dict[str, str] = {}      # 소문자 파일명(확장자 제외) → 항목 키. 이번 실행에서 한 번 쓴 이름은 다른 항목이 쓰지 못한다
+_INDEX_SUFFIX_RE = re.compile(r" \(\d{2,3}\)$")
+MAX_NAME_LEN = 120
+PATH_BUDGET = 240                         # Windows MAX_PATH(260) - yt-dlp 임시 접미사(.f137.mp4.part-FragNNN 등) 여유
 
 
-def _reserve_name(name: str, url: str, out_dir: Path, force: bool) -> str:
-    """동시 실행/동일 제목 충돌 방지. 충돌하면 URL 해시를 덧붙여 고유 파일명 사용."""
-    base = sanitize_filename(name)
+def _name_limit(out_dir: Path) -> int:
+    """폴더 경로가 길면 파일명 상한을 줄여 임시 파일까지 MAX_PATH 를 넘지 않게 한다."""
+    try:
+        used = len(str(out_dir.resolve())) + 1
+    except OSError:
+        used = len(str(out_dir)) + 1
+    return max(40, min(MAX_NAME_LEN, PATH_BUDGET - used - 30))
+
+
+def _reserve_name(name: str, url: str, out_dir: Path, force: bool, prev_output: str | Path | None = None) -> str:
+    """파일명(확장자 제외)을 정한다. 서로 다른 항목이 같은 파일을 쓰지 않도록 보장한다.
+
+    - 끝의 ' (NN)'(여러 영상 글의 순번)은 제목이 길어 잘려도 보존한다.
+    - 비교는 대소문자를 무시한다 (Windows 는 'Movie' 와 'movie' 가 같은 파일).
+    - 같은 이름이 이번 실행에서 다른 항목에 쓰였거나 폴더에 이미 있으면 URL 해시(' [abc123]')를 덧붙인다.
+    - --force 는 '같은 항목이 이전에 받은 파일(prev_output)'만 덮어쓴다. 다른 글/영상의 파일은 덮어쓰지 않는다.
+    """
+    limit = _name_limit(out_dir)
+    m = _INDEX_SUFFIX_RE.search(name)
+    suffix = m.group(0) if m else ""
+    head = sanitize_filename(name[: m.start()] if m else name, max_len=max(10, limit - len(suffix)))
+    base = head + suffix
+    key = normalize_url(url)
+    prev_stem = Path(prev_output).stem.lower() if prev_output else None
+    existing = {f.stem.lower() for f in out_dir.iterdir() if f.is_file()} if out_dir.is_dir() else set()
+
+    def free(cand: str) -> bool:
+        low = cand.lower()
+        owner = _names_claimed.get(low)
+        if owner is not None and owner != key:
+            return False
+        if low in existing and owner != key and not (force and prev_stem == low):
+            return False
+        return True
+
     with _names_lock:
         cand = base
-        other_file_exists = any(
-            f.is_file() and f.stem == cand for f in out_dir.iterdir()
-        ) if out_dir.is_dir() else False
-        if cand.lower() in _names_in_use or (other_file_exists and not force):
-            h = hashlib.sha1(normalize_url(url).encode("utf-8")).hexdigest()[:6]
-            cand = f"{base[:100]} [{h}]"
-        _names_in_use.add(cand.lower())
+        if not free(cand):
+            h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:6]
+            room = max(10, limit - len(suffix) - 9)
+            cand = f"{head[:room].rstrip(' .')}{suffix} [{h}]"
+            n = 2
+            while not free(cand):     # 해시까지 충돌하는 극히 드문 경우
+                cand = f"{head[:room].rstrip(' .')}{suffix} [{h}-{n}]"
+                n += 1
+        _names_claimed[cand.lower()] = key
         return cand
-
-
-def _release_name(name: str) -> None:
-    with _names_lock:
-        _names_in_use.discard(name.lower())
 
 
 # ------------------------------------------------------------------ item pipeline
@@ -238,7 +270,8 @@ def _process_item(
 
         r = _download_candidate(cand, item_url=item_url, item_name=item_name, out_dir=out_dir,
                                 proxy=proxy, opts=opts, force=force, on_progress=on_progress,
-                                group_id=group.get("group_id"))
+                                group_id=group.get("group_id"),
+                                prev_output=history.previous_output(item_url) if (history and force) else None)
         st = r.pop("status")
         n_attempted += 1
         is_dead = r.pop("dead", False)
@@ -306,12 +339,12 @@ def _short_reason(dl_log: str) -> str:
 
 
 def _download_candidate(cand, *, item_url, item_name, out_dir, proxy, opts, force, on_progress,
-                        group_id=None) -> dict:
+                        group_id=None, prev_output=None) -> dict:
     """후보 1개 다운로드 + 검증. status: ok | short | failed | cancelled.
     시도 결과(헤더 프로필별/엔진별)와 검증 정보는 downloads.json 에 기록한다."""
     r: dict[str, Any] = {}
     diag = get_diagnostics()
-    safe_name = _reserve_name(item_name, item_url, out_dir, force)
+    safe_name = _reserve_name(item_name, item_url, out_dir, force, prev_output)
     attempts: list[dict[str, Any]] = []
     rec: dict[str, Any] = {"candidate_id": cand.get("candidate_id"), "group_id": group_id, "url": cand.get("url"),
                            "classification": cand.get("classification"), "item_name": item_name}
@@ -393,8 +426,6 @@ def _download_candidate(cand, *, item_url, item_name, out_dir, proxy, opts, forc
         log_exception("download", e, candidate_id=cand.get("candidate_id"))
         diag.download(**rec, status="ERROR", reason=f"{type(e).__name__}: {e}")
         raise
-    finally:
-        _release_name(safe_name)
 
 
 def _backoff(attempt: int, name: str, reason: str, limit: int) -> bool:

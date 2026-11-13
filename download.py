@@ -117,8 +117,21 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             pass
 
 
+# safe_name 뒤에 올 수 있는 yt-dlp/ffmpeg 산출물 접미사: mp4, mp4.part, f137.mp4, temp.mp4, mp4.part-Frag3, mp4.ytdl ...
+_OWN_SUFFIX_RE = re.compile(
+    r"^(?:(?:temp|f[\w-]+)\.)?[A-Za-z0-9]{2,4}(?:\.(?:part(?:-Frag\d+)?|ytdl|temp))*$"
+)
+
+
 def _related_files(out: pathlib.Path, safe_name: str) -> list[pathlib.Path]:
-    return [pathlib.Path(p) for p in glob.glob(str(out / (glob.escape(safe_name) + ".*")))]
+    """safe_name 의 산출물만. 'Vol' 이 'Vol.1.mp4'(다른 영상) 를 포함해 지우거나 크기에 합산하지 않도록 접미사를 검사한다."""
+    prefix = safe_name + "."
+    found = []
+    for p in glob.glob(str(out / (glob.escape(safe_name) + ".*"))):
+        path = pathlib.Path(p)
+        if _OWN_SUFFIX_RE.match(path.name[len(prefix):]):
+            found.append(path)
+    return found
 
 
 def _dir_size(files: list[pathlib.Path]) -> int:

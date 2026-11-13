@@ -420,6 +420,7 @@ Playwright 페이지와 프레임에 다음 이벤트 수집기를 연결한다.
 | 2026-11-13 | (검증) `--crawl` | 테스트 페이지 선정: 로컬 카탈로그(2페이지, article/time, 날짜 필터) + 실제 공개 영상(Blender Big Buck Bunny: mux HLS 465MB, archive.org mp4 59MB) + 로컬 생성 영상. 실제 공개 영상 2건 다운로드·검증 성공, 광고만 있는 글 `no_main_found`, 오래된 글 날짜 필터 제외, 광고+본편/HLS/playlist 정상 | 완료 | 외부 카탈로그 사이트 크롤은 미실시(§13.4-1) |
 | 2026-11-13 | `media_grouping.py` | 크롤 테스트에서 발견한 버그 수정: 리다이렉트로 호스트가 달라진 같은 파일(DOM 후보 + 네트워크 후보)이 서로 다른 영상으로 그룹화되어 중복 다운로드되던 문제 → 파일명·용량이 같으면 `SAME_FILE` 로 병합 | 완료 | 단위 테스트 추가 |
 | 2026-11-13 | `tests/test_e2e_crawl.py` | 외부 네트워크 없는 `--crawl` E2E 5건 저장소 편입. 단위 테스트 43건 + E2E 11건 | 완료 | §13.1 |
+| 2026-11-13 | `main.py`, `download.py`, `history.py` | **파일 네이밍 점검 및 덮어쓰기 버그 수정.** 확인된 문제: ①긴 제목에서 ` (NN)` 이 120자 제한에 잘려 `--force` 시 영상 여러 개가 한 파일로 덮어쓰임 ②`--force` 가 같은 제목의 다른 글 파일을 덮어씀 ③대소문자만 다른 제목이 Windows 에서 충돌 ④`Vol` 실패 정리가 완료된 `Vol.1.mp4` 삭제. 수정: 순번 보존 truncation, 대소문자 무시 충돌 검사, 실행 내 이름 점유 레지스트리, `--force` 는 같은 항목의 이전 파일(`history.previous_output`)만 덮어쓰기, 경로 길이 반영, 산출물 접미사 정규식 | 완료 | `tests/test_naming.py` 11건. 실제 다운로드 검증: 130자 한글 제목 12영상(순번·내용 순서 일치), 같은 제목/대소문자 충돌 글, 재실행 무변경, `--force` 후 파일 수·이름 동일 |
 | 2026-11-13 | 저장소 | https://github.com/hak023/video_pipeline `main` 브랜치에 업로드(`.gitignore`: logs/out/history_data/ad_blacklist.json 등 런타임 산출물 제외) | 완료 | |
 
 남은 과제 (우선순위는 §13.4):
