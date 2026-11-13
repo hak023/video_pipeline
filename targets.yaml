@@ -1,0 +1,11 @@
+targets:
+  - name: mux-bbb-hls
+    page_url: "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+    license: "CC BY (Blender Foundation)"
+    wait_ms: 3000
+
+  - name: s28-test
+    page_url: "https://s28.testonline.co/test/"
+    license: "integration test"
+    wait_ms: 12000
+    click_selector: "iframe >> video, .plyr__control--overlaid, button[aria-label*='Play'], .vjs-big-play-button"
