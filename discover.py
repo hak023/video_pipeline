@@ -1181,14 +1181,18 @@ def discover_videos(
                 for g in need_b:
                     embed_url = g.get("embed_url")
                     target_frame, click_point = _find_embed_frame(
-                        page, embed_url or ""
+                        page,
+                        embed_url or "",
+                        debug=g["debug"],
                     )
 
                     if target_frame is None:
+                        match_info = g["debug"].get("iframe_match", {})
                         g["debug"]["inpage"] = {
                             "player_found": 0,
                             "rejected": [],
-                            "reason": "target_embed_frame_not_unique",
+                            "reason": match_info.get("status", "target_embed_frame_not_found"),
+                            "iframe_match": match_info,
                         }
                         log_event(
                             "media_discovery",
@@ -1197,9 +1201,12 @@ def discover_videos(
                             level="WARNING",
                             page_url=page_url,
                             frame_url=embed_url,
+                            iframe_match=g["debug"].get("iframe_match"),
                         )
-                        continue
 
+                        # 기존 continue 유지
+                        continue                    
+                    
                     active_player["index"] = g["index"]
                     active_player["frame"] = target_frame
                     before = set(player_found)
