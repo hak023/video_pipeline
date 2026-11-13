@@ -20,6 +20,17 @@ def resolve_chrome_channel() -> str | None:
     return None
 
 
+def _sandbox_args() -> list[str]:
+    """Chrome 샌드박스는 광고(악성 스크립트) 페이지로부터 PC 를 보호하는 마지막 방어선이라 기본으로 켠다.
+    Windows 일반 사용자 실행에서는 필요 없고, Linux root/컨테이너처럼 켤 수 없을 때만 해제한다.
+    (환경변수 VP_NO_SANDBOX=1 로 강제 해제 가능)"""
+    if os.environ.get("VP_NO_SANDBOX") == "1":
+        return ["--no-sandbox"]
+    if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        return ["--no-sandbox"]
+    return []
+
+
 def get_browser_launch_kwargs(
     headless: bool = True,
     proxy: str | None = None,
@@ -29,7 +40,7 @@ def get_browser_launch_kwargs(
         "headless": headless,
         "args": [
             "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
+            *_sandbox_args(),
         ],
     }
     channel = resolve_chrome_channel()
@@ -40,6 +51,11 @@ def get_browser_launch_kwargs(
         kwargs["proxy"] = {"server": proxy}
 
     return kwargs
+
+
+def get_context_kwargs(user_agent: str) -> dict[str, Any]:
+    """브라우저 컨텍스트 공통 옵션. 광고가 유발하는 자동 파일 다운로드(.exe/.apk 등)는 받지 않는다."""
+    return {"user_agent": user_agent, "locale": "ko-KR", "accept_downloads": False}
 
 
 def resolve_ffmpeg() -> Path | None:

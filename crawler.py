@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 
 from playwright.sync_api import sync_playwright
 
-from media_tools import get_browser_launch_kwargs
+from media_tools import get_browser_launch_kwargs, get_context_kwargs
 from diagnostics import attach_page_diagnostics, get_diagnostics, log_event, log_exception
 
 MONTH_NAMES = {
@@ -227,10 +227,8 @@ def crawl_page(
     with sync_playwright() as p:
         launch_kwargs = get_browser_launch_kwargs(headless=headless, proxy=proxy)
         browser = p.chromium.launch(**launch_kwargs)
-        ctx = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            locale="ko-KR",
-        )
+        ctx = browser.new_context(**get_context_kwargs(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"))
         # Anti-detection stealth script
         ctx.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });

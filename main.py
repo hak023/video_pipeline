@@ -5,6 +5,7 @@ import hashlib
 import json
 import random
 import re
+import shutil
 import sys
 import threading
 import time
@@ -48,6 +49,40 @@ MAX_CONCURRENT_BROWSERS = 3           # Chromium 동시 실행 수 (메모리/�
 MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".m4a", ".ts", ".mov"}
 DONE_STATES = {"ok", "skipped", "skipped_short"}
 MAX_CANDIDATES_TRIED = 3              # 한 영상에서 후보 URL을 최대 몇 개까지 시도할지
+
+
+MIN_FREE_BYTES = 3 * 1024 ** 3        # 다운로드 시작 전 최소 여유 공간. 가혹한 환경에서 광고/대용량 스트림으로 디스크가 차는 것 방지
+
+
+def _env_info() -> dict[str, str]:
+    """원격 진단용 환경 버전 (summary.json meta). 실패해도 실행에는 영향 없음."""
+    import platform
+    import subprocess
+    info: dict[str, str] = {"python": platform.python_version(), "os": platform.platform()}
+    for mod in ("playwright", "yt_dlp"):
+        try:
+            from importlib.metadata import version
+            info[mod] = version(mod.replace("_", "-"))
+        except Exception:
+            info[mod] = "?"
+    try:
+        from media_tools import resolve_ffmpeg
+        ff = resolve_ffmpeg()
+        out = subprocess.run([str(ff), "-version"], capture_output=True, text=True, timeout=10).stdout if ff else ""
+        info["ffmpeg"] = (out.splitlines() or ["?"])[0][:60]
+    except Exception:
+        info["ffmpeg"] = "?"
+    return info
+
+
+def _free_space_problem(out_dir: Path) -> str | None:
+    try:
+        free = shutil.disk_usage(out_dir).free
+    except OSError:
+        return None
+    if free < MIN_FREE_BYTES:
+        return f"디스크 여유 공간 부족: {free / 1024 ** 3:.1f}GB < {MIN_FREE_BYTES / 1024 ** 3:.0f}GB ({out_dir})"
+    return None
 
 
 # ------------------------------------------------------------------ library (파일명 매칭)
@@ -350,6 +385,13 @@ def _download_candidate(cand, *, item_url, item_name, out_dir, proxy, opts, forc
     rec: dict[str, Any] = {"candidate_id": cand.get("candidate_id"), "group_id": group_id, "url": cand.get("url"),
                            "classification": cand.get("classification"), "item_name": item_name}
     t0 = time.monotonic()
+    low_space = _free_space_problem(out_dir)
+    if low_space:      # 이 문제는 재시도해도 해결되지 않으므로 fatal
+        r.update(status="failed", reason=low_space, fatal=True)
+        diag.download(**rec, status="FAILED", reason=low_space)
+        log_event("download", "low_disk_space", low_space, level="ERROR", candidate_id=cand.get("candidate_id"))
+        diag.fail("download", low_space)
+        return r
     try:
         with diag.stage("download"):
             ok, dl_log = download(
@@ -1015,7 +1057,7 @@ def main() -> None:
     diag = init_diagnostics(LOG_DIR, retain=args.log_retain, meta={
         "mode": "url" if args.url else "crawl" if args.crawl else "discover_only" if args.discover_only else "targets",
         "workers": args.workers, "attempts": args.attempts, "skip_under": args.skip_under,
-        "headless": headless, "proxy": bool(args.proxy), "force": args.force,
+        "headless": headless, "proxy": bool(args.proxy), "force": args.force, "env": _env_info(),
     })
     diag.add_snapshot("blacklist.json", blacklist.snapshot)
     log(f"[진단] 실행 ID {diag.run_id} → 로그: {diag.dir}")

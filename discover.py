@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import itertools
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -22,7 +23,7 @@ from diagnostics import (
 )
 from media_classifier import classify_candidate, strong_ad_rules
 from media_grouping import group_candidates, order_attempts
-from media_tools import get_browser_launch_kwargs
+from media_tools import get_browser_launch_kwargs, get_context_kwargs
 from progress import log
 
 
@@ -808,6 +809,28 @@ def _launch_browser(p, headless: bool, proxy: str | None):
 
 
 MAX_VIDEOS_PER_PAGE = 50
+DISCOVER_BUDGET_SEC = 360      # 글 1개의 탐색(임베드 순회) 시간 예산. 광고 iframe 이 많은 글에서 끝없이 늘어지는 것을 막는다
+
+
+def _site_key(host: str) -> str:
+    parts = [x for x in (host or "").lower().split(".") if x]
+    if len(parts) >= 3 and parts[-2] in {"co", "com", "or", "ne", "go", "ac", "org", "net"} and len(parts[-1]) == 2:
+        return parts[-3]
+    return parts[-2] if len(parts) >= 2 else (host or "").lower()
+
+
+def _page_hijacked(page, page_url: str) -> bool:
+    """글 페이지가 광고 스크립트에 의해 다른 사이트로 이동했는지 (같은 사이트의 미러/서브도메인은 정상)."""
+    try:
+        now = _host(page.url)
+    except Exception:
+        return False
+    if not now or _site_key(now) == _site_key(_host(page_url)):
+        return False
+    log(f"  [하이재킹] 글 페이지가 다른 사이트로 이동됨({now}) → 해당 페이지에서의 재생/클릭을 생략")
+    log_event("navigation", "page_hijacked", f"글 페이지가 다른 사이트로 이동됨: {now}", level="WARNING",
+              page_url=page_url, final_host=now)
+    return True
 
 # 페이지 내 모든 임베드 플레이어 URL을 DOM 순서대로 수집
 _EMBED_JS = """() => {
@@ -900,10 +923,12 @@ def discover_videos(
     groups: list[dict[str, Any]] = []
     diag = get_diagnostics()
     diag.note_page(page_url)
+    budget_sec = int(os.environ.get("VP_DISCOVER_BUDGET", DISCOVER_BUDGET_SEC))
+    deadline = time.monotonic() + budget_sec
 
     with sync_playwright() as p:
         browser = _launch_browser(p, headless, proxy)
-        ctx = browser.new_context(user_agent=ua, locale="ko-KR")
+        ctx = browser.new_context(**get_context_kwargs(ua))
         ctx.add_init_script(_STEALTH_JS)
 
         # 광고 팝업: 우리가 만든 페이지가 아닌 새 탭은 모두 즉시 닫기
@@ -949,8 +974,16 @@ def discover_videos(
             log_event("media_discovery", "embeds_detected", f"임베드 플레이어 {len(embed_urls)}개 감지",
                       page_url=page_url, embeds=[str(u)[:150] for u in embed_urls])
 
-            # ---- A) 임베드 직접 열기
+            # ---- A) 임베드 직접 열기 (페이지당 시간 예산 안에서; 초과분은 빈 항목으로 남겨 인덱스를 고정)
             for i, eu in enumerate(embed_urls, 1):
+                if time.monotonic() > deadline:
+                    log_event("media_discovery", "budget_exceeded", f"탐색 시간 예산({budget_sec}s) 초과: 임베드 {i}번째부터 생략",
+                              level="WARNING", page_url=page_url, skipped=len(embed_urls) - i + 1)
+                    log(f"  [시간 초과] 탐색 예산 {budget_sec}초 초과 → 임베드 {i}~{len(embed_urls)}번 생략")
+                    for j in range(i, len(embed_urls) + 1):
+                        groups.append({"index": j, "embed_url": embed_urls[j - 1], "candidates": [],
+                                       "debug": {"headless": headless, "skipped": "discover_budget"}})
+                    break
                 if len(embed_urls) > 1:
                     log(f"    [{i}/{len(embed_urls)}] 스트림 추출: {eu[:90]}")
                 dbg: dict[str, Any] = {"headless": headless}
@@ -961,7 +994,13 @@ def discover_videos(
                 groups.append({"index": i, "embed_url": eu, "candidates": infos, "debug": dbg})
 
             # ---- B) 본편(m3u8/mpd/충분한 길이의 mp4)을 못 얻은 플레이어: 글 페이지에서 직접 재생
-            need_b = [g for g in groups if not _has_real_stream(g["candidates"])]
+            need_b = [g for g in groups if not g["debug"].get("skipped") and not _has_real_stream(g["candidates"])]
+            if need_b and not page_closed and _page_hijacked(page, page_url):
+                need_b = []     # 광고가 글 페이지를 다른 사이트로 옮겼다: 그 사이트에서는 클릭/재생하지 않는다
+            if need_b and not page_closed and time.monotonic() > deadline:
+                log_event("media_discovery", "budget_exceeded", "탐색 시간 예산 초과: 글 페이지 직접 재생(B) 생략", level="WARNING",
+                          page_url=page_url)
+                need_b = []
             if need_b and not page_closed:
                 log("  → 임베드 직접 열기로 본편을 못 찾음: 글 페이지에서 직접 재생을 시도합니다")
                 log_event("media_discovery", "inpage_play", "글 페이지에서 직접 재생 시도(B)", page_url=page_url, players=len(need_b))
