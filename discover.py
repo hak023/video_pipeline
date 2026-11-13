@@ -311,7 +311,8 @@ def _find_embed_frame(
             resolved_src = urljoin(page.url, src).split("#", 1)[0]
 
             element = locator.element_handle()
-            frame = element.content_frame if element else None
+            
+            frame = element.content_frame() if element else None
             frame_url = (frame.url or "").split("#", 1)[0] if frame else ""
 
             # src는 원본 iframe 주소, frame.url은 리다이렉트 후 주소일 수 있다.
