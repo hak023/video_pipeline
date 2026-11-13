@@ -86,7 +86,7 @@ class CrawlE2ETests(unittest.TestCase):
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
-        bl = ad_blacklist.AdBlacklistStack(cls.tmp / "bl.json", extra_file=cls.tmp / "none.txt")
+        bl = ad_blacklist.AdBlacklistStack(cls.tmp / "bl.json")
         orig = dl.download
         cls.out_dir = cls.tmp / "out"
         cls.out_dir.mkdir()

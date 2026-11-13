@@ -60,7 +60,7 @@ class HostileE2ETests(unittest.TestCase):
         cls.base = f"http://127.0.0.1:{port}"
         cls.out_dir = cls.tmp / "out"
         cls.out_dir.mkdir()
-        bl = ad_blacklist.AdBlacklistStack(cls.tmp / "bl.json", extra_file=cls.tmp / "none.txt")
+        bl = ad_blacklist.AdBlacklistStack(cls.tmp / "bl.json")
         orig = dl.download
         for p in (mock.patch.object(discover, "blacklist", bl), mock.patch.object(main, "blacklist", bl),
                   mock.patch.object(main, "download", lambda *a, **k: orig(*a, allow_private=True, **k)),
