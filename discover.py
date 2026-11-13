@@ -281,6 +281,43 @@ def _host(url: str) -> str:
     except Exception:
         return ""
 
+def _is_descendant_frame(frame: Any, root: Any) -> bool:
+    """frame이 root 프레임 자체이거나 그 하위 프레임인지 확인."""
+    current = frame
+    while current is not None:
+        if current == root:
+            return True
+        current = current.parent_frame
+    return False
+
+
+def _find_embed_frame(page: Any, embed_url: str) -> tuple[Any | None, tuple[float, float] | None]:
+    """페이지 DOM에서 embed_url과 일치하는 iframe 및 중앙 클릭 좌표를 찾는다.
+
+    여러 iframe이 같은 URL을 가리키거나 iframe을 찾지 못하면 추측해서 선택하지 않는다.
+    """
+    matches = []
+    expected = embed_url.split("#", 1)[0]
+
+    for locator in page.locator("iframe").all():
+        try:
+            src = locator.get_attribute("src") or ""
+            resolved = urljoin(page.url, src).split("#", 1)[0]
+            if resolved != expected:
+                continue
+
+            element = locator.element_handle()
+            frame = element.content_frame if element else None
+            box = locator.bounding_box()
+            if frame is not None and box:
+                point = (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                matches.append((frame, point))
+        except Exception:
+            continue
+
+    if len(matches) != 1:
+        return None, None
+    return matches[0]
 
 def _has_real_stream(candidates) -> bool:
     """재생 루프를 멈춰도 될 만큼 '본편일 가능성이 있는' 후보가 있는지.
@@ -305,10 +342,17 @@ def _has_real_stream(candidates) -> bool:
     return False
 
 
-def _eval_frames(page, js: str, hosts: set[str] | None = None) -> list[Any]:
-    """지정한 호스트의 프레임(없으면 전체)에서 JS 실행. 광고 iframe 은 건드리지 않는다."""
+def _eval_frames(
+    page,
+    js: str,
+    hosts: set[str] | None = None,
+    target_frame: Any | None = None,
+) -> list[Any]:
+    """허용된 프레임에서만 JS를 실행한다."""
     out: list[Any] = []
     for fr in page.frames:
+        if target_frame is not None and not _is_descendant_frame(fr, target_frame):
+            continue
         if hosts is not None and _host(fr.url) not in hosts:
             continue
         try:
@@ -372,32 +416,46 @@ def _media_candidate(
         return None
 
     frame_url = ""
+    response_frame = None
+    is_main_frame = False
+
     try:
-        frame_url = resp.frame.url
+        response_frame = resp.frame
+        frame_url = response_frame.url
+        is_main_frame = response_frame.parent_frame is None
     except Exception:
         pass
+
+    request_headers = {}
+    try:
+        request_headers = {
+            k.lower(): v for k, v in resp.request.all_headers().items()
+        }
+    except Exception:
+        pass
+
     if allowed_hosts is not None:
         fh = _host(frame_url)
-        if not fh:
-            try:
-                hdr = resp.request.all_headers()
-            except Exception:
-                hdr = {}
-            fh = _host(hdr.get("origin") or "") or _host(hdr.get("referer") or "")
-            frame_url = frame_url or (hdr.get("referer") or "")
-        if fh not in allowed_hosts:
-            why = f"other_frame:{fh or '?'}"
+
+        # 플레이어 호스트 자체에서 온 요청은 허용한다.
+        # 플레이어 클릭 중 최상위 글 페이지에서 발생한 요청은 호출부에서 별도 귀속한다.
+        if fh not in allowed_hosts and not is_main_frame:
+            why = f"frame_unresolved:{fh or '?'}"
             if trace is not None and len(trace) < 12:
                 trace.append({"url": u[:140], "why": why})
-            get_diagnostics().candidate({
-                "url": u, "content_type": ctype, "status": resp.status, "frame_url": frame_url, "source": "network",
-                "classification": "AD", "ad_score": 0, "excluded_reason": why,
-                "ad_evidence": [{"rule": "EXCLUDED_OTHER_FRAME", "points": 0, "detail": fh or "?"}],
-            })
+            # 프레임 귀속 실패는 광고 판정이 아니다. AD 후보를 만들지 않는다.
             return None
+
     return {
-        "url": u, "content_type": ctype, "referer": referer, "frame_url": frame_url, "status": resp.status,
-        "content_length": _resp_total_length(resp), "first_seen": now_iso(), "source": "network",
+        "url": u,
+        "content_type": ctype,
+        "referer": referer,
+        "frame_url": frame_url,
+        "frame_role": "main" if is_main_frame else "child",
+        "status": resp.status,
+        "content_length": _resp_total_length(resp),
+        "first_seen": now_iso(),
+        "source": "network",
         "request_headers": _safe_request_headers(resp),
     }
 
@@ -426,6 +484,8 @@ def _play_until_stream(
     click_hosts: set[str] | None = None,
     video_hosts: set[str] | None = None,
     use_player_center: bool = False,
+    target_frame: Any | None = None,
+    click_point: tuple[float, float] | None = None,
 ) -> bool:
     """재생을 여러 번 시도해 '본편' 스트림이 나올 때까지 진행. 본편이 확인되면 True.
 
@@ -437,20 +497,29 @@ def _play_until_stream(
     for rnd in range(MAX_PLAY_ROUNDS):
         if rnd > 0:
             try:
-                pt = page.evaluate(_PLAYER_CENTER_JS) if use_player_center else None
+                pt = click_point
+                if pt is None and use_player_center:
+                    pt = page.evaluate(_PLAYER_CENTER_JS)
                 if not pt:
                     vp = page.viewport_size or {"width": 1280, "height": 720}
-                    pt = {"x": vp["width"] / 2, "y": vp["height"] / 2}
-                page.mouse.click(pt["x"], pt["y"])
+                    pt = (vp["width"] / 2, vp["height"] / 2)
+
+                if isinstance(pt, dict):
+                    page.mouse.click(pt["x"], pt["y"])
+                else:
+                    page.mouse.click(pt[0], pt[1])
             except Exception as e:
                 if _is_closed_error(e):
                     raise
             page.wait_for_timeout(800)
-        _eval_frames(page, _CLICK_BTN_JS, click_hosts)
-        _eval_frames(page, _PLAY_VIDEO_JS, video_hosts)
+
+        _eval_frames(page, _CLICK_BTN_JS, click_hosts, target_frame)
+        _eval_frames(page, _PLAY_VIDEO_JS, video_hosts, target_frame)
         page.wait_for_timeout(2000 if rnd == 0 else 2500)
-        longest = max([v for v in _eval_frames(page, _VIDEO_STATE_JS, video_hosts)
-                       if isinstance(v, (int, float))] or [0])
+        longest = max([
+            v for v in _eval_frames(page, _VIDEO_STATE_JS, video_hosts, target_frame)
+            if isinstance(v, (int, float))
+        ] or [0])
         confirmed = longest > REAL_VIDEO_SECONDS or any(
             isinstance(c, dict) and (c.get("dom_duration") or 0) >= REAL_VIDEO_SECONDS for c in captured.values())
         if _has_real_stream(captured.values() if isinstance(captured, dict) else captured) or longest > REAL_VIDEO_SECONDS:
@@ -884,6 +953,10 @@ def discover_videos(
          '플레이어 iframe 에서 발생한 요청'만 수집 (도메인 잠금/클릭 2회 구조 대응)
       C) 임베드가 아예 없는 페이지: 클릭 후 네트워크/DOM 에서 탐색 (프레임 제한 없이 수집 후 판별)
     """
+    active_player: dict[str, Any] = {
+        "index": None,
+        "frame": None,
+    }
     found: dict[str, dict[str, Any]] = {}           # 모든 프레임의 미디어 (C 용)
     player_found: dict[str, dict[str, Any]] = {}    # 플레이어 프레임에서 발생한 미디어만 (B 용)
     player_hosts: set[str] = set()
@@ -908,13 +981,48 @@ def discover_videos(
                               "request_headers": _safe_request_headers(resp)}
         if player_hosts:
             try:
-                c = _media_candidate(resp, page_url, player_hosts, trace_b)
-            except Exception as e:
-                log_exception("media_discovery", e, page_url=page_url)
-                return
-            if c and c["url"] not in player_found and len(player_found) < MAX_CAPTURED:
-                c["play_order"] = len(player_found) + 1
-                player_found[c["url"]] = c
+                response_frame = resp.frame
+            except Exception:
+                response_frame = None
+
+            target_frame = active_player["frame"]
+            group_index = active_player["index"]
+
+            # B 경로에서는 현재 재생 중인 플레이어와 연결된 응답만 받는다.
+            if group_index is not None:
+                is_main = False
+                try:
+                    is_main = response_frame.parent_frame is None
+                except Exception:
+                    pass
+
+                belongs_to_active = (
+                    is_main
+                    or (
+                        target_frame is not None
+                        and response_frame is not None
+                        and _is_descendant_frame(response_frame, target_frame)
+                    )
+                )
+                if not belongs_to_active:
+                    return
+
+                try:
+                    c = _media_candidate(
+                        resp,
+                        page_url,
+                        player_hosts,
+                        trace_b,
+                    )
+                except Exception as e:
+                    log_exception("media_discovery", e, page_url=page_url)
+                    return
+
+                if c:
+                    c["inpage_group_index"] = group_index
+                    if c["url"] not in player_found and len(player_found) < MAX_CAPTURED:
+                        c["play_order"] = len(player_found) + 1
+                        player_found[c["url"]] = c
 
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     page_closed = False
@@ -1004,12 +1112,79 @@ def discover_videos(
                 log("  → 임베드 직접 열기로 본편을 못 찾음: 글 페이지에서 직접 재생을 시도합니다")
                 log_event("media_discovery", "inpage_play", "글 페이지에서 직접 재생 시도(B)", page_url=page_url, players=len(need_b))
                 try:
-                    _play_until_stream(
-                        page, player_found, wait_ms,
-                        click_hosts=set(player_hosts) | {_host(page_url)},
-                        video_hosts=set(player_hosts),
-                        use_player_center=True,
-                    )
+                for g in need_b:
+                    embed_url = g.get("embed_url")
+                    target_frame, click_point = _find_embed_frame(page, embed_url or "")
+
+                    if target_frame is None:
+                        g["debug"]["inpage"] = {
+                            "player_found": 0,
+                            "rejected": [],
+                            "reason": "target_embed_frame_not_unique",
+                        }
+                        log_event(
+                            "media_discovery",
+                            "player_frame_unresolved",
+                            "임베드 URL과 연결되는 iframe을 하나로 특정하지 못함",
+                            level="WARNING",
+                            page_url=page_url,
+                            frame_url=embed_url,
+                        )
+                        continue
+
+                    active_player["index"] = g["index"]
+                    active_player["frame"] = target_frame
+                    before = set(player_found)
+
+                    try:
+                        _play_until_stream(
+                            page,
+                            player_found,
+                            wait_ms,
+                            target_frame=target_frame,
+                            click_point=click_point,
+                        )
+                    except Exception as e:
+                        if _is_closed_error(e):
+                            page_closed = True
+                            break
+                        log(f"  [Play Warning] {str(e).splitlines()[0]}")
+                        log_exception("media_discovery", e, page_url=page_url)
+
+                    active_player["index"] = None
+                    active_player["frame"] = None
+
+                    mine = [
+                        c for url, c in player_found.items()
+                        if url not in before
+                        and c.get("inpage_group_index") == g["index"]
+                    ]
+                    mine = _prune_segments(mine)
+
+                    g["debug"]["inpage"] = {
+                        "player_found": len(mine),
+                        "rejected": trace_b[:12],
+                        "frames": [fr.url[:100] for fr in page.frames],
+                    }
+
+                    if mine:
+                        cookies = _collect_cookies(
+                            ctx,
+                            [c["url"] for c in mine] + [g["embed_url"]],
+                        )
+                        have = {x["url"] for x in g["candidates"]}
+                        for c in mine:
+                            c.update(
+                                referer=g["embed_url"],
+                                user_agent=ua,
+                                page_url=page_url,
+                                cookies=cookies,
+                                embed_url=g["embed_url"],
+                                source="network_inpage",
+                            )
+                        g["candidates"] += [
+                            c for c in mine if c["url"] not in have
+                        ]
                 except Exception as e:
                     if _is_closed_error(e):
                         page_closed = True
