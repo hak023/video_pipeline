@@ -345,29 +345,6 @@ def _is_special_stream_url(u: str) -> bool:
     return host.endswith("ssrr.org") or "sora" in [s.lower() for s in p.path.split("/")]
 
 
-def _frame_in_allowed_hosts(frame_url: str, allowed_hosts: set[str] | None, referer: str = "", request_headers: dict | None = None) -> bool:
-    """프레임 호스트가 허용 목록에 없더라도 같은 페이지/같은 플레이어 소속이면 통과.
-
-    광고 iframe 과 동일 사이트 페이지를 구분하기 위해, referer/origin 헤더와 같은 페이지 호스트를 보조 신호로 사용한다.
-    """
-    if allowed_hosts is None:
-        return True
-    fh = _host(frame_url)
-    if fh and fh in allowed_hosts:
-        return True
-    page_host = _host(referer)
-    if page_host and fh and fh == page_host and page_host in allowed_hosts:
-        return True
-    hdr = request_headers or {}
-    for key in ("referer", "origin"):
-        host = _host(str(hdr.get(key) or ""))
-        if host and host in allowed_hosts:
-            return True
-    if page_host and page_host in allowed_hosts:
-        return True
-    return False
-
-
 def _media_candidate(
     resp,
     referer: str,
@@ -377,8 +354,7 @@ def _media_candidate(
     """응답이 미디어이면 후보 dict, 아니면 None. 광고 여부는 여기서 판단하지 않는다(수집과 판별 분리).
 
     allowed_hosts 가 주어지면(B 단계) 요청을 일으킨 프레임의 호스트가 플레이어 호스트일 때만 인정한다.
-    프레임을 알 수 없는 요청(Web Worker 등)은 Origin/Referer 헤더의 호스트로 귀속한다.
-    제외된 요청은 trace 와 후보 로그(excluded_reason)에 사유와 함께 기록한다.
+    frame_url 이 허용 목록에 없더라도 page/referer/origin 이 허용 목록과 같은 호스트면 통과한다.
     """
     u = resp.url
     path = urlparse(u).path.lower()
@@ -400,14 +376,16 @@ def _media_candidate(
         frame_url = resp.frame.url
     except Exception:
         pass
-    request_headers = {}
-    try:
-        request_headers = resp.request.all_headers()
-    except Exception:
-        pass
     if allowed_hosts is not None:
-        if not _frame_in_allowed_hosts(frame_url, allowed_hosts, referer, request_headers):
-            fh = _host(frame_url)
+        fh = _host(frame_url)
+        if not fh:
+            try:
+                hdr = resp.request.all_headers()
+            except Exception:
+                hdr = {}
+            fh = _host(hdr.get("origin") or "") or _host(hdr.get("referer") or "")
+            frame_url = frame_url or (hdr.get("referer") or "")
+        if fh not in allowed_hosts:
             why = f"other_frame:{fh or '?'}"
             if trace is not None and len(trace) < 12:
                 trace.append({"url": u[:140], "why": why})
@@ -818,7 +796,7 @@ try {
 
 
 def _launch_browser(p, headless: bool, proxy: str | None):
-    """headless 일 때 '새 headless 모드'(full Chromium)를 우선 사용 - 구형 headless-shell 보다 봇 탐지에 덜 걸린다.
+    """headless 일 때 '새 headless 모드'(full Chromium)를 우선 사용 - 구형 headless-shell 보다 봇 탐지에 덜 걸림.
     실패하면 기존 방식으로 실행한다."""
     kwargs = get_browser_launch_kwargs(headless=headless, proxy=proxy)
     if headless and "channel" not in kwargs and "executable_path" not in kwargs:
@@ -874,7 +852,7 @@ _EMBED_JS = """() => {
 
 
 def _scroll_page(page) -> None:
-    """지연 로딩(lazy-load)되는 플레이어를 모두 불러오기 위해 끝까지 ��크롤."""
+    """지연 로딩(lazy-load)되는 플레이어를 모두 불러오기 위해 끝까지 스크롤."""
     try:
         for _ in range(4):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -991,7 +969,6 @@ def discover_videos(
 
         if embed_urls:
             player_hosts.update(h for h in (_host(u) for u in embed_urls) if h)
-            player_hosts.add(_host(page_url))
             log(f"  → 임베드 플레이어 {len(embed_urls)}개 감지")
             log_event("media_discovery", "embeds_detected", f"임베드 플레이어 {len(embed_urls)}개 감지",
                       page_url=page_url, embeds=[str(u)[:150] for u in embed_urls])
@@ -1136,7 +1113,32 @@ def discover_videos(
         info["user_agent"] = ua
         info["page_url"] = page_url
     return _finalize_items([{"index": 1, "embed_url": None, "candidates": pretty, "debug": {"headless": headless}}],
-                          page_url=page_url, proxy=proxy, player_hosts=set())
+                           page_url=page_url, proxy=proxy, player_hosts=set())
+
+
+# ----------------------------------------------------------------- 수집 이후: 보강 → 판별 → 그룹화
+MAX_ENRICH = 40
+
+
+def _enrich_candidates(cands: list[dict[str, Any]], proxy: str | None) -> None:
+    """판별에 필요한 메타정보(HLS 종류/길이, mp4 용량)를 보강한다. 실패해도 조용히 넘어가며 이벤트만 남긴다."""
+    for c in cands[:MAX_ENRICH]:
+        u = c["url"]
+        path = urlparse(u).path.lower()
+        try:
+            if path.endswith(".m3u8") or "mpegurl" in (c.get("content_type") or ""):
+                if not c.get("m3u8_kind"):
+                    c["m3u8_kind"] = _probe_m3u8_kind(c, proxy=proxy)
+                if c.get("duration") is None and c.get("m3u8_kind") != "unknown":
+                    d = _m3u8_duration(c, proxy)
+                    if d:
+                        c["duration"] = d
+            elif not path.endswith(".mpd") and c.get("content_length") is None:
+                c["content_length"] = _get_content_length(
+                    u, referer=c.get("referer", ""), user_agent=c.get("user_agent", ""), proxy=proxy)
+        except Exception as e:
+            log_event("classification", "enrich_failed", f"메타 보강 실패: {type(e).__name__}", level="DEBUG",
+                      frame_url=u)
 
 
 def _finalize_items(
@@ -1220,29 +1222,155 @@ def _finalize_items(
     return items
 
 
-# ----------------------------------------------------------------- 수집 이후: 보강 → 판별 → 그룹화
-MAX_ENRICH = 40
+def discover(
+    page_url: str,
+    wait_ms: int = 6000,
+    click_selector: str | None = None,
+    proxy: str | None = None,
+    headless: bool = True,
+) -> list[dict[str, Any]]:
+    """하위 호환: 모든 동영상의 후보를 평탄화해서 반환."""
+    groups = discover_videos(
+        page_url, wait_ms=wait_ms, click_selector=click_selector,
+        proxy=proxy, headless=headless,
+    )
+    return [c for g in groups for c in g["candidates"]]
 
 
-def _enrich_candidates(cands: list[dict[str, Any]], proxy: str | None) -> None:
-    """판별에 필요한 메타정보(HLS 종류/길이, mp4 용량)를 보강한다. 실패해도 조용히 넘어가며 이벤트만 남긴다."""
-    for c in cands[:MAX_ENRICH]:
-        u = c["url"]
-        path = urlparse(u).path.lower()
-        try:
-            if path.endswith(".m3u8") or "mpegurl" in (c.get("content_type") or ""):
-                if not c.get("m3u8_kind"):
-                    c["m3u8_kind"] = _probe_m3u8_kind(c, proxy=proxy)
-                if c.get("duration") is None and c.get("m3u8_kind") != "unknown":
-                    d = _m3u8_duration(c, proxy)
-                    if d:
-                        c["duration"] = d
-            elif not path.endswith(".mpd") and c.get("content_length") is None:
-                c["content_length"] = _get_content_length(
-                    u, referer=c.get("referer", ""), user_agent=c.get("user_agent", ""), proxy=proxy)
-        except Exception as e:
-            log_event("classification", "enrich_failed", f"메타 보강 실패: {type(e).__name__}", level="DEBUG",
-                      frame_url=u)
+def rank_candidates(
+    candidates: list[dict[str, Any]],
+    proxy: str | None = None,
+) -> list[dict[str, Any]]:
+    """다운로드 시도 순서로 정렬한 후보 목록 (--discover-only/select_best 용; 판별은 하지 않는다).
+
+    m3u8(master → media → 기타) > mpd > mp4(화질/용량 큰 순). master 아래 하위 playlist 는 제외.
+    앞 후보가 실패(403 등)하면 호출측이 다음 후보를 시도한다.
+    """
+    if not candidates:
+        return []
+    _enrich_candidates(candidates, proxy)
+    return order_attempts(candidates)
 
 
-# ... rest of original file follows unchanged ...
+def select_best(
+    candidates: list[dict[str, Any]],
+    proxy: str | None = None,
+) -> dict[str, Any] | None:
+    ranked = rank_candidates(candidates, proxy=proxy)
+    return ranked[0] if ranked else None
+
+
+# ----------------------------------------------------------------- duration probe
+_EXTINF_RE = re.compile(r"#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)")
+_BANDWIDTH_RE = re.compile(r"BANDWIDTH=(\d+)")
+
+
+def _fetch_text(
+    url: str,
+    referer: str = "",
+    user_agent: str = "",
+    proxy: str | None = None,
+    limit: int = 2_000_000,
+    timeout: int = 15,
+) -> str | None:
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Referer": referer,
+            "User-Agent": user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        },
+    )
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.read(limit).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _m3u8_duration(info: dict[str, Any], proxy: str | None) -> float | None:
+    """m3u8 플레이리스트의 #EXTINF 합계로 총 길이 계산 (master면 variant를 따라감)."""
+    url = info["url"]
+    ref, ua = info.get("referer", ""), info.get("user_agent", "")
+    text = _fetch_text(url, ref, ua, proxy)
+    if text is None:
+        return None
+    if "#EXT-X-STREAM-INF" in text:
+        lines = [l.strip() for l in text.splitlines()]
+        best_uri, best_bw = None, -1
+        for i, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF"):
+                m = _BANDWIDTH_RE.search(line)
+                bw = int(m.group(1)) if m else 0
+                for nxt in lines[i + 1:]:
+                    if nxt and not nxt.startswith("#"):
+                        if bw > best_bw:
+                            best_uri, best_bw = nxt, bw
+                        break
+        if not best_uri:
+            return None
+        text = _fetch_text(urljoin(url, best_uri), ref, ua, proxy)
+        if text is None:
+            return None
+    if "#EXT-X-ENDLIST" not in text:
+        return None  # 라이브/불완전 → 판단 불가
+    total = sum(float(x) for x in _EXTINF_RE.findall(text))
+    return total if total > 0 else None
+
+
+def _find_ffprobe() -> str | None:
+    try:
+        from media_tools import resolve_ffmpeg
+        ff = resolve_ffmpeg()
+        if ff:
+            pth = pathlib.Path(str(ff))
+            d = pth if pth.is_dir() else pth.parent
+            for n in ("ffprobe.exe", "ffprobe"):
+                if (d / n).is_file():
+                    return str(d / n)
+    except Exception:
+        pass
+    return shutil.which("ffprobe")
+
+
+def _ffprobe_duration(info: dict[str, Any], proxy: str | None) -> float | None:
+    exe = _find_ffprobe()
+    if not exe:
+        return None
+    cmd = [
+        exe, "-v", "error",
+        "-protocol_whitelist", "http,https,tcp,tls,crypto",
+        "-user_agent", info.get("user_agent") or "Mozilla/5.0",
+        "-headers", f"Referer: {info.get('referer', '')}\r\n",
+    ]
+    if proxy and proxy.startswith("http"):
+        cmd += ["-http_proxy", proxy]
+    cmd += ["-show_entries", "format=duration", "-of", "default=nw=1:nk=1", "-i", info["url"]]
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=25, stdin=subprocess.DEVNULL,
+        )
+        v = (r.stdout or "").strip().splitlines()
+        return float(v[0]) if v and v[0] not in ("N/A", "") else None
+    except Exception:
+        return None
+
+
+def probe_duration(info: dict[str, Any], proxy: str | None = None) -> float | None:
+    """다운로드 전에 영상 길이(초)를 추정. 알 수 없으면 None (다운로드 후 재검사).
+    탐색 단계에서 이미 구한 길이(duration)가 있으면 재요청하지 않는다."""
+    cached = info.get("duration")
+    if isinstance(cached, (int, float)) and cached > 0:
+        return float(cached)
+    path = urlparse(info["url"]).path.lower()
+    try:
+        if path.endswith(".m3u8") or "mpegurl" in (info.get("content_type") or ""):
+            return _m3u8_duration(info, proxy)
+        if path.endswith(".mpd"):
+            return None
+        return _ffprobe_duration(info, proxy)
+    except Exception:
+        return None
