@@ -269,6 +269,17 @@ class GroupingTests(unittest.TestCase):
         g = group_candidates([self.c("https://c.example/a.mp4", classification="PENDING")])
         self.assertEqual(g[0]["classification"], "PENDING")
 
+    def test_same_file_via_redirect_host_is_one_video(self):
+        a = self.c("https://archive.org/download/x/Content/movie_720p.mp4", content_length=61878609, source="dom")
+        b = self.c("https://dn1.ca.archive.org/0/items/x/Content/movie_720p.mp4", content_length=61878609,
+                   classification="PENDING", source="network")
+        g = group_candidates([a, b])
+        self.assertEqual(len(g), 1)
+        self.assertIn("SAME_FILE", g[0]["reasons"])
+        # 용량이 다르면 같은 파일명이어도 다른 영상으로 둔다
+        c = self.c("https://other.example/a/movie_720p.mp4", content_length=123)
+        self.assertEqual(len(group_candidates([a, c])), 2)
+
     def test_two_masters_in_same_directory_are_different_videos(self):
         m = dict(content_type="application/x-mpegurl", m3u8_kind="master")
         cands = [

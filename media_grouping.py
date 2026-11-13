@@ -33,6 +33,10 @@ def _host(u: str) -> str:
         return ""
 
 
+def _basename(u: str) -> str:
+    return _path(u).rsplit("/", 1)[-1].lower()
+
+
 def is_hls(c: dict[str, Any]) -> bool:
     return _path(c["url"]).lower().endswith(".m3u8") or "mpegurl" in (c.get("content_type") or "")
 
@@ -147,6 +151,11 @@ def group_candidates(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ci, cj = cands[i], cands[j]
             if keys[i] == keys[j] and keys[i][1]:
                 link(i, j, "SAME_BASENAME")
+            # 리다이렉트/미러로 호스트가 달라져도 파일명과 전체 용량이 같으면 같은 파일이다
+            li, lj = ci.get("content_length"), cj.get("content_length")
+            if (isinstance(li, int) and li > 0 and li == lj and _basename(ci["url"]) == _basename(cj["url"])
+                    and _basename(ci["url"])):
+                link(i, j, "SAME_FILE")
             pi, pj = ci.get("playlist_index"), cj.get("playlist_index")
             if (pi is not None and pi == pj and ci.get("player_id") == cj.get("player_id")
                     and ci.get("embed_url") == cj.get("embed_url")):

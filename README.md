@@ -97,10 +97,11 @@ ZIP 생성에 실패해도 원본 폴더는 보존됩니다.
 python -m unittest discover -s tests -v
 ```
 
-실제 Chrome + yt-dlp + ffmpeg 로 로컬 서버를 처리하는 E2E (약 3분, 기본은 건너뜀. 복수 본편·광고 제외·JW playlist·광고만 있는 글·404 확인):
+실제 Chrome + yt-dlp + ffmpeg 로 로컬 서버를 처리하는 E2E (기본은 건너뜀). `test_e2e_local`(약 3분)은 복수 본편·광고 제외·JW playlist·광고만 있는 글·404,
+`test_e2e_crawl`(약 3분, 외부 네트워크 불필요)은 `--crawl` 전체 경로(2페이지 카탈로그, 날짜 필터, HLS master, playlist, 광고만 있는 글)를 확인합니다.
 
 ```powershell
-$env:RUN_E2E=1; python -m unittest tests.test_e2e_local -v
+$env:RUN_E2E=1; python -m unittest tests.test_e2e_local tests.test_e2e_crawl -v
 ```
 
 ## 반복 실패 글의 재탐색 보류 (선택)
