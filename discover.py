@@ -1108,13 +1108,22 @@ def discover_videos(
                 log_event("media_discovery", "budget_exceeded", "탐색 시간 예산 초과: 글 페이지 직접 재생(B) 생략", level="WARNING",
                           page_url=page_url)
                 need_b = []
+                
             if need_b and not page_closed:
                 log("  → 임베드 직접 열기로 본편을 못 찾음: 글 페이지에서 직접 재생을 시도합니다")
-                log_event("media_discovery", "inpage_play", "글 페이지에서 직접 재생 시도(B)", page_url=page_url, players=len(need_b))
-                try:
+                log_event(
+                    "media_discovery",
+                    "inpage_play",
+                    "글 페이지에서 직접 재생 시도(B)",
+                    page_url=page_url,
+                    players=len(need_b),
+                )
+
                 for g in need_b:
                     embed_url = g.get("embed_url")
-                    target_frame, click_point = _find_embed_frame(page, embed_url or "")
+                    target_frame, click_point = _find_embed_frame(
+                        page, embed_url or ""
+                    )
 
                     if target_frame is None:
                         g["debug"]["inpage"] = {
@@ -1147,12 +1156,19 @@ def discover_videos(
                     except Exception as e:
                         if _is_closed_error(e):
                             page_closed = True
-                            break
-                        log(f"  [Play Warning] {str(e).splitlines()[0]}")
-                        log_exception("media_discovery", e, page_url=page_url)
+                        else:
+                            log(f"  [Play Warning] {str(e).splitlines()[0]}")
+                            log_exception(
+                                "media_discovery",
+                                e,
+                                page_url=page_url,
+                            )
+                    finally:
+                        active_player["index"] = None
+                        active_player["frame"] = None
 
-                    active_player["index"] = None
-                    active_player["frame"] = None
+                    if page_closed:
+                        break
 
                     mine = [
                         c for url, c in player_found.items()
@@ -1161,10 +1177,15 @@ def discover_videos(
                     ]
                     mine = _prune_segments(mine)
 
+                    try:
+                        frames_now = [fr.url[:100] for fr in page.frames]
+                    except Exception:
+                        frames_now = []
+
                     g["debug"]["inpage"] = {
                         "player_found": len(mine),
                         "rejected": trace_b[:12],
-                        "frames": [fr.url[:100] for fr in page.frames],
+                        "frames": frames_now,
                     }
 
                     if mine:
@@ -1172,7 +1193,8 @@ def discover_videos(
                             ctx,
                             [c["url"] for c in mine] + [g["embed_url"]],
                         )
-                        have = {x["url"] for x in g["candidates"]}
+                        have = {c["url"] for c in g["candidates"]}
+
                         for c in mine:
                             c.update(
                                 referer=g["embed_url"],
@@ -1182,39 +1204,17 @@ def discover_videos(
                                 embed_url=g["embed_url"],
                                 source="network_inpage",
                             )
+
                         g["candidates"] += [
                             c for c in mine if c["url"] not in have
                         ]
-                except Exception as e:
-                    if _is_closed_error(e):
-                        page_closed = True
-                    else:
-                        log(f"  [Play Warning] {str(e).splitlines()[0]}")
-                        log_exception("media_discovery", e, page_url=page_url)
+
                 try:
                     frames_now = [fr.url[:100] for fr in page.frames]
                 except Exception:
                     frames_now = []
                 diag.note_frames(frames_now)
-                for g in need_b:
-                    g["debug"]["inpage"] = {
-                        "player_found": len(player_found),
-                        "rejected": trace_b[:12],
-                        "frames": frames_now,
-                    }
-                    key = g["embed_url"].split("#")[0]
-                    mine = [c for c in player_found.values()
-                            if (c.get("frame_url") or "").split("#")[0] == key]
-                    if not mine and len(groups) == 1:
-                        mine = list(player_found.values())
-                    mine = _prune_segments(mine)
-                    if mine:
-                        cookies = _collect_cookies(ctx, [c["url"] for c in mine] + [g["embed_url"]])
-                        have = {x["url"] for x in g["candidates"]}
-                        for c in mine:
-                            c.update(referer=g["embed_url"], user_agent=ua, page_url=page_url, cookies=cookies,
-                                     embed_url=g["embed_url"], source="network_inpage")
-                        g["candidates"] += [c for c in mine if c["url"] not in have]
+
             try:
                 browser.close()
             except Exception:

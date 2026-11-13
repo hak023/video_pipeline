@@ -121,8 +121,7 @@ class BlacklistTests(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.path = Path(self.td.name) / "bl.json"
-        self.bl = AdBlacklistStack(self.path, extra_file=Path(self.td.name) / "none.txt")
-
+        self.bl = AdBlacklistStack(self.path)
     def tearDown(self):
         self.td.cleanup()
 
@@ -166,12 +165,12 @@ class BlacklistTests(unittest.TestCase):
     def test_state_persists_and_legacy_file_is_discarded(self):
         for i in range(3):
             self.bl.observe_ad("https://cdn.persist.example/promo/a.mp4", "short_unclassified", page_url=f"https://p/{i}")
-        again = AdBlacklistStack(self.path, extra_file=Path(self.td.name) / "none.txt")
+        again = AdBlacklistStack(self.path)
         self.assertIsNotNone(again.match("https://cdn.persist.example/promo/q.mp4"))
 
         legacy = Path(self.td.name) / "legacy.json"
         legacy.write_text(json.dumps({"cdn.poisoned.example": {"reason": "short_ad_video", "count": 9}}), encoding="utf-8")
-        fresh = AdBlacklistStack(legacy, extra_file=Path(self.td.name) / "none.txt")
+        fresh = AdBlacklistStack(legacy)
         self.assertIsNone(fresh.match("https://cdn.poisoned.example/main.mp4"))
         self.assertTrue(legacy.with_suffix(".legacy.bak").exists())
 
@@ -180,7 +179,7 @@ class ClassifierTests(unittest.TestCase):
     def setUp(self):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
-        self.bl = AdBlacklistStack(Path(td.name) / "bl.json", extra_file=Path(td.name) / "none.txt")
+        self.bl = AdBlacklistStack(Path(td.name) / "bl.json")
 
     def cls(self, **c):
         c.setdefault("url", "https://cdn.example/v/video.mp4")
