@@ -313,8 +313,9 @@ def _process_item(
             return _mark_short(res, history, item_url, item_name, post_date, max(d for d, _ in short_seen), opts)
         # 본편 근거가 없는 짧은 영상뿐: 광고만 잡힌 것일 수 있으므로 '완료'로 기록하지 않아 다음 실행에서 다시 탐색한다.
         longest = max(d for d, _ in short_seen)
-        res.update(status="no_main_found", duration=longest,
-                   reason=f"본편 미검출: 짧은 미분류 영상만 발견({longest:.0f}s <= {opts.skip_under:.0f}s) - 광고 가능성")
+        res.update(status="no_main_found", duration=longest, fatal=True,    # 길이는 재시도해도 같으므로 반복하지 않는다
+                   reason=(f"본편 미검출: 짧은 미분류 영상만 발견({longest:.0f}s <= {opts.skip_under:.0f}s) - 광고 가능성. "
+                           f"실제로 짧은 본편이면 --skip-under 0 (또는 더 작은 값)으로 다시 실행"))
         diag.fail("classification", res["reason"])
         log(f"  [본편 미검출] {item_name}: 짧은 영상({longest:.0f}초)만 발견되어 완료 처리하지 않음")
         return res
@@ -928,12 +929,20 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _name_from_url(url: str) -> str:
+    """--url 용 기본 이름: 경로 마지막 조각(영상 확장자는 제거: x.m3u8 → x). 없으면 'video'."""
+    from urllib.parse import unquote, urlparse
+    slug = unquote(urlparse(url).path.strip("/").split("/")[-1]) or "video"
+    stem, dot, ext = slug.rpartition(".")
+    if dot and stem and ext.lower() in {"m3u8", "mpd", "mp4", "mkv", "webm", "mov", "ts", "html", "htm", "php"}:
+        slug = stem
+    return sanitize_filename(slug)
+
+
 def _dispatch(args: argparse.Namespace, opts: Options, headless: bool) -> list[dict] | None:
     if args.url:
-        from urllib.parse import unquote, urlparse
-        slug = unquote(urlparse(args.url).path.strip("/").split("/")[-1]) or "video"
         t = {
-            "name": sanitize_filename(slug), "page_url": args.url, "wait_ms": 8000,
+            "name": _name_from_url(args.url), "page_url": args.url, "wait_ms": 8000,
             "click_selector": "iframe >> video, .plyr__control--overlaid, button[aria-label*='Play'], .vjs-big-play-button",
         }
         history = _open_history(opts)

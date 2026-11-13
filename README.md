@@ -17,10 +17,18 @@ pip install -r requirements.txt
 
 ```powershell
 python main.py                                  # targets.yaml 전체
-python main.py --url "https://사이트/글/"         # 글 1개
+python main.py --url "https://사이트/글/"         # 글 1개 (다른 옵션 없이 이것만으로 충분)
 python main.py --crawl https://사이트 --end-page 3
 python main.py --discover-only                  # 다운로드 없이 후보만 확인
 ```
+
+`--url` 만 써도 되는 이유: 나머지는 모두 기본값이 있습니다 (workers 5, attempts 3, 총 1시간/무진행 90초 타임아웃,
+`out/` 저장, `history_data/` 이력, `logs/` 로그·ZIP 자동 생성). 파일명은 URL 마지막 경로 조각(`/글-제목/` → `글-제목.mp4`,
+영상 여러 개면 `글-제목 (01).mp4`...)이고, 영상 URL(`.m3u8`/`.mp4`)을 직접 줘도 동작합니다. 결과 JSON 은 콘솔에 출력됩니다.
+
+**알아둘 기본값 하나:** `--skip-under 60` — **60초 이하 영상은 받지 않습니다**(광고/예고편 제외 목적). 짧은 본편을 받으려면
+`--skip-under 0` 을 함께 주세요. 짧은 영상만 발견되면 `no_main_found` 로 끝나며 사유에 이 안내가 표시됩니다.
+같은 URL 을 다시 실행하면 이미 받은 것은 건너뛰고(`--force` 로 재다운로드), 실패한 글은 다시 시도합니다.
 
 옵션은 `python main.py --help` 를 참고하세요. 평소와 같이 실행하면 되고, 별도의 디버그 옵션은 필요 없습니다.
 

@@ -328,6 +328,16 @@ class HistoryCooldownTests(unittest.TestCase):
                 self.assertFalse(h.in_cooldown(url, 24))
 
 
+class UrlNameTests(unittest.TestCase):
+    def test_name_from_url(self):
+        import main
+        self.assertEqual(main._name_from_url("https://s.example/post/my-video/"), "my-video")
+        self.assertEqual(main._name_from_url("https://cdn.example/a/x36xhzz.m3u8?t=1"), "x36xhzz")
+        self.assertEqual(main._name_from_url("https://s.example/%ec%a3%bc%ed%95%98-261009/"), "주하-261009")
+        self.assertEqual(main._name_from_url("https://s.example/"), "video")
+        self.assertEqual(main._name_from_url("https://s.example/ver1.5"), "ver1.5")
+
+
 class AnalyzeRunTests(unittest.TestCase):
     def test_analyze_reads_zip_and_gives_hints(self):
         import analyze_run
