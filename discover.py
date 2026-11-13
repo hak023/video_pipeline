@@ -291,33 +291,92 @@ def _is_descendant_frame(frame: Any, root: Any) -> bool:
     return False
 
 
-def _find_embed_frame(page: Any, embed_url: str) -> tuple[Any | None, tuple[float, float] | None]:
-    """페이지 DOM에서 embed_url과 일치하는 iframe 및 중앙 클릭 좌표를 찾는다.
+def _find_embed_frame(
+    page: Any,
+    embed_url: str,
+    debug: dict[str, Any] | None = None,
+) -> tuple[Any | None, tuple[float, float] | None]:
+    """embed_url에 연결되는 iframe 프레임과 클릭 좌표를 찾는다.
 
-    여러 iframe이 같은 URL을 가리키거나 iframe을 찾지 못하면 추측해서 선택하지 않는다.
+    URL 비교는 fragment만 제외한다. bounding box가 없어도 iframe 프레임을
+    찾았다면 매칭은 유효하며, 클릭 좌표만 None으로 반환한다.
     """
-    matches = []
-    expected = embed_url.split("#", 1)[0]
+    expected = urljoin(page.url, embed_url).split("#", 1)[0]
+    matches: list[tuple[Any, tuple[float, float] | None]] = []
+    inspected: list[dict[str, Any]] = []
 
-    for locator in page.locator("iframe").all():
+    for index, locator in enumerate(page.locator("iframe").all()):
         try:
             src = locator.get_attribute("src") or ""
-            resolved = urljoin(page.url, src).split("#", 1)[0]
-            if resolved != expected:
-                continue
+            resolved_src = urljoin(page.url, src).split("#", 1)[0]
 
             element = locator.element_handle()
             frame = element.content_frame if element else None
-            box = locator.bounding_box()
-            if frame is not None and box:
-                point = (box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-                matches.append((frame, point))
-        except Exception:
-            continue
+            frame_url = (frame.url or "").split("#", 1)[0] if frame else ""
 
-    if len(matches) != 1:
-        return None, None
-    return matches[0]
+            # src는 원본 iframe 주소, frame.url은 리다이렉트 후 주소일 수 있다.
+            src_matches = resolved_src == expected
+            frame_matches = frame_url == expected
+
+            box = locator.bounding_box()
+            click_point = None
+            if box:
+                click_point = (
+                    box["x"] + box["width"] / 2,
+                    box["y"] + box["height"] / 2,
+                )
+
+            inspected.append({
+                "index": index,
+                "src": src[:250],
+                "resolved_src": resolved_src[:250],
+                "frame_url": frame_url[:250],
+                "src_matches": src_matches,
+                "frame_matches": frame_matches,
+                "frame_found": frame is not None,
+                "bounding_box_found": box is not None,
+            })
+
+            if frame is not None and (src_matches or frame_matches):
+                matches.append((frame, click_point))
+
+        except Exception as e:
+            inspected.append({
+                "index": index,
+                "error": f"{type(e).__name__}: {str(e).splitlines()[0][:150]}",
+            })
+
+    # 동일한 Frame 객체가 중복 수집된 경우는 한 개로 취급한다.
+    unique_matches: list[tuple[Any, tuple[float, float] | None]] = []
+    seen_frames: set[int] = set()
+    for frame, point in matches:
+        frame_id = id(frame)
+        if frame_id not in seen_frames:
+            seen_frames.add(frame_id)
+            unique_matches.append((frame, point))
+
+    if len(unique_matches) == 1:
+        if debug is not None:
+            debug["iframe_match"] = {
+                "status": "matched",
+                "expected": expected[:250],
+                "iframe_count": len(inspected),
+                "match_count": 1,
+                "bounding_box_found": unique_matches[0][1] is not None,
+                "iframes": inspected,
+            }
+        return unique_matches[0]
+
+    if debug is not None:
+        debug["iframe_match"] = {
+            "status": "not_found" if not unique_matches else "ambiguous",
+            "expected": expected[:250],
+            "iframe_count": len(inspected),
+            "match_count": len(unique_matches),
+            "iframes": inspected,
+        }
+
+    return None, None
 
 def _has_real_stream(candidates) -> bool:
     """재생 루프를 멈춰도 될 만큼 '본편일 가능성이 있는' 후보가 있는지.
@@ -1108,7 +1167,7 @@ def discover_videos(
                 log_event("media_discovery", "budget_exceeded", "탐색 시간 예산 초과: 글 페이지 직접 재생(B) 생략", level="WARNING",
                           page_url=page_url)
                 need_b = []
-                
+
             if need_b and not page_closed:
                 log("  → 임베드 직접 열기로 본편을 못 찾음: 글 페이지에서 직접 재생을 시도합니다")
                 log_event(

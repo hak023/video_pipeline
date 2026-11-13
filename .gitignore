@@ -4,7 +4,6 @@ out/
 history_data/
 probe_out/
 ad_blacklist.json
-ad_blacklist.*
 ad_domains.txt
 
 # Python
