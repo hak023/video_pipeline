@@ -376,7 +376,7 @@ class AdBlacklistStack:
 
 
 # 전역 싱글톤 인스턴스
-blacklist = AdBlacklistStack()
+bl = ad_blacklist.AdBlacklistStack(cls.tmp / "bl.json")
 
 
 def is_ad_url(url: str) -> bool:
