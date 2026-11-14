@@ -430,12 +430,14 @@ class Diagnostics:
             self._warn("downloads", f"다운로드 기록 실패: {e}")
 
     # ------------------------------------------------------------ browser logs
-    def browser_console(self, kind: str, text: str, location: str = "") -> None:
+    def browser_console(self, kind: str, text: str, location: str = "", frame_url: str = "") -> None:
         with self._lock:
             self._counts["console"] += 1
             n = self._counts["console"]
         if n <= MAX_CONSOLE:
-            self._append("browser/console.log", f"{now_iso()} [{kind}] {mask_text(text)[:500]} {mask_text(location)}".rstrip())
+            frame_part = f" frame={mask_url(frame_url)}" if frame_url else ""
+            loc_part = f" {mask_text(location)}" if location else ""
+            self._append("browser/console.log", f"{now_iso()} [{kind}] {mask_text(text)[:500]}{loc_part}{frame_part}".rstrip())
 
     def browser_page_error(self, text: str) -> None:
         self._append("browser/page_errors.log", f"{now_iso()} {mask_text(text)[:2000]}")
@@ -609,7 +611,15 @@ def attach_page_diagnostics(page: Any, label: str = "") -> None:
 
     def on_console(msg: Any) -> None:
         loc = msg.location or {}
-        diag.browser_console(f"{label}:{msg.type}", msg.text, str(loc.get("url", ""))[:120])
+        u = loc.get("url", "")
+        line = loc.get("lineNumber")
+        col = loc.get("columnNumber")
+        loc_str = f"{u}:{line}:{col}" if (line is not None and u) else (u or "")
+        try:
+            frame_url = getattr(getattr(msg, "page", None), "url", "")
+        except Exception:
+            frame_url = ""
+        diag.browser_console(f"{label}:{msg.type}", msg.text, loc_str[:160], frame_url=frame_url)
 
     def on_pageerror(err: Any) -> None:
         diag.browser_page_error(f"[{label}] {err}")
@@ -624,12 +634,30 @@ def attach_page_diagnostics(page: Any, label: str = "") -> None:
 
     def on_response(resp: Any) -> None:
         ctype = (resp.headers.get("content-type") or "").lower()
-        if not _is_media_response(resp.url, ctype):
-            return
+        frame_url = ""
         try:
             frame_url = resp.frame.url
         except Exception:
-            frame_url = ""
+            pass
+
+        # 1. HTTP 4xx, 5xx 오류 응답 기록
+        if resp.status >= 400:
+            req = resp.request
+            diag.browser_request_failure(
+                label=label,
+                url=resp.url,
+                method=req.method if req else "GET",
+                resource_type=req.resource_type if req else "",
+                status=resp.status,
+                content_type=ctype[:80],
+                error=f"HTTP {resp.status}",
+                frame_url=frame_url,
+            )
+
+        # 2. 미디어 응답 기록
+        if not _is_media_response(resp.url, ctype):
+            return
+
         diag.browser_response(label=label, url=resp.url, status=resp.status, content_type=ctype[:80],
                               content_length=resp.headers.get("content-length"),
                               content_range=resp.headers.get("content-range"), frame_url=frame_url)

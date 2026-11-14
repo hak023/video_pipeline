@@ -9,3 +9,9 @@ targets:
     license: "integration test"
     wait_ms: 12000
     click_selector: "iframe >> video, .plyr__control--overlaid, button[aria-label*='Play'], .vjs-big-play-button"
+
+  - name: frame-filter-check
+    page_url: "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%A4-362540/"
+    wait_ms: 8000
+
+    

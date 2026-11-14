@@ -47,7 +47,7 @@ CANCEL = threading.Event()            # Ctrl+C 시 모든 워커에 중단 신�
 BACKOFF = (5, 15, 30)                 # 재시도 대기(초). 여기에 0~3초 jitter 가산
 MAX_CONCURRENT_BROWSERS = 3           # Chromium 동시 실행 수 (메모리/차단 방지)
 MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".m4a", ".ts", ".mov"}
-DONE_STATES = {"ok", "skipped", "skipped_short"}
+DONE_STATES = {"ok", "skipped", "skipped_short", "skipped_unconfirmed"}
 MAX_CANDIDATES_TRIED = 3              # 한 영상에서 후보 URL을 최대 몇 개까지 시도할지
 
 
@@ -125,6 +125,8 @@ class Options:
     cooldown_hours: float = 0.0       # 0 = 끄기. 같은 글이 cooldown_after 회 이상 실패했으면 이 시간 동안 재탐색 보류
     cooldown_after: int = 2
     library: Library | None = field(default=None, repr=False)
+    allow_pending: bool = False       # fail-closed: 본편 확인(MAIN) 안 된 PENDING 후보 다운로드 허용 여부
+    passive_embed: bool = False       # 진단 모드: 임베드 탐색 시 라우팅/스크립트 주입 비활성화
 
 
 # ------------------------------------------------------------------ names
@@ -200,7 +202,7 @@ def _meta_num(meta: Any, key: str) -> float | None:
     return None
 
 
-def _discover_groups(t, url, proxy, headless, attempt, browser_sem):
+def _discover_groups(t, url, proxy, headless, attempt, browser_sem, passive: bool = False):
     # 재시도할수록 플레이어 로딩 대기시간을 늘림
     wait_ms = int(t.get("wait_ms", 6000) * (1 + 0.5 * (attempt - 1)))
     with (browser_sem or nullcontext()):
@@ -210,6 +212,7 @@ def _discover_groups(t, url, proxy, headless, attempt, browser_sem):
             click_selector=t.get("click_selector"),
             proxy=proxy,
             headless=headless,
+            passive=passive,
         )
 
 
@@ -254,9 +257,10 @@ def _process_item(
         ad_excluded = group.get("ad_excluded") or 0
         if ad_excluded:
             res.update(status="no_main_found", candidates=0, ad_excluded=ad_excluded,
-                       reason=f"본편으로 볼 후보 없음: 발견된 {ad_excluded}개 후보가 모두 광고로 판별됨")
+                       reason=f"본편으로 볼 후보 없음: 발견된 {ad_excluded}개 후보가 모두 광고로 판별됨",
+                       fatal=True)
         else:
-            res.update(status="no_media_found", reason="no_media_found", candidates=0)
+            res.update(status="no_media_found", reason="no_media_found", candidates=0, fatal=True)
         diag.fail("classification" if ad_excluded else "media_discovery", res["reason"])
         if group.get("debug"):
             res["debug"] = group["debug"]     # 이동 결과/거절된 요청/프레임 목록 (원인 진단용)
@@ -266,9 +270,36 @@ def _process_item(
     res["candidates"] = len(cands)
     if group.get("group_id"):
         res["group_id"] = group["group_id"]
+
+    # 광고 회피 fail-closed: 본편(MAIN) 근거가 없는 PENDING 후보는 기본적으로 자동 다운로드하지 않는다
+    has_main_candidate = any(c.get("classification") == "MAIN" for c in ordered)
+    allow_pending = getattr(opts, "allow_pending", False)
+    if not has_main_candidate and not allow_pending:
+        res.update(
+            status="skipped_unconfirmed",
+            reason="fail-closed: 본편 근거(MAIN)가 없는 PENDING 후보는 광고 오인 방지를 위해 자동 다운로드하지 않습니다 (--allow-pending 옵션으로 허용 가능)",
+            fatal=True,
+        )
+        log(f"  [보호] {item_name}: 광고 방지(fail-closed) - 본편 근거(MAIN)가 확인되지 않아 자동 다운로드를 건너뜁니다 (후보 {len(ordered)}개는 PENDING)")
+        log_event(
+            "download",
+            "skipped_unconfirmed_pending",
+            "fail-closed: 본편 미확인(PENDING) 후보 자동 다운로드 차단",
+            level="WARNING",
+            candidate_count=len(ordered),
+            group_id=group.get("group_id"),
+        )
+        diag.download(
+            candidate_id=ordered[0].get("candidate_id") if ordered else None,
+            group_id=group.get("group_id"),
+            status="SKIPPED_UNCONFIRMED_PENDING",
+            reason="fail-closed_pending",
+        )
+        return res
+
     if group.get("low_confidence"):
         res["low_confidence"] = True
-        log(f"  [주의] {item_name}: 본편 근거가 약한 후보(PENDING)를 사용합니다")
+        log(f"  [주의] {item_name}: 본편 근거가 약한 후보(PENDING)를 사용합니다 (--allow-pending 활성화됨)")
 
     on_progress = None
     if board is not None:
@@ -542,7 +573,7 @@ def run_target(
             nav_fatal = False
             try:
                 with get_diagnostics().stage("media_discovery"):
-                    groups = _discover_groups(t, url, proxy, headless, attempt, browser_sem)
+                    groups = _discover_groups(t, url, proxy, headless, attempt, browser_sem, passive=opts.passive_embed)
             except DiscoverNavigationError as e:
                 last_error = mask_text(f"navigation: {e}")
                 nav_fatal = getattr(e, "status", None) in (404, 410, 451)   # 재시도 무의미
@@ -966,6 +997,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="같은 글이 반복 실패(--cooldown-after 회 이상)하면 H시간 동안 재탐색을 보류 (기본값: 0=끄기)")
     parser.add_argument("--cooldown-after", type=int, default=2, metavar="N",
                         help="--cooldown-hours 적용 기준이 되는 누적 실패 횟수 (기본값: 2)")
+    parser.add_argument("--allow-pending", action="store_true",
+                        help="본편 근거가 약한 PENDING 후보도 다운로드 시도 (기본값: False, 광고 오인 방지 fail-closed)")
+    parser.add_argument("--passive-embed", action="store_true",
+                        help="진단 모드: 임베드 탐색 시 라우팅 인터셉트 및 스크립트 주입을 끄고 순수 상태로 관찰")
     parser.add_argument("--log-retain", type=int, default=DEFAULT_RETAIN, metavar="N",
                         help=f"logs/runs 에 보관할 최근 실행 수 (기본값: {DEFAULT_RETAIN}, 0이면 정리 안 함)")
     return parser
@@ -1081,6 +1116,8 @@ def main() -> None:
             cooldown_after=max(1, args.cooldown_after),
             history_dir=args.history_dir,
             library=library,
+            allow_pending=args.allow_pending,
+            passive_embed=args.passive_embed,
         )
         report = _dispatch(args, opts, headless)
         status, f_stage, f_reason = _summarize_report(report)

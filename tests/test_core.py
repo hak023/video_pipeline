@@ -373,5 +373,107 @@ class VerifyTests(unittest.TestCase):
             self.assertFalse(ok)
 
 
+class FailClosedAndDiagnosticsTests(unittest.TestCase):
+    def test_fail_closed_skips_unconfirmed_pending_by_default(self):
+        import main
+        group = {
+            "index": 1,
+            "embed_url": "https://player.example/embed/123",
+            "candidates": [
+                {"url": "https://cdn.example/video.mp4", "classification": "PENDING", "candidate_id": "c1"},
+            ],
+            "low_confidence": True,
+        }
+        opts = main.Options(allow_pending=False)
+        with mock.patch("main.get_diagnostics"):
+            res = main._process_item(
+                group=group, n=1, url="https://site.example/post/1", name="test_post",
+                out_dir=Path("."), proxy=None, opts=opts, history=None, post_date=None,
+                force=False, board=None, slot=1,
+            )
+        self.assertEqual(res["status"], "skipped_unconfirmed")
+        self.assertTrue(res.get("fatal"))
+        self.assertIn("fail-closed", res.get("reason", ""))
+
+    def test_fail_closed_allows_pending_when_flag_enabled(self):
+        import main
+        group = {
+            "index": 1,
+            "embed_url": "https://player.example/embed/123",
+            "candidates": [
+                {"url": "https://cdn.example/video.mp4", "classification": "PENDING", "candidate_id": "c1"},
+            ],
+            "low_confidence": True,
+        }
+        opts = main.Options(allow_pending=True)
+        with mock.patch("main.get_diagnostics"), \
+             mock.patch("main._download_candidate", return_value={"status": "ok", "output": "test.mp4", "meta": {}}):
+            res = main._process_item(
+                group=group, n=1, url="https://site.example/post/1", name="test_post",
+                out_dir=Path("."), proxy=None, opts=opts, history=None, post_date=None,
+                force=False, board=None, slot=1,
+            )
+        self.assertEqual(res["status"], "ok")
+
+    def test_no_media_found_marks_fatal_to_avoid_useless_retries(self):
+        import main
+        group = {
+            "index": 1,
+            "embed_url": "https://player.example/embed/123",
+            "candidates": [],
+            "debug": {},
+        }
+        opts = main.Options()
+        with mock.patch("main.get_diagnostics"):
+            res = main._process_item(
+                group=group, n=1, url="https://site.example/post/1", name="test_post",
+                out_dir=Path("."), proxy=None, opts=opts, history=None, post_date=None,
+                force=False, board=None, slot=1,
+            )
+        self.assertEqual(res["status"], "no_media_found")
+        self.assertTrue(res.get("fatal"))
+
+    def test_fill_page_debug_separates_wrapper_and_embed_frame(self):
+        import discover
+        page = mock.MagicMock()
+        page.url = "about:blank"
+        page.title.return_value = ""
+        page.inner_text.return_value = ""
+
+        main_fr = mock.MagicMock()
+        page.main_frame = main_fr
+
+        embed_fr = mock.MagicMock()
+        embed_fr.url = "https://player.example/embed.html"
+        embed_fr.title.return_value = "Player Title"
+        embed_fr.inner_text.return_value = "Player Body Content"
+        embed_fr.evaluate.return_value = "complete"
+
+        page.frames = [main_fr, embed_fr]
+
+        debug = {}
+        discover._fill_page_debug(page, debug, embed_url="https://player.example/embed.html")
+
+        self.assertIn("wrapper", debug)
+        self.assertEqual(debug["wrapper"]["url"], "about:blank")
+        self.assertIn("embed_frame", debug)
+        self.assertEqual(debug["embed_frame"]["url"], "https://player.example/embed.html")
+        self.assertEqual(debug["embed_frame"]["title"], "Player Title")
+        self.assertEqual(debug["embed_frame"]["readyState"], "complete")
+        self.assertEqual(debug["title"], "Player Title")
+
+    def test_find_embed_frame_reports_detailed_reason_on_failure(self):
+        import discover
+        page = mock.MagicMock()
+        page.url = "https://site.example/post/1"
+        page.locator.return_value.all.return_value = []
+
+        debug = {}
+        frame, point = discover._find_embed_frame(page, "https://player.example/embed", debug=debug)
+        self.assertIsNone(frame)
+        self.assertIsNone(point)
+        self.assertEqual(debug["iframe_match"]["reason_detail"], "dom_no_iframes")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,7 @@ from playwright.sync_api import sync_playwright
 
 from ad_blacklist import blacklist
 from diagnostics import (
-    attach_page_diagnostics, get_diagnostics, log_event, log_exception, now_iso,
+    attach_page_diagnostics, get_diagnostics, log_event, log_exception, mask_text, mask_url, now_iso,
 )
 from media_classifier import classify_candidate, strong_ad_rules
 from media_grouping import group_candidates, order_attempts
@@ -300,8 +300,10 @@ def _find_embed_frame(
 
     URL 비교는 fragment만 제외한다. bounding box가 없어도 iframe 프레임을
     찾았다면 매칭은 유효하며, 클릭 좌표만 None으로 반환한다.
+    매칭 실패 시 감지한 임베드가 실제 DOM에 존재하는지, 교체되었거나 사라졌는지 세부 이유를 기록한다.
     """
     expected = urljoin(page.url, embed_url).split("#", 1)[0]
+    expected_host = _host(expected)
     matches: list[tuple[Any, tuple[float, float] | None]] = []
     inspected: list[dict[str, Any]] = []
 
@@ -318,6 +320,7 @@ def _find_embed_frame(
             # src는 원본 iframe 주소, frame.url은 리다이렉트 후 주소일 수 있다.
             src_matches = resolved_src == expected
             frame_matches = frame_url == expected
+            host_matches = (_host(resolved_src) == expected_host) or (_host(frame_url) == expected_host)
 
             box = locator.bounding_box()
             click_point = None
@@ -334,6 +337,7 @@ def _find_embed_frame(
                 "frame_url": frame_url[:250],
                 "src_matches": src_matches,
                 "frame_matches": frame_matches,
+                "host_matches": host_matches,
                 "frame_found": frame is not None,
                 "bounding_box_found": box is not None,
             })
@@ -360,7 +364,9 @@ def _find_embed_frame(
         if debug is not None:
             debug["iframe_match"] = {
                 "status": "matched",
+                "reason_detail": "matched_exact",
                 "expected": expected[:250],
+                "expected_host": expected_host,
                 "iframe_count": len(inspected),
                 "match_count": 1,
                 "bounding_box_found": unique_matches[0][1] is not None,
@@ -368,10 +374,24 @@ def _find_embed_frame(
             }
         return unique_matches[0]
 
+    # 매칭 실패 세부 사유 분석
+    if not inspected:
+        reason_detail = "dom_no_iframes"
+    elif not any(x.get("frame_found") for x in inspected):
+        reason_detail = "all_iframes_detached"
+    elif any(x.get("host_matches") for x in inspected):
+        reason_detail = "host_matched_but_url_changed"
+    elif len(unique_matches) > 1:
+        reason_detail = "ambiguous_multiple_matches"
+    else:
+        reason_detail = "embed_url_absent_from_dom"
+
     if debug is not None:
         debug["iframe_match"] = {
             "status": "not_found" if not unique_matches else "ambiguous",
+            "reason_detail": reason_detail,
             "expected": expected[:250],
+            "expected_host": expected_host,
             "iframe_count": len(inspected),
             "match_count": len(unique_matches),
             "iframes": inspected,
@@ -396,9 +416,10 @@ def _has_real_stream(candidates) -> bool:
         low = u.lower()
         if ".m3u8" in low or ".mpd" in low:
             return True
-        clean = low.split("?")[0]
-        if any(clean.endswith(ext) for ext in (".mp4", ".mkv", ".webm")) and dur > 0:
-            return True
+        clean = low.split("#")[0].split("?")[0]
+        if any(clean.endswith(ext) for ext in (".mp4", ".mkv", ".webm")):
+            if c.get("from_playlist") or dur >= REAL_VIDEO_SECONDS or dur == 0:
+                return True
     return False
 
 
@@ -591,12 +612,68 @@ def _play_until_stream(
     return _has_real_stream(captured.values() if isinstance(captured, dict) else captured)
 
 
-def _fill_page_debug(page, debug: dict[str, Any]) -> None:
-    """임베드 페이지가 실제로 무엇을 보여줬는지 기록 (차단/잠금/오류 페이지 판별용)."""
+def _fill_page_debug(page, debug: dict[str, Any], embed_url: str = "") -> None:
+    """임베드 페이지가 실제로 무엇을 보여줬는지 기록 (차단/잠금/오류 페이지 판별용).
+
+    래퍼 페이지(about:blank)와 임베드 프레임 자체의 문서 상태·제목·본문을 구별하여 기록한다.
+    """
     try:
-        debug["final_url"] = page.url[:150]
-        debug["title"] = (page.title() or "")[:80]
-        debug["body"] = re.sub(r"\s+", " ", page.inner_text("body", timeout=1500))[:160]
+        # 1. 래퍼 페이지 정보 (about:blank 등)
+        debug["wrapper"] = {
+            "url": page.url[:150],
+            "title": (page.title() or "")[:80],
+            "frame_count": len(page.frames),
+        }
+
+        # 2. 임베드 프레임 탐색
+        embed_frame = None
+        target_host = _host(embed_url) if embed_url else ""
+        for fr in page.frames:
+            if fr == page.main_frame:
+                continue
+            fr_host = _host(fr.url)
+            if (target_host and fr_host == target_host) or (embed_url and fr.url.startswith(embed_url.split("?")[0])):
+                embed_frame = fr
+                break
+        if embed_frame is None and len(page.frames) > 1:
+            embed_frame = page.frames[1]
+
+        # 3. 임베드 프레임 상태 추출
+        if embed_frame is not None:
+            fr_url = embed_frame.url or ""
+            fr_title = ""
+            fr_body = ""
+            fr_ready = ""
+            try:
+                fr_title = (embed_frame.title() or "")[:80]
+            except Exception:
+                pass
+            try:
+                raw_body = embed_frame.inner_text("body", timeout=1500)
+                fr_body = re.sub(r"\s+", " ", raw_body)[:300]
+                fr_body = str(mask_text(fr_body))
+            except Exception:
+                pass
+            try:
+                fr_ready = embed_frame.evaluate("() => document.readyState")
+            except Exception:
+                pass
+
+            debug["embed_frame"] = {
+                "url": fr_url[:200],
+                "host": _host(fr_url),
+                "title": fr_title,
+                "body": fr_body,
+                "readyState": fr_ready,
+            }
+            debug["final_url"] = fr_url[:150] or page.url[:150]
+            debug["title"] = fr_title or (page.title() or "")[:80]
+            debug["body"] = fr_body or re.sub(r"\s+", " ", page.inner_text("body", timeout=1500))[:160]
+        else:
+            debug["final_url"] = page.url[:150]
+            debug["title"] = (page.title() or "")[:80]
+            debug["body"] = re.sub(r"\s+", " ", page.inner_text("body", timeout=1500))[:160]
+
         debug["frames"] = [fr.url[:100] for fr in page.frames]
     except Exception:
         pass
@@ -608,11 +685,13 @@ def _extract_embed_stream(
     wait_ms: int = 4000,
     page_url: str = "",
     debug: dict[str, Any] | None = None,
+    passive: bool = False,
 ) -> list[dict[str, Any]]:
     """임베드 플레이어 URL을 iframe wrapper 환경에서 열어 미디어 후보를 수집한다.
 
     - 직접 방문 시 frame-buster / 안티크롤러에 걸리는 문제 방지
     - 실제 브라우저와 동일한 iframe 환경을 제공하여 정상 스트림(jwplayer sources 등) 온전 추출
+    - passive=True 시(진단 모드) 라우팅 인터셉트 및 스크립트 주입을 끄고 순수 상태로 관찰
     """
     captured: dict[str, dict[str, Any]] = {}
     trace: list[dict[str, str]] = []
@@ -671,10 +750,15 @@ def _extract_embed_stream(
                 pass
         route.continue_()
 
-    try:
-        page.route("**", _route_embed_inject)
-    except Exception as e:
-        log_event("media_discovery", "route_failed", f"embed 라우팅 설정 실패: {e}", level="WARNING", frame_url=embed_url)
+    passive_mode = passive or (os.environ.get("VP_PASSIVE_EMBED", "0").lower() in ("1", "true", "yes"))
+    if passive_mode:
+        log("    [PASSIVE] 진단 모드: 페이지 라우팅 및 스크립트 주입 비활성화")
+        log_event("media_discovery", "passive_mode", "진단(passive) 모드: 라우팅 및 스크립트 주입 비활성화", frame_url=embed_url)
+    else:
+        try:
+            page.route("**", _route_embed_inject)
+        except Exception as e:
+            log_event("media_discovery", "route_failed", f"embed 라우팅 설정 실패: {e}", level="WARNING", frame_url=embed_url)
 
     diag = get_diagnostics()
     player_id = diag.new_player_id()
@@ -734,17 +818,102 @@ def _extract_embed_stream(
         } catch(e) { return null; }
     }"""
 
-    # jwplayer.setup() 직접 호출 시도 JS
+    # jwplayer 및 실행 환경 상세 진단 JS
+    _JW_INSPECT_JS = """() => {
+        try {
+            const res = {
+                has_jwplayer: typeof jwplayer === 'function',
+                ready_state: document.readyState,
+                cookie_enabled: navigator.cookieEnabled,
+                storage_status: 'unknown',
+                storage_error: null,
+                player_elements: [],
+                instances: [],
+                error_text: null
+            };
+            try {
+                sessionStorage.setItem('__vp_test__', '1');
+                sessionStorage.removeItem('__vp_test__');
+                res.storage_status = 'ok';
+            } catch (e) {
+                res.storage_status = 'denied';
+                res.storage_error = e.name + ': ' + e.message;
+            }
+            try {
+                const els = document.querySelectorAll('.jwplayer, [id*="jwplayer"], #player, [data-jwplayer]');
+                els.forEach(el => {
+                    res.player_elements.push({
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || '',
+                        className: (el.className ? String(el.className) : '').slice(0, 80)
+                    });
+                });
+            } catch (e) {}
+
+            const errEl = document.querySelector('.jw-error, .jw-error-msg, .jw-error-text, .error-message, .jw-title-primary');
+            if (errEl) {
+                res.error_text = (errEl.textContent || '').trim().slice(0, 150);
+            }
+
+            if (res.has_jwplayer) {
+                const checkedIds = new Set();
+                const checkInst = (jw, label) => {
+                    if (!jw) return null;
+                    const info = {
+                        label: label,
+                        state: typeof jw.getState === 'function' ? jw.getState() : null,
+                        playlist_len: 0,
+                        sources_len: 0,
+                        is_ready: false
+                    };
+                    if (typeof jw.getPlaylist === 'function') {
+                        const pl = jw.getPlaylist();
+                        if (Array.isArray(pl)) {
+                            info.playlist_len = pl.length;
+                            if (pl[0]) {
+                                const srcs = pl[0].allSources || pl[0].sources || [];
+                                info.sources_len = srcs.length;
+                                info.is_ready = srcs.length > 0 || !!pl[0].file;
+                            }
+                        }
+                    }
+                    return info;
+                };
+
+                res.player_elements.forEach(p => {
+                    if (p.id && !checkedIds.has(p.id)) {
+                        checkedIds.add(p.id);
+                        try {
+                            const jw = jwplayer(p.id);
+                            const info = checkInst(jw, p.id);
+                            if (info) res.instances.push(info);
+                        } catch (e) {}
+                    }
+                });
+
+                if (!res.instances.length) {
+                    try {
+                        const jw = jwplayer();
+                        const info = checkInst(jw, 'default');
+                        if (info) res.instances.push(info);
+                    } catch (e) {}
+                }
+            }
+            return res;
+        } catch (e) {
+            return { error: e.name + ': ' + e.message };
+        }
+    }"""
+
+    # jwplayer.setup() 직접 호출 시도 JS (빈 소스 setup은 악영향을 주므로 환경변수 활성화 시에만 사용)
     _JW_SETUP_JS = """() => {
         try {
             if (typeof jwplayer !== 'function') return 'no_jwplayer';
             const jw = jwplayer();
             if (!jw) return 'no_instance';
-            // setup이 이미 완료되었는지 확인
             if (jw.getPlaylist && jw.getPlaylist() && jw.getPlaylist().length > 0) {
                 return 'already_ready';
             }
-            // setup 직접 호출 (player element가 있는 경우)
             const playerEl = document.querySelector('#player, [data-jwplayer], .jwplayer');
             if (playerEl && jw.setup) {
                 jw.setup({
@@ -760,7 +929,21 @@ def _extract_embed_stream(
     }"""
 
     try:
-        page.set_content(wrapper_html)
+        # about:blank(null origin) 대신 실제 글 페이지의 origin 컨텍스트를 유지하여
+        # Chromium의 서드파티 스토리지/IndexedDB 샌드박스 차단을 원천 방지한다.
+        if page_url and page_url.startswith("http"):
+            try:
+                page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
+                page.evaluate(
+                    """(u) => {
+                        document.body.innerHTML = '<iframe id="player_frame" src="' + u + '" width="1280" height="720" allowfullscreen></iframe>';
+                    }""",
+                    embed_url,
+                )
+            except Exception:
+                page.set_content(wrapper_html)
+        else:
+            page.set_content(wrapper_html)
         # 플레이어 스크립트 로딩 + jwplayer 초기화를 위해 충분히 대기
         page.wait_for_timeout(5000)
 
@@ -786,8 +969,45 @@ def _extract_embed_stream(
                 break
             page.wait_for_timeout(1000)
 
-        # jwplayer가 존재하지만 소스가 없는 경우: setup 직접 시도
-        if not jw_ready:
+        # JWPlayer 및 실행 환경(sessionStorage 등) 세부 진단 수집
+        jw_diagnostics = None
+        for fr in page.frames:
+            if fr == page.main_frame:
+                continue
+            try:
+                diag_res = fr.evaluate(_JW_INSPECT_JS)
+                if diag_res and (diag_res.get("has_jwplayer") or diag_res.get("player_elements") or diag_res.get("storage_error")):
+                    jw_diagnostics = diag_res
+                    jw_diagnostics["frame_url"] = fr.url[:200]
+                    break
+            except Exception:
+                pass
+        if jw_diagnostics is None and len(page.frames) > 1:
+            try:
+                jw_diagnostics = page.frames[1].evaluate(_JW_INSPECT_JS)
+                if jw_diagnostics:
+                    jw_diagnostics["frame_url"] = page.frames[1].url[:200]
+            except Exception:
+                pass
+
+        if jw_diagnostics:
+            jw_info["jw_diagnostics"] = jw_diagnostics
+            if debug is not None:
+                debug["jw_diagnostics"] = jw_diagnostics
+            log_event(
+                "player_init",
+                "jw_inspection",
+                f"JW 초기화 진단: jw={jw_diagnostics.get('has_jwplayer')}, storage={jw_diagnostics.get('storage_status')}, instances={len(jw_diagnostics.get('instances', []))}",
+                level="INFO",
+                player_id=player_id,
+                frame_url=embed_url,
+                **{k: v for k, v in jw_diagnostics.items() if k not in ("player_elements", "frame_url")},
+            )
+
+        # 빈 소스 jwplayer.setup() 호출 fallback:
+        # 원래 페이지 초기화를 방해할 수 있으므로 VP_ENABLE_JW_EMPTY_SETUP 환경변수가 명시된 경우에만 실행
+        enable_empty_setup = os.environ.get("VP_ENABLE_JW_EMPTY_SETUP", "0").lower() in ("1", "true", "yes")
+        if not jw_ready and enable_empty_setup and not passive_mode:
             for fr in page.frames:
                 try:
                     setup_result = fr.evaluate(_JW_SETUP_JS)
@@ -844,7 +1064,26 @@ def _extract_embed_stream(
                 dom_items.extend(fr_items)
 
         if debug is not None:
-            _fill_page_debug(page, debug)
+            _fill_page_debug(page, debug, embed_url=embed_url)
+            embed_doc_resp = next(
+                (r for r in all_responses if _host(r.get("url", "")) == _host(embed_url) and r.get("status")),
+                None,
+            )
+            if embed_doc_resp:
+                debug["embed_doc_response"] = {
+                    "status": embed_doc_resp.get("status"),
+                    "content_type": embed_doc_resp.get("content_type"),
+                    "url": mask_url(embed_doc_resp.get("url", "")),
+                }
+            log_event(
+                "media_discovery",
+                "embed_frame_inspected",
+                f"임베드 프레임 검사: HTTP {debug.get('embed_doc_response', {}).get('status', '?')}, host={debug.get('embed_frame', {}).get('host', '?')}",
+                level="INFO",
+                frame_url=embed_url,
+                embed_frame=debug.get("embed_frame"),
+                embed_doc_response=debug.get("embed_doc_response"),
+            )
         jw_info["frames"] = [fr.url for fr in page.frames]
         diag.note_frames(jw_info["frames"])
     except Exception as e:
@@ -921,6 +1160,34 @@ try {
     if (q) navigator.permissions.query = (p) => p && p.name === 'notifications'
         ? Promise.resolve({ state: Notification.permission }) : q.call(navigator.permissions, p);
 } catch (e) {}
+
+// iframe 샌드박스로 인한 sessionStorage/localStorage SecurityError 방어 shim
+try {
+    const _t = '__st_test__';
+    window.sessionStorage.setItem(_t, '1');
+    window.sessionStorage.removeItem(_t);
+} catch (e) {
+    function _makeStorage() {
+        var s = {};
+        return {
+            getItem: function(k) { return s.hasOwnProperty(k) ? s[k] : null; },
+            setItem: function(k, v) { s[k] = String(v); },
+            removeItem: function(k) { delete s[k]; },
+            clear: function() { s = {}; },
+            key: function(i) { return Object.keys(s)[i] || null; },
+            get length() { return Object.keys(s).length; }
+        };
+    }
+    var _mockS = _makeStorage(), _mockL = _makeStorage();
+    try {
+        delete window.sessionStorage;
+        Object.defineProperty(window, 'sessionStorage', { get: function() { return _mockS; }, set: function() {}, configurable: true, enumerable: true });
+    } catch (_) {}
+    try {
+        delete window.localStorage;
+        Object.defineProperty(window, 'localStorage', { get: function() { return _mockL; }, set: function() {}, configurable: true, enumerable: true });
+    } catch (_) {}
+}
 """
 
 
@@ -998,6 +1265,7 @@ def discover_videos(
     click_selector: str | None = None,
     proxy: str | None = None,
     headless: bool = True,
+    passive: bool = False,
 ) -> list[dict[str, Any]]:
     """페이지 안의 모든 동영상을 DOM 순서대로 탐색한다.
 
@@ -1153,8 +1421,8 @@ def discover_videos(
                     break
                 if len(embed_urls) > 1:
                     log(f"    [{i}/{len(embed_urls)}] 스트림 추출: {eu[:90]}")
-                dbg: dict[str, Any] = {"headless": headless}
-                infos = _extract_embed_stream(ctx, eu, page_url=page_url, debug=dbg)
+                dbg: dict[str, Any] = {"headless": headless, "passive": passive}
+                infos = _extract_embed_stream(ctx, eu, page_url=page_url, debug=dbg, passive=passive)
                 for info in infos:
                     info["user_agent"] = ua
                     info["page_url"] = page_url
@@ -1189,20 +1457,23 @@ def discover_videos(
 
                     if target_frame is None:
                         match_info = g["debug"].get("iframe_match", {})
+                        reason_code = match_info.get("status", "target_embed_frame_not_found")
+                        reason_detail = match_info.get("reason_detail", reason_code)
                         g["debug"]["inpage"] = {
                             "player_found": 0,
                             "rejected": [],
-                            "reason": match_info.get("status", "target_embed_frame_not_found"),
+                            "reason": reason_detail,
                             "iframe_match": match_info,
                         }
                         log_event(
                             "media_discovery",
                             "player_frame_unresolved",
-                            "임베드 URL과 연결되는 iframe을 하나로 특정하지 못함",
+                            f"임베드 iframe 특정 실패 ({reason_detail})",
                             level="WARNING",
                             page_url=page_url,
                             frame_url=embed_url,
-                            iframe_match=g["debug"].get("iframe_match"),
+                            reason=reason_detail,
+                            iframe_match=match_info,
                         )
 
                         # 기존 continue 유지
@@ -1470,11 +1741,12 @@ def discover(
     click_selector: str | None = None,
     proxy: str | None = None,
     headless: bool = True,
+    passive: bool = False,
 ) -> list[dict[str, Any]]:
     """하위 호환: 모든 동영상의 후보를 평탄화해서 반환."""
     groups = discover_videos(
         page_url, wait_ms=wait_ms, click_selector=click_selector,
-        proxy=proxy, headless=headless,
+        proxy=proxy, headless=headless, passive=passive,
     )
     return [c for g in groups for c in g["candidates"]]
 
