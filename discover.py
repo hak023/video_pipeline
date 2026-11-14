@@ -1653,6 +1653,48 @@ def _enrich_candidates(cands: list[dict[str, Any]], proxy: str | None) -> None:
             log_event("classification", "enrich_failed", f"메타 보강 실패: {type(e).__name__}", level="DEBUG",
                       frame_url=u)
 
+def _merge_duplicate_candidates(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """완전히 같은 URL 후보의 DOM/네트워크 메타데이터를 분류 전에 병합한다."""
+    by_url: dict[str, dict[str, Any]] = {}
+    merged: list[dict[str, Any]] = []
+
+    for cand in cands:
+        url = cand.get("url")
+        if not url or url not in by_url:
+            item = dict(cand)
+            merged.append(item)
+            if url:
+                by_url[url] = item
+            continue
+
+        dst = by_url[url]
+        for key, value in cand.items():
+            if value is None:
+                continue
+
+            if key == "from_playlist":
+                dst[key] = bool(dst.get(key)) or bool(value)
+            elif key == "request_headers":
+                dst[key] = {**(dst.get(key) or {}), **(value or {})}
+            elif key == "cookies":
+                cookies = {
+                    (c.get("domain"), c.get("path"), c.get("name")): c
+                    for c in dst.get(key, [])
+                }
+                for cookie in value or []:
+                    cookies[(cookie.get("domain"), cookie.get("path"), cookie.get("name"))] = cookie
+                dst[key] = list(cookies.values())
+            elif key == "frame_url":
+                # 빈 문자열이나 about:blank보다 실제 프레임 URL을 우선한다.
+                if value and (not dst.get(key) or dst[key] == "about:blank"):
+                    dst[key] = value
+            elif key == "source":
+                # 기존 source 호환성을 유지한다. 별도 분류 입력으로 쓰지 않는다.
+                continue
+            elif dst.get(key) in (None, "", [], {}):
+                dst[key] = value
+
+    return merged
 
 def _finalize_items(
     raw_groups: list[dict[str, Any]],
@@ -1671,7 +1713,7 @@ def _finalize_items(
     diag = get_diagnostics()
     items: list[dict[str, Any]] = []
     for rg in raw_groups:
-        cands: list[dict[str, Any]] = rg.get("candidates") or []
+        cands = _merge_duplicate_candidates(rg.get("candidates") or [])
         try:
             with diag.stage("classification"):
                 _enrich_candidates(cands, proxy)

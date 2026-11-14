@@ -343,8 +343,28 @@ def _process_item(
         is_dead = r.pop("dead", False)
         if is_dead:
             n_dead += 1
-            blacklist.observe_ad(cand.get("url", ""), reason="dead_url", page_url=url)
         res.update(r)
+
+
+        # 제공자 계정/billing 오류는 광고 근거가 아니며, 다른 후보나 재탐색으로 해결되지 않는다.
+        if "UserProjectAccountProblem" in str(r.get("reason", "")):
+            reason = (
+                "provider_configuration_error: 미디어 제공자가 "
+                "billing 계정 오류(UserProjectAccountProblem)를 반환했습니다."
+            )
+            res.update(status="failed", fatal=True, reason=reason)
+            log_event(
+                "download",
+                "provider_configuration_error",
+                reason,
+                level="ERROR",
+                candidate_id=cand.get("candidate_id"),
+                group_id=group.get("group_id"),
+            )
+            diag.fail("download", reason)
+            return res
+
+
         if st == "ok":
             res["status"] = "ok"
             if not group.get("low_confidence"):
@@ -387,8 +407,15 @@ def _process_item(
         return res
     res["status"] = "failed"
     res.setdefault("reason", "all candidates failed")
-    if n_attempted and n_dead == n_attempted:
-        res["reason"] = "본편 스트림 미검출(폐기된 URL만 발견) - " + str(res["reason"])
+
+    all_tried_candidates_dead = (
+        n_attempted > 0
+        and n_dead == n_attempted
+        and n_attempted >= min(len(ordered), MAX_CANDIDATES_TRIED)
+    )
+    if all_tried_candidates_dead:
+        res["reason"] = "non_retryable_candidates: 모든 시도 후보가 제공 불가 상태였습니다. " + str(res["reason"])
+        res["fatal"] = True
     diag.fail("download", str(res["reason"]))
     return res
 
@@ -1000,7 +1027,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-pending", action="store_true",
                         help="본편 근거가 약한 PENDING 후보도 다운로드 시도 (기본값: False, 광고 오인 방지 fail-closed)")
     parser.add_argument("--passive-embed", action="store_true",
-                        help="진단 모드: 임베드 탐색 시 라우팅 인터셉트 및 스크립트 주입을 끄고 순수 상태로 관찰")
+                        help="임베드 탐색의 라우팅/스크립트 주입을 끔 (--discover-only와 함께 사용하면 다운로드 없이 진단)")
     parser.add_argument("--log-retain", type=int, default=DEFAULT_RETAIN, metavar="N",
                         help=f"logs/runs 에 보관할 최근 실행 수 (기본값: {DEFAULT_RETAIN}, 0이면 정리 안 함)")
     return parser
@@ -1022,6 +1049,19 @@ def _dispatch(args: argparse.Namespace, opts: Options, headless: bool) -> list[d
             "name": _name_from_url(args.url), "page_url": args.url, "wait_ms": 8000,
             "click_selector": "iframe >> video, .plyr__control--overlaid, button[aria-label*='Play'], .vjs-big-play-button",
         }
+
+        if args.discover_only:
+            groups = discover_videos(
+                t["page_url"],
+                wait_ms=t["wait_ms"],
+                click_selector=t["click_selector"],
+                proxy=args.proxy,
+                headless=headless,
+                passive=opts.passive_embed,
+            )
+            print(json.dumps(sanitize(groups), ensure_ascii=False, indent=2))
+            return None
+
         history = _open_history(opts)
         report = _run_batch([t], history, args.proxy, headless, args.force, opts)
         print(json.dumps(sanitize(report), ensure_ascii=False, indent=2))
@@ -1054,6 +1094,7 @@ def _dispatch(args: argparse.Namespace, opts: Options, headless: bool) -> list[d
                         click_selector=t.get("click_selector"),
                         proxy=args.proxy or t.get("proxy"),
                         headless=headless,
+                        passive=opts.passive_embed,
                     )
                 except DiscoverNavigationError as e:
                     log(f"  [Navigation Error] {e}")
