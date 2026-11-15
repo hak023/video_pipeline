@@ -281,6 +281,7 @@ def _host(url: str) -> str:
     except Exception:
         return ""
 
+
 def _is_descendant_frame(frame: Any, root: Any) -> bool:
     """frame이 root 프레임 자체이거나 그 하위 프레임인지 확인."""
     current = frame
@@ -313,11 +314,10 @@ def _find_embed_frame(
             resolved_src = urljoin(page.url, src).split("#", 1)[0]
 
             element = locator.element_handle()
-            
+
             frame = element.content_frame() if element else None
             frame_url = (frame.url or "").split("#", 1)[0] if frame else ""
 
-            # src는 원본 iframe 주소, frame.url은 리다이렉트 후 주소일 수 있다.
             src_matches = resolved_src == expected
             frame_matches = frame_url == expected
             host_matches = (_host(resolved_src) == expected_host) or (_host(frame_url) == expected_host)
@@ -351,7 +351,6 @@ def _find_embed_frame(
                 "error": f"{type(e).__name__}: {str(e).splitlines()[0][:150]}",
             })
 
-    # 동일한 Frame 객체가 중복 수집된 경우는 한 개로 취급한다.
     unique_matches: list[tuple[Any, tuple[float, float] | None]] = []
     seen_frames: set[int] = set()
     for frame, point in matches:
@@ -374,7 +373,6 @@ def _find_embed_frame(
             }
         return unique_matches[0]
 
-    # 매칭 실패 세부 사유 분석
     if not inspected:
         reason_detail = "dom_no_iframes"
     elif not any(x.get("frame_found") for x in inspected):
@@ -398,6 +396,7 @@ def _find_embed_frame(
         }
 
     return None, None
+
 
 def _has_real_stream(candidates) -> bool:
     """재생 루프를 멈춰도 될 만큼 '본편일 가능성이 있는' 후보가 있는지.
@@ -485,7 +484,7 @@ def _media_candidate(
     path = urlparse(u).path.lower()
     ctype = (resp.headers.get("content-type") or "").lower()
     if path.endswith(_SEGMENT_EXT) or "mp2t" in ctype or "segment" in ctype:
-        return None  # HLS/DASH 조각
+        return None
 
     clean_path = u.split("?")[0].lower()
     path_media = path.endswith((".m3u8", ".mpd", ".mp4")) or clean_path.endswith((".m3u8", ".mpd", ".mp4"))
@@ -517,14 +516,10 @@ def _media_candidate(
 
     if allowed_hosts is not None:
         fh = _host(frame_url)
-
-        # 플레이어 호스트 자체에서 온 요청은 허용한다.
-        # 플레이어 클릭 중 최상위 글 페이지에서 발생한 요청은 호출부에서 별도 귀속한다.
         if fh not in allowed_hosts and not is_main_frame:
             why = f"frame_unresolved:{fh or '?'}"
             if trace is not None and len(trace) < 12:
                 trace.append({"url": u[:140], "why": why})
-            # 프레임 귀속 실패는 광고 판정이 아니다. AD 후보를 만들지 않는다.
             return None
 
     return {
@@ -605,8 +600,8 @@ def _play_until_stream(
             isinstance(c, dict) and (c.get("dom_duration") or 0) >= REAL_VIDEO_SECONDS for c in captured.values())
         if _has_real_stream(captured.values() if isinstance(captured, dict) else captured) or longest > REAL_VIDEO_SECONDS:
             if not confirmed:
-                page.wait_for_timeout(2500)   # 길이로 확인되지 않은 스트림: 광고 뒤에 본편 요청이 이어지는지 추가 관찰
-            page.wait_for_timeout(1000)   # 플레이리스트/후속 요청이 잡히도록 잠깐 대기
+                page.wait_for_timeout(2500)
+            page.wait_for_timeout(1000)
             return True
     page.wait_for_timeout(wait_ms)
     return _has_real_stream(captured.values() if isinstance(captured, dict) else captured)
@@ -618,14 +613,12 @@ def _fill_page_debug(page, debug: dict[str, Any], embed_url: str = "") -> None:
     래퍼 페이지(about:blank)와 임베드 프레임 자체의 문서 상태·제목·본문을 구별하여 기록한다.
     """
     try:
-        # 1. 래퍼 페이지 정보 (about:blank 등)
         debug["wrapper"] = {
             "url": page.url[:150],
             "title": (page.title() or "")[:80],
             "frame_count": len(page.frames),
         }
 
-        # 2. 임베드 프레임 탐색
         embed_frame = None
         target_host = _host(embed_url) if embed_url else ""
         for fr in page.frames:
@@ -638,7 +631,6 @@ def _fill_page_debug(page, debug: dict[str, Any], embed_url: str = "") -> None:
         if embed_frame is None and len(page.frames) > 1:
             embed_frame = page.frames[1]
 
-        # 3. 임베드 프레임 상태 추출
         if embed_frame is not None:
             fr_url = embed_frame.url or ""
             fr_title = ""
@@ -698,9 +690,6 @@ def _extract_embed_stream(
     dom_items: list[dict[str, Any]] = []
     page = _own_page(ctx)
 
-    # fuckadblock 감지 우회:
-    # 1. fuckadblock.min.js 자체를 빈 스크립트로 차단
-    # 2. embed 플레이어 HTML에 anti-fuckadblock 스크립트를 직접 주입 (cross-origin iframe은 add_init_script 적용 불가)
     _ANTI_FUCKADBLOCK_SNIPPET = (
         "<script>"
         "window.fuckAdBlock=window.blockAdBlock={"
@@ -716,24 +705,19 @@ def _extract_embed_stream(
     _embed_host = _host(embed_url)
 
     def _route_embed_inject(route):
-        """embed 플레이어 HTML에 anti-fuckadblock 스크립트를 주입한다."""
         req = route.request
         u = req.url
         url_host = _host(u)
-        # fuckadblock 스크립트 자체 차단 (확장된 매칭)
         if "fuckadblock" in u.lower() or "fuckAdBlock" in u:
             route.fulfill(status=200, body="", content_type="text/javascript")
             return
-        # iamcdn.net/player 경로의 모든 fuckadblock 관련 스크립트 차단
         if url_host == "iamcdn.net" and "fuckadblock" in u.lower():
             route.fulfill(status=200, body="", content_type="text/javascript")
             return
-        # embed 플레이어 HTML에만 스크립트 주입 (다른 리소스는 패스)
         if url_host == _embed_host and req.resource_type == "document":
             try:
                 resp = route.fetch()
                 body = resp.body().decode("utf-8", errors="replace")
-                # <head> 직후에 anti-fuckadblock 삽입 (첫 번째 자식으로)
                 if "<head>" in body:
                     body = body.replace("<head>", "<head>" + _ANTI_FUCKADBLOCK_SNIPPET, 1)
                 elif "<html>" in body:
@@ -768,7 +752,6 @@ def _extract_embed_stream(
     jw_info: dict[str, Any] = {"embed_url": embed_url, "page_url": page_url, "kind": "embed_direct"}
     t_start = time.monotonic()
 
-    # 진단: 최근 요청/응답 요약 (report debug 용, 상한 있음)
     all_requests: list[dict[str, Any]] = []
     all_responses: list[dict[str, Any]] = []
 
@@ -805,7 +788,6 @@ def _extract_embed_stream(
         "</body></html>"
     )
 
-    # jwplayer 초기화 완료를 대기하는 JS (최대 N회 폴링)
     _JW_READY_JS = """() => {
         try {
             if (typeof jwplayer !== 'function') return null;
@@ -818,7 +800,6 @@ def _extract_embed_stream(
         } catch(e) { return null; }
     }"""
 
-    # jwplayer 및 실행 환경 상세 진단 JS
     _JW_INSPECT_JS = """() => {
         try {
             const res = {
@@ -905,7 +886,6 @@ def _extract_embed_stream(
         }
     }"""
 
-    # jwplayer.setup() 직접 호출 시도 JS (빈 소스 setup은 악영향을 주므로 환경변수 활성화 시에만 사용)
     _JW_SETUP_JS = """() => {
         try {
             if (typeof jwplayer !== 'function') return 'no_jwplayer';
@@ -929,8 +909,6 @@ def _extract_embed_stream(
     }"""
 
     try:
-        # about:blank(null origin) 대신 실제 글 페이지의 origin 컨텍스트를 유지하여
-        # Chromium의 서드파티 스토리지/IndexedDB 샌드박스 차단을 원천 방지한다.
         if page_url and page_url.startswith("http"):
             try:
                 page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
@@ -944,11 +922,8 @@ def _extract_embed_stream(
                 page.set_content(wrapper_html)
         else:
             page.set_content(wrapper_html)
-        # 플레이어 스크립트 로딩 + jwplayer 초기화를 위해 충분히 대기
         page.wait_for_timeout(5000)
 
-        # jwplayer 초기화 완료될 때까지 폴링. 5회(약 10초 시점) 지나도 어느 프레임에도 jwplayer 자체가 없으면
-        # JW 플레이어가 아닌 것으로 보고 기다리지 않는다 (JW 가 있으면 기존처럼 최대 15회까지 대기).
         jw_ready = False
         jw_present = False
         for _poll in range(15):
@@ -969,7 +944,6 @@ def _extract_embed_stream(
                 break
             page.wait_for_timeout(1000)
 
-        # JWPlayer 및 실행 환경(sessionStorage 등) 세부 진단 수집
         jw_diagnostics = None
         for fr in page.frames:
             if fr == page.main_frame:
@@ -1004,8 +978,6 @@ def _extract_embed_stream(
                 **{k: v for k, v in jw_diagnostics.items() if k not in ("player_elements", "frame_url")},
             )
 
-        # 빈 소스 jwplayer.setup() 호출 fallback:
-        # 원래 페이지 초기화를 방해할 수 있으므로 VP_ENABLE_JW_EMPTY_SETUP 환경변수가 명시된 경우에만 실행
         enable_empty_setup = os.environ.get("VP_ENABLE_JW_EMPTY_SETUP", "0").lower() in ("1", "true", "yes")
         if not jw_ready and enable_empty_setup and not passive_mode:
             for fr in page.frames:
@@ -1013,7 +985,6 @@ def _extract_embed_stream(
                     setup_result = fr.evaluate(_JW_SETUP_JS)
                     if setup_result == 'setup_called':
                         log(f"    [JW SETUP] jwplayer.setup() 직접 호출 성공 ({fr.url[:60]})")
-                        # setup 후 3초 더 대기 후 재확인
                         page.wait_for_timeout(3000)
                         for _poll2 in range(5):
                             try:
@@ -1049,16 +1020,13 @@ def _extract_embed_stream(
             log_event("player_init", "jw_absent", "JWPlayer 없음(일반 플레이어로 진행)", level="INFO",
                       player_id=player_id, frame_url=embed_url, waited_sec=jw_info["init_wait_sec"])
 
-        # 1. 로드 직후 원본 DOM / jwplayer 소스 우선 수집
         for fr_items in _eval_frames(page, _DOM_MEDIA_JS, None):
             if fr_items:
                 dom_items.extend(fr_items)
 
-        # 2. 재생 시도 (오버레이 해제 및 클릭)
         stream_ok = _play_until_stream(page, captured, wait_ms, click_hosts=None, video_hosts=None)
         jw_info["play_result"] = "stream_found" if stream_ok else "no_stream_after_play"
 
-        # 3. 재생 후 추가/교체된 DOM 미디어 수집
         for fr_items in _eval_frames(page, _DOM_MEDIA_JS, None):
             if fr_items:
                 dom_items.extend(fr_items)
@@ -1132,7 +1100,6 @@ def _extract_embed_stream(
         if dur is not None and dur > 0:
             c["dom_duration"] = float(dur)
 
-    # 네트워크 응답에서 캡처된 미디어 병합 (DOM 후보와 같은 URL 이면 네트워크 메타정보를 보강)
     for u, c in captured.items():
         if u in cands:
             for k in ("status", "content_length", "frame_url", "request_headers", "play_order"):
@@ -1161,7 +1128,6 @@ try {
         ? Promise.resolve({ state: Notification.permission }) : q.call(navigator.permissions, p);
 } catch (e) {}
 
-// iframe 샌드박스로 인한 sessionStorage/localStorage SecurityError 방어 shim
 try {
     const _t = '__st_test__';
     window.sessionStorage.setItem(_t, '1');
@@ -1191,9 +1157,14 @@ try {
 """
 
 
-def _launch_browser(p, headless: bool, proxy: str | None):
-    """headless 일 때 '새 headless 모드'(full Chromium)를 우선 사용 - 구형 headless-shell 보다 봇 탐지에 덜 걸림.
-    실패하면 기존 방식으로 실행한다."""
+def _launch_browser(p, headless: bool, proxy: str | None, cdp_url: str | None = None):
+    """CDP URL이 있으면 기존 Chrome 연결을 사용하고, 없으면 새 브라우저를 띄운다."""
+    if cdp_url:
+        try:
+            log(f"[CDP] 연결 시도: {cdp_url}")
+            return p.chromium.connect_over_cdp(cdp_url)
+        except Exception as exc:
+            raise DiscoverNavigationError(f"CDP 연결 실패: {cdp_url} ({exc})") from exc
     kwargs = get_browser_launch_kwargs(headless=headless, proxy=proxy)
     if headless and "channel" not in kwargs and "executable_path" not in kwargs:
         try:
@@ -1204,7 +1175,7 @@ def _launch_browser(p, headless: bool, proxy: str | None):
 
 
 MAX_VIDEOS_PER_PAGE = 50
-DISCOVER_BUDGET_SEC = 360      # 글 1개의 탐색(임베드 순회) 시간 예산. 광고 iframe 이 많은 글에서 끝없이 늘어지는 것을 막는다
+DISCOVER_BUDGET_SEC = 360
 
 
 def _site_key(host: str) -> str:
@@ -1215,7 +1186,6 @@ def _site_key(host: str) -> str:
 
 
 def _page_hijacked(page, page_url: str) -> bool:
-    """글 페이지가 광고 스크립트에 의해 다른 사이트로 이동했는지 (같은 사이트의 미러/서브도메인은 정상)."""
     try:
         now = _host(page.url)
     except Exception:
@@ -1227,7 +1197,6 @@ def _page_hijacked(page, page_url: str) -> bool:
               page_url=page_url, final_host=now)
     return True
 
-# 페이지 내 모든 임베드 플레이어 URL을 DOM 순서대로 수집
 _EMBED_JS = """() => {
     const urls = [];
     const add = (u) => { if (u && /^https?:/i.test(u) && !urls.includes(u)) urls.push(u); };
@@ -1241,14 +1210,13 @@ _EMBED_JS = """() => {
     document.querySelectorAll('iframe').forEach(i => {
         const u = i.src || i.getAttribute('data-src') || i.getAttribute('data-lazy-src') || '';
         if (/upns|tellmewhy|embed/i.test(u)) add(u);
-        else if (u && i.clientWidth >= 400 && i.clientHeight >= 200) add(u);   // 728x90, 300x250 등 광고 배너는 제외
+        else if (u && i.clientWidth >= 400 && i.clientHeight >= 200) add(u);
     });
     return urls;
 }"""
 
 
 def _scroll_page(page) -> None:
-    """지연 로딩(lazy-load)되는 플레이어를 모두 불러오기 위해 끝까지 스크롤."""
     try:
         for _ in range(4):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -1266,32 +1234,17 @@ def discover_videos(
     proxy: str | None = None,
     headless: bool = True,
     passive: bool = False,
+    cdp_url: str | None = None,
 ) -> list[dict[str, Any]]:
-    """페이지 안의 모든 동영상을 DOM 순서대로 탐색한다.
-
-    반환: [{"index": 1, "embed_url": str|None, "candidates": [stream_info, ...], "group_id", "low_confidence",
-            "ad_excluded", "debug"}, ...]
-    수집된 후보는 판별(MAIN/AD/PENDING)·그룹화를 거쳐 '영상 단위 항목'이 된다. 항목의 candidates 는 다운로드
-    시도 순서이며, 광고로 판별된 후보는 포함되지 않는다(근거는 candidates.json 에 기록).
-    본편을 못 찾은 임베드도 candidates=[] 로 포함한다 (인덱스가 고정되어 재시도/히스토리 키가 안정적).
-
-    탐색 순서
-      A) 임베드 URL 을 Referer 와 함께 직접 열어 플레이어 프레임의 요청만 수집
-      B) A 로 본편(m3u8/mpd)을 못 얻으면, 글 페이지에서 직접 재생 버튼을 눌러
-         '플레이어 iframe 에서 발생한 요청'만 수집 (도메인 잠금/클릭 2회 구조 대응)
-      C) 임베드가 아예 없는 페이지: 클릭 후 네트워크/DOM 에서 탐색 (프레임 제한 없이 수집 후 판별)
-    """
     active_player: dict[str, Any] = {
         "index": None,
         "frame": None,
     }
-    found: dict[str, dict[str, Any]] = {}           # 모든 프레임의 미디어 (C 용)
-    player_found: dict[str, dict[str, Any]] = {}    # 플레이어 프레임에서 발생한 미디어만 (B 용)
+    found: dict[str, dict[str, Any]] = {}
+    player_found: dict[str, dict[str, Any]] = {}
     player_hosts: set[str] = set()
-    trace_b: list[dict[str, str]] = []              # B 에서 거절된 요청 (진단용)
+    trace_b: list[dict[str, str]] = []
     popups0 = _popup_count()
-    # Playwright 동기 API 는 핸들러 안의 왕복 호출(all_headers 등) 중에 다른 응답 핸들러가 끼어들 수 있으므로
-    # 순번은 핸들러 시작 시점에 확보한다 (len(dict)+1 은 경합한다).
     order_counter = itertools.count(1)
 
     def on_response(resp) -> None:
@@ -1312,18 +1265,14 @@ def discover_videos(
                 response_frame = resp.frame
             except Exception:
                 response_frame = None
-
             target_frame = active_player["frame"]
             group_index = active_player["index"]
-
-            # B 경로에서는 현재 재생 중인 플레이어와 연결된 응답만 받는다.
             if group_index is not None:
                 is_main = False
                 try:
                     is_main = response_frame.parent_frame is None
                 except Exception:
                     pass
-
                 belongs_to_active = (
                     is_main
                     or (
@@ -1334,7 +1283,6 @@ def discover_videos(
                 )
                 if not belongs_to_active:
                     return
-
                 try:
                     c = _media_candidate(
                         resp,
@@ -1345,7 +1293,6 @@ def discover_videos(
                 except Exception as e:
                     log_exception("media_discovery", e, page_url=page_url)
                     return
-
                 if c:
                     c["inpage_group_index"] = group_index
                     if c["url"] not in player_found and len(player_found) < MAX_CAPTURED:
@@ -1362,11 +1309,13 @@ def discover_videos(
     deadline = time.monotonic() + budget_sec
 
     with sync_playwright() as p:
-        browser = _launch_browser(p, headless, proxy)
-        ctx = browser.new_context(**get_context_kwargs(ua))
+        browser = _launch_browser(p, headless, proxy, cdp_url=cdp_url)
+        if cdp_url:
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context(**get_context_kwargs(ua))
+            log(f"[CDP] 기존 Chrome 세션 연결 완료: {cdp_url}")
+        else:
+            ctx = browser.new_context(**get_context_kwargs(ua))
         ctx.add_init_script(_STEALTH_JS)
-
-        # 광고 팝업: 우리가 만든 페이지가 아닌 새 탭은 모두 즉시 닫기
         ctx.on("page", _close_stray_page)
 
         page = _own_page(ctx)
@@ -1376,17 +1325,18 @@ def discover_videos(
         try:
             resp = page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
         except Exception as e:
-            browser.close()
+            if not cdp_url:
+                browser.close()
             log_event("navigation", "goto_failed", f"페이지 접속 실패: {str(e).splitlines()[0]}", level="WARNING", page_url=page_url)
             raise DiscoverNavigationError(str(e).splitlines()[0]) from e
         status = resp.status if resp else None
         log_event("navigation", "page_loaded", f"페이지 로드 (HTTP {status})", page_url=page_url, status=status, final_url=page.url)
         if status is not None and status >= 400:
-            browser.close()
+            if not cdp_url:
+                browser.close()
             log_event("navigation", "http_error", f"페이지 HTTP {status}", level="WARNING", page_url=page_url, status=status)
             raise DiscoverNavigationError(f"HTTP {status}", status=status)
 
-        # 1. 페이지 내 모든 임베드 플레이어 수집 (스크롤로 lazy-load 유도)
         try:
             page.wait_for_timeout(1500)
             _scroll_page(page)
@@ -1395,7 +1345,8 @@ def discover_videos(
             diag.note_frames([fr.url for fr in page.frames])
         except Exception as e:
             if not _is_closed_error(e):
-                browser.close()
+                if not cdp_url:
+                    browser.close()
                 raise DiscoverNavigationError(str(e).splitlines()[0]) from e
             page_closed = True
         if not embed_urls:
@@ -1409,7 +1360,6 @@ def discover_videos(
             log_event("media_discovery", "embeds_detected", f"임베드 플레이어 {len(embed_urls)}개 감지",
                       page_url=page_url, embeds=[str(u)[:150] for u in embed_urls])
 
-            # ---- A) 임베드 직접 열기 (페이지당 시간 예산 안에서; 초과분은 빈 항목으로 남겨 인덱스를 고정)
             for i, eu in enumerate(embed_urls, 1):
                 if time.monotonic() > deadline:
                     log_event("media_discovery", "budget_exceeded", f"탐색 시간 예산({budget_sec}s) 초과: 임베드 {i}번째부터 생략",
@@ -1419,8 +1369,6 @@ def discover_videos(
                         groups.append({"index": j, "embed_url": embed_urls[j - 1], "candidates": [],
                                        "debug": {"headless": headless, "skipped": "discover_budget"}})
                     break
-                if len(embed_urls) > 1:
-                    log(f"    [{i}/{len(embed_urls)}] 스트림 추출: {eu[:90]}")
                 dbg: dict[str, Any] = {"headless": headless, "passive": passive}
                 infos = _extract_embed_stream(ctx, eu, page_url=page_url, debug=dbg, passive=passive)
                 for info in infos:
@@ -1428,10 +1376,9 @@ def discover_videos(
                     info["page_url"] = page_url
                 groups.append({"index": i, "embed_url": eu, "candidates": infos, "debug": dbg})
 
-            # ---- B) 본편(m3u8/mpd/충분한 길이의 mp4)을 못 얻은 플레이어: 글 페이지에서 직접 재생
             need_b = [g for g in groups if not g["debug"].get("skipped") and not _has_real_stream(g["candidates"])]
             if need_b and not page_closed and _page_hijacked(page, page_url):
-                need_b = []     # 광고가 글 페이지를 다른 사이트로 옮겼다: 그 사이트에서는 클릭/재생하지 않는다
+                need_b = []
             if need_b and not page_closed and time.monotonic() > deadline:
                 log_event("media_discovery", "budget_exceeded", "탐색 시간 예산 초과: 글 페이지 직접 재생(B) 생략", level="WARNING",
                           page_url=page_url)
@@ -1475,10 +1422,8 @@ def discover_videos(
                             reason=reason_detail,
                             iframe_match=match_info,
                         )
+                        continue
 
-                        # 기존 continue 유지
-                        continue                    
-                    
                     active_player["index"] = g["index"]
                     active_player["frame"] = target_frame
                     before = set(player_found)
@@ -1553,16 +1498,15 @@ def discover_videos(
                     frames_now = []
                 diag.note_frames(frames_now)
 
-            try:
-                browser.close()
-            except Exception:
-                pass
+            if not cdp_url:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
             for g in groups:
                 g["debug"]["popups_closed"] = _popup_count() - popups0
-            # 임베드가 있으면 광고가 섞인 C 경로로 내려가지 않는다
             return _finalize_items(groups, page_url=page_url, proxy=proxy, player_hosts=player_hosts)
 
-        # ---- C) 임베드 없음: 클릭 후 DOM/네트워크에서 탐색
         if click_selector and not page_closed:
             try:
                 page.click(click_selector, timeout=5000, force=True)
@@ -1582,7 +1526,6 @@ def discover_videos(
                     raise
                 page_closed = True
 
-        # Inspect DOM videos / JW playlist in main page and all child frames (iframes)
         try:
             for fr_items in _eval_frames(page, _DOM_MEDIA_JS, None):
                 for it in fr_items or []:
@@ -1608,13 +1551,13 @@ def discover_videos(
         except Exception:
             pass
 
-        try:
-            browser.close()
-        except Exception:
-            pass
+        if not cdp_url:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     if page_closed and not found:
-        # 광고 리다이렉트/브라우저 크래시 등으로 페이지가 닫힘 → 새 브라우저로 재시도
         raise DiscoverNavigationError("page/browser closed before media was found")
 
     if not found:
@@ -1626,15 +1569,13 @@ def discover_videos(
         info["user_agent"] = ua
         info["page_url"] = page_url
     return _finalize_items([{"index": 1, "embed_url": None, "candidates": pretty, "debug": {"headless": headless}}],
-                           page_url=page_url, proxy=proxy, player_hosts=set())
+                          page_url=page_url, proxy=proxy, player_hosts=set())
 
 
-# ----------------------------------------------------------------- 수집 이후: 보강 → 판별 → 그룹화
 MAX_ENRICH = 40
 
 
 def _enrich_candidates(cands: list[dict[str, Any]], proxy: str | None) -> None:
-    """판별에 필요한 메타정보(HLS 종류/길이, mp4 용량)를 보강한다. 실패해도 조용히 넘어가며 이벤트만 남긴다."""
     for c in cands[:MAX_ENRICH]:
         u = c["url"]
         path = urlparse(u).path.lower()
@@ -1653,8 +1594,8 @@ def _enrich_candidates(cands: list[dict[str, Any]], proxy: str | None) -> None:
             log_event("classification", "enrich_failed", f"메타 보강 실패: {type(e).__name__}", level="DEBUG",
                       frame_url=u)
 
+
 def _merge_duplicate_candidates(cands: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """완전히 같은 URL 후보의 DOM/네트워크 메타데이터를 분류 전에 병합한다."""
     by_url: dict[str, dict[str, Any]] = {}
     merged: list[dict[str, Any]] = []
 
@@ -1685,16 +1626,15 @@ def _merge_duplicate_candidates(cands: list[dict[str, Any]]) -> list[dict[str, A
                     cookies[(cookie.get("domain"), cookie.get("path"), cookie.get("name"))] = cookie
                 dst[key] = list(cookies.values())
             elif key == "frame_url":
-                # 빈 문자열이나 about:blank보다 실제 프레임 URL을 우선한다.
                 if value and (not dst.get(key) or dst[key] == "about:blank"):
                     dst[key] = value
             elif key == "source":
-                # 기존 source 호환성을 유지한다. 별도 분류 입력으로 쓰지 않는다.
                 continue
             elif dst.get(key) in (None, "", [], {}):
                 dst[key] = value
 
     return merged
+
 
 def _finalize_items(
     raw_groups: list[dict[str, Any]],
@@ -1703,13 +1643,6 @@ def _finalize_items(
     proxy: str | None,
     player_hosts: set[str],
 ) -> list[dict[str, Any]]:
-    """수집된 후보 전체를 판별(MAIN/AD/PENDING)하고 영상 단위로 그룹화해 처리 항목 목록을 만든다.
-
-    - 광고로 판별된 후보도 제거 근거와 함께 candidates.json 에 남는다.
-    - 임베드마다 MAIN 그룹이 있으면 MAIN 그룹 + 광고 근거가 전혀 없는 PENDING 그룹을 항목으로 만든다.
-      MAIN 이 없으면 PENDING 그룹을 모두 항목으로 만들고 low_confidence 로 표시한다.
-    - 항목의 candidates 는 다운로드 시도 순서로 정렬되어 있다. 항목 index 는 1부터 연속.
-    """
     diag = get_diagnostics()
     items: list[dict[str, Any]] = []
     for rg in raw_groups:
@@ -1747,7 +1680,6 @@ def _finalize_items(
                                     diag.update_candidate(m["candidate_id"], excluded_reason="pending_with_ad_evidence")
                 kept.sort(key=lambda g: g["group_id"])
         except Exception as e:
-            # 판별 계층의 오류가 탐색 결과를 잃게 하지 않는다: 후보를 전부 PENDING 으로 두고 그대로 전달
             log_exception("classification", e, page_url=page_url)
             for c in cands:
                 c.setdefault("classification", "PENDING")
@@ -1784,11 +1716,11 @@ def discover(
     proxy: str | None = None,
     headless: bool = True,
     passive: bool = False,
+    cdp_url: str | None = None,
 ) -> list[dict[str, Any]]:
-    """하위 호환: 모든 동영상의 후보를 평탄화해서 반환."""
     groups = discover_videos(
         page_url, wait_ms=wait_ms, click_selector=click_selector,
-        proxy=proxy, headless=headless, passive=passive,
+        proxy=proxy, headless=headless, passive=passive, cdp_url=cdp_url,
     )
     return [c for g in groups for c in g["candidates"]]
 
@@ -1797,11 +1729,6 @@ def rank_candidates(
     candidates: list[dict[str, Any]],
     proxy: str | None = None,
 ) -> list[dict[str, Any]]:
-    """다운로드 시도 순서로 정렬한 후보 목록 (--discover-only/select_best 용; 판별은 하지 않는다).
-
-    m3u8(master → media → 기타) > mpd > mp4(화질/용량 큰 순). master 아래 하위 playlist 는 제외.
-    앞 후보가 실패(403 등)하면 호출측이 다음 후보를 시도한다.
-    """
     if not candidates:
         return []
     _enrich_candidates(candidates, proxy)
@@ -1816,7 +1743,6 @@ def select_best(
     return ranked[0] if ranked else None
 
 
-# ----------------------------------------------------------------- duration probe
 _EXTINF_RE = re.compile(r"#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)")
 _BANDWIDTH_RE = re.compile(r"BANDWIDTH=(\d+)")
 
@@ -1848,7 +1774,6 @@ def _fetch_text(
 
 
 def _m3u8_duration(info: dict[str, Any], proxy: str | None) -> float | None:
-    """m3u8 플레이리스트의 #EXTINF 합계로 총 길이 계산 (master면 variant를 따라감)."""
     url = info["url"]
     ref, ua = info.get("referer", ""), info.get("user_agent", "")
     text = _fetch_text(url, ref, ua, proxy)
@@ -1872,7 +1797,7 @@ def _m3u8_duration(info: dict[str, Any], proxy: str | None) -> float | None:
         if text is None:
             return None
     if "#EXT-X-ENDLIST" not in text:
-        return None  # 라이브/불완전 → 판단 불가
+        return None
     total = sum(float(x) for x in _EXTINF_RE.findall(text))
     return total if total > 0 else None
 
@@ -1916,8 +1841,6 @@ def _ffprobe_duration(info: dict[str, Any], proxy: str | None) -> float | None:
 
 
 def probe_duration(info: dict[str, Any], proxy: str | None = None) -> float | None:
-    """다운로드 전에 영상 길이(초)를 추정. 알 수 없으면 None (다운로드 후 재검사).
-    탐색 단계에서 이미 구한 길이(duration)가 있으면 재요청하지 않는다."""
     cached = info.get("duration")
     if isinstance(cached, (int, float)) and cached > 0:
         return float(cached)
