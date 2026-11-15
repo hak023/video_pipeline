@@ -173,3 +173,370 @@ P0 변경 후 전체 코어 테스트 통과.
 - P1(헤더 재현): `discover.py:_REPLAY_HEADERS` / `download.py:_REPLAY_OK`에 `range`, `if-range`, `x-goog-user-project` 추가 — 계획대로 미진행
 
 **참고**: 기존 테스트 43개는 모두 통과했습니다. 다만 `test_sanitize_drops_cookies_and_request_headers`가 과거 정책(요청 헤더 전체 drop)을 단언하던 테스트였기에, 새 동작에 맞게 수정했습니다. (사용자 요청대로 테스트 보강은 이후 별도 진행)
+
+## 후속 정보
+현재 P1과 P2가 완료된것으로 보임. 확인 필요.
+
+## 수동 성공시 manual playback 결과 로그
+'''
+{
+  "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+  "captured_at": "2026-11-16T00:01:12.220383+09:00",
+  "response_event_count": 1,
+  "responses": [
+    {
+      "url": "https://storage.googleapis.com/mediastorage/1794754864223/fmv3js6rok/167382505.mp4",
+      "status": 206,
+      "status_text": "",
+      "content_type": "video/mp4",
+      "content_length": "167382505",
+      "content_range": "bytes 0-167382504/167382505",
+      "accept_ranges": "bytes",
+      "content_disposition": null,
+      "response_headers": {
+        "accept-ranges": "bytes",
+        "cache-control": "no-cache, no-store, must-revalidate, max-age=0",
+        "content-length": "167382505",
+        "content-type": "video/mp4",
+        "content-range": "bytes 0-167382504/167382505"
+      },
+      "request_method": "GET",
+      "resource_type": "media",
+      "frame_url": "https://1465544.xyz/?v=[OMITTED]",
+      "observed_at": "2026-11-16T00:01:04.500+09:00"
+    }
+  ],
+  "downloads": [],
+  "network_events": [
+    {
+      "event": "page_attached",
+      "observed_at": "2026-11-16T00:00:52.217+09:00",
+      "page_url": "about:blank"
+    },
+    {
+      "event": "page_attached",
+      "observed_at": "2026-11-16T00:00:52.219+09:00",
+      "page_url": "about:blank"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.248+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.249+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "page_error",
+      "observed_at": "2026-11-16T00:00:54.256+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "error": "afa3igj"
+    },
+    {
+      "event": "page_error",
+      "observed_at": "2026-11-16T00:00:54.257+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "error": "afa3igj"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.308+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.309+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.330+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.331+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.334+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.335+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.416+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.417+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.420+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.421+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.440+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.442+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.446+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:54.447+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:55.038+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:00:55.040+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:01:04.273+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: the server responded with a status of 400 ()"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:01:04.275+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: the server responded with a status of 400 ()"
+    },
+    {
+      "event": "media_request",
+      "observed_at": "2026-11-16T00:01:04.498+09:00",
+      "url": "https://storage.googleapis.com/mediastorage/1794754864223/fmv3js6rok/167382505.mp4",
+      "method": "GET",
+      "resource_type": "media",
+      "frame_url": "https://1465544.xyz/?v=[OMITTED]",
+      "is_navigation_request": false
+    },
+    {
+      "event": "media_response",
+      "observed_at": "2026-11-16T00:01:04.500+09:00",
+      "url": "https://storage.googleapis.com/mediastorage/1794754864223/fmv3js6rok/167382505.mp4",
+      "status": 206,
+      "status_text": "",
+      "content_type": "video/mp4",
+      "content_length": "167382505",
+      "content_range": "bytes 0-167382504/167382505",
+      "accept_ranges": "bytes",
+      "content_disposition": null,
+      "response_headers": {
+        "accept-ranges": "bytes",
+        "cache-control": "no-cache, no-store, must-revalidate, max-age=0",
+        "content-length": "167382505",
+        "content-type": "video/mp4",
+        "content-range": "bytes 0-167382504/167382505"
+      },
+      "request_method": "GET",
+      "resource_type": "media",
+      "frame_url": "https://1465544.xyz/?v=[OMITTED]"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:01:06.048+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "console_error",
+      "observed_at": "2026-11-16T00:01:06.050+09:00",
+      "page_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+      "message": "Failed to load resource: net::ERR_BLOCKED_BY_CLIENT"
+    },
+    {
+      "event": "final_snapshot",
+      "observed_at": "2026-11-16T00:01:12.220+09:00",
+      "frames": [
+        {
+          "url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/",
+          "title": "유백설-362540 - Watch Free JAV Online - Free JAV Porn Online",
+          "readyState": "complete",
+          "jwplayers": [],
+          "videos": [
+            {
+              "index": 0,
+              "src": null,
+              "readyState": 0,
+              "networkState": 0,
+              "paused": true,
+              "currentTime": 0,
+              "duration": null,
+              "videoWidth": 0,
+              "videoHeight": 0,
+              "error": null
+            }
+          ],
+          "sources": [],
+          "frame_index": 0,
+          "frame_url": "https://s29.watchfreejavonline.co/%ec%9c%a0%eb%b0%b1%ec%84%a4-362540/"
+        },
+        {
+          "url": "chrome-error://chromewebdata/",
+          "title": "creative.whitetrafsa.com",
+          "readyState": "complete",
+          "jwplayers": [],
+          "videos": [],
+          "sources": [],
+          "frame_index": 1,
+          "frame_url": "chrome-error://chromewebdata/"
+        },
+        {
+          "url": "chrome-error://chromewebdata/",
+          "title": "thekav.co",
+          "readyState": "complete",
+          "jwplayers": [],
+          "videos": [],
+          "sources": [],
+          "frame_index": 2,
+          "frame_url": "chrome-error://chromewebdata/"
+        },
+        {
+          "url": "chrome-error://chromewebdata/",
+          "title": "creative.whitetrafsa.com",
+          "readyState": "complete",
+          "jwplayers": [],
+          "videos": [],
+          "sources": [],
+          "frame_index": 3,
+          "frame_url": "chrome-error://chromewebdata/"
+        },
+        {
+          "url": "chrome-error://chromewebdata/",
+          "title": "creative.whitetrafsa.com",
+          "readyState": "complete",
+          "jwplayers": [],
+          "videos": [],
+          "sources": [],
+          "frame_index": 4,
+          "frame_url": "chrome-error://chromewebdata/"
+        },
+        {
+          "url": "chrome-error://chromewebdata/",
+          "title": "thekav.co",
+          "readyState": "complete",
+          "jwplayers": [],
+          "videos": [],
+          "sources": [],
+          "frame_index": 5,
+          "frame_url": "chrome-error://chromewebdata/"
+        },
+        {
+          "url": "about:blank",
+          "title": "",
+          "readyState": "complete",
+          "jwplayers": [],
+          "videos": [],
+          "sources": [],
+          "frame_index": 6,
+          "frame_url": "about:blank"
+        },
+        {
+          "url": "https://1465544.xyz/?v=gI-cXG9gx",
+          "title": "유백설-362540.mp4",
+          "readyState": "complete",
+          "jwplayers": [
+            {
+              "id": "player",
+              "state": "playing",
+              "position": 6.612742,
+              "duration": 1813.079206,
+              "playlist": [
+                {
+                  "index": 0,
+                  "title": null,
+                  "duration": null,
+                  "sources": [
+                    {
+                      "file": "https://storage.googleapis.com/mediastorage/1794754864223/fmv3js6rok/167382505.mp4",
+                      "type": "mp4",
+                      "label": "480p"
+                    },
+                    {
+                      "file": "https://storage.googleapis.com/mediastorage/1794754864223/gmla7urkpl5/335703721.mp4",
+                      "type": "mp4",
+                      "label": "720p"
+                    },
+                    {
+                      "file": "https://storage.googleapis.com/mediastorage/1794754864223/yzvwn59ikp/984822727.mp4",
+                      "type": "mp4",
+                      "label": "1080p"
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "videos": [
+            {
+              "index": 0,
+              "src": "https://storage.googleapis.com/mediastorage/1794754864223/fmv3js6rok/167382505.mp4",
+              "readyState": 4,
+              "networkState": 1,
+              "paused": false,
+              "currentTime": 6.717832,
+              "duration": 1813.079206,
+              "videoWidth": 854,
+              "videoHeight": 480,
+              "error": null
+            }
+          ],
+          "sources": [],
+          "frame_index": 7,
+          "frame_url": "https://1465544.xyz/?v=[OMITTED]"
+        }
+      ]
+    }
+  ],
+  "note": "Cookie/Authorization 및 서명 URL 인증 쿼리 값은 저장하지 않음. userProject와 Range 관련 정보는 보존."
+}
+'''
