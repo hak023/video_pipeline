@@ -130,6 +130,7 @@ class Options:
     library: Library | None = field(default=None, repr=False)
     allow_pending: bool = False       # fail-closed: 본편 확인(MAIN) 안 된 PENDING 후보 다운로드 허용 여부
     passive_embed: bool = False       # 진단 모드: 임베드 탐색 시 라우팅/스크립트 주입 비활성화
+    max_url_age: float = 300.0        # 후보 URL 발급 시각(경로 접두사 epoch-ms)이 이 초보다 오래됐으면 재탐색 (0 = 끄기)
 
 
 # ------------------------------------------------------------------ names
@@ -228,8 +229,95 @@ def _mark_short(res, history, item_url, item_name, post_date, dur, opts) -> dict
     return res
 
 
+def _url_age_sec(cand: dict) -> float | None:
+    """후보 URL 발급 시각(경로 접두사 epoch-ms) 이후 경과 초. 타임스탬프가 없으면 None(만료 검사 대상 아님)."""
+    ts = cand.get("url_timestamp")
+    if not ts:
+        return None
+    try:
+        return max(0.0, (time.time() * 1000 - float(ts)) / 1000.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rediscover_candidates(group: dict, *, t: dict, url: str, proxy: str | None, headless: bool,
+                           browser_sem, opts, attempt: int) -> list[dict] | None:
+    """같은 임베드를 다시 열어 새 미디어 URL 을 얻는다. 얻지 못하면 None."""
+    embed = group.get("embed_url")
+    log(f"  [재탐색] {t.get('name') or url}: URL 만료/세션 만료 의심 → "
+        f"같은 임베드({mask_text(embed) if embed else '없음'}) 재탐색")
+    try:
+        with get_diagnostics().stage("media_discovery"):
+            groups = _discover_groups(t, url, proxy, headless, attempt, browser_sem, passive=opts.passive_embed)
+    except Exception as e:
+        log_event("media_discovery", "rediscover_failed", f"재탐색 오류: {mask_text(str(e))}",
+                  level="WARNING", page_url=url)
+        return None
+    if not groups:
+        log_event("media_discovery", "rediscover_empty", "재탐색 결과 후보 없음", level="WARNING", page_url=url)
+        return None
+    ng = None
+    if embed:
+        ng = next((g for g in groups if g.get("embed_url") == embed), None)
+    if ng is None:
+        ng = next((g for g in groups if g.get("index") == group.get("index")), None)
+    if ng is None and len(groups) == 1:
+        ng = groups[0]
+    if ng is None:
+        log("  [재탐색] 같은 임베드의 새 그룹을 찾지 못함")
+        return None
+    old_urls = {c.get("url") for c in (group.get("candidates") or [])}
+    fresh = [c for c in (ng.get("candidates") or []) if c.get("url") and c["url"] not in old_urls]
+    if not fresh:
+        log("  [재탐색] 새 URL 이 없음(같은 후보 반복) → 재시도 생략")
+        return None
+    log_event("media_discovery", "rediscover_fresh", f"재탐색으로 새 후보 {len(fresh)}개 확보",
+              page_url=url, group_id=ng.get("group_id"))
+    return fresh
+
+
+def _rediscover_and_download(group, *, item_url, item_name, out_dir, proxy, opts, history, post_date, force,
+                             on_progress, t, url, name, headless, browser_sem, attempt, prev_output) -> dict | None:
+    """만료된 URL 로 추정되는 실패 후 같은 글을 재탐색해 새 후보로 한 번만 재시도한다.
+    결과 dict(status 포함) 또는 시도할 새 후보가 없으면 None."""
+    fresh = _rediscover_candidates(group, t=t, url=url, proxy=proxy, headless=headless,
+                                   browser_sem=browser_sem, opts=opts, attempt=attempt)
+    if not fresh:
+        return None
+    res: dict[str, Any] = {}
+    for cand in fresh[:MAX_CANDIDATES_TRIED]:
+        if CANCEL.is_set():
+            return {"status": "cancelled"}
+        cls = cand.get("classification") or "PENDING"
+        r = _download_candidate(cand, item_url=item_url, item_name=item_name, out_dir=out_dir,
+                                proxy=proxy, opts=opts, force=force, on_progress=on_progress,
+                                group_id=group.get("group_id"), prev_output=prev_output)
+        st = r.pop("status")
+        res.update(r)
+        if st == "ok":
+            res["status"] = "ok"
+            if not group.get("low_confidence"):
+                blacklist.record_main(cand.get("url", ""), page_url=url)
+            if history:
+                size = _meta_num(res.get("meta"), "size")
+                history.record_success(url=item_url, name=item_name, output_file=res["output"],
+                                       post_date=post_date, duration=res.get("duration"),
+                                       size=int(size) if size is not None else None,
+                                       extra={"low_confidence": True, "classification": cls}
+                                       if group.get("low_confidence") else None)
+            return res
+        if st == "cancelled":
+            res["status"] = "cancelled"
+            return res
+        log(f"  [재탐색 후보 실패] {item_name}: {str(r.get('reason'))[:110]} → 다음 새 후보 시도")
+    res["status"] = "failed"
+    res.setdefault("reason", "all rediscover candidates failed")
+    return res
+
+
 def _process_item(
     *, group, n, url, name, out_dir, proxy, opts, history, post_date, force, board, slot,
+    target: dict | None = None, headless: bool = True, browser_sem=None, attempt: int = 1,
 ) -> dict:
     """페이지 안의 동영상 1개를 처리 (이미 완료/길이 스킵/다운로드/검증/기록)."""
     idx = group["index"]
@@ -310,6 +398,29 @@ def _process_item(
             board.update(_s, _l, pct, size)
         board.update(slot, label, "시작", 0)
 
+    target = target or {"name": name, "page_url": url}
+    prev_output = history.previous_output(item_url) if (history and force) else None
+    rediscover_used = False
+
+    # URL 신선도 확인: 발급 시각이 max_url_age 초보다 오래된 후보면 재탐색으로 갱신한다(세션 바인딩 URL 대응).
+    if opts.max_url_age > 0:
+        ages = [a for a in (_url_age_sec(c) for c in ordered) if a is not None]
+        oldest = min(ages, default=None)
+        if oldest is not None and oldest > opts.max_url_age:
+            log(f"  [URL 만료] {item_name}: 후보 URL 발급 후 {oldest:.0f}초 경과(>--max-url-age {opts.max_url_age:.0f}s)")
+            rr = _rediscover_and_download(
+                group, item_url=item_url, item_name=item_name, out_dir=out_dir, proxy=proxy, opts=opts,
+                history=history, post_date=post_date, force=force, on_progress=on_progress, t=target,
+                url=url, name=name, headless=headless, browser_sem=browser_sem, attempt=attempt,
+                prev_output=prev_output)
+            rediscover_used = True
+            if rr is not None:
+                if rr.get("status") == "ok":
+                    return rr
+                res.update(rr)
+                return res
+            log("  [URL 만료] 재탐색으로 새 후보를 얻지 못해 기존 후보로 계속 시도")
+
     # 후보를 우선순위대로 시도: 앞 후보가 403 등으로 실패하면 다음 후보로 (광고/만료 URL 대비)
     short_seen: list[tuple[float, str]] = []     # (길이, 판별 결과)
     failed_any = False
@@ -340,7 +451,7 @@ def _process_item(
         r = _download_candidate(cand, item_url=item_url, item_name=item_name, out_dir=out_dir,
                                 proxy=proxy, opts=opts, force=force, on_progress=on_progress,
                                 group_id=group.get("group_id"),
-                                prev_output=history.previous_output(item_url) if (history and force) else None)
+                                prev_output=prev_output)
         st = r.pop("status")
         n_attempted += 1
         is_dead = r.pop("dead", False)
@@ -349,8 +460,18 @@ def _process_item(
         res.update(r)
 
 
-        # 제공자 계정/billing 오류는 광고 근거가 아니며, 다른 후보나 재탐색으로 해결되지 않는다.
+        # 제공자 계정/billing 오류는 광고 근거가 아니다. URL/세션 만료일 수 있으므로 재탐색해 새 URL 로 한 번만 재시도한다.
         if "UserProjectAccountProblem" in str(r.get("reason", "")):
+            if not rediscover_used:
+                rediscover_used = True
+                rr = _rediscover_and_download(
+                    group, item_url=item_url, item_name=item_name, out_dir=out_dir, proxy=proxy, opts=opts,
+                    history=history, post_date=post_date, force=force, on_progress=on_progress, t=target,
+                    url=url, name=name, headless=headless, browser_sem=browser_sem, attempt=attempt,
+                    prev_output=prev_output)
+                if rr is not None:
+                    return rr
+                log("  [billing 오류] 재탐색으로 새 후보를 얻지 못해 기존 판단(제공자 설정 오류)을 유지합니다")
             reason = (
                 "provider_configuration_error: 미디어 제공자가 "
                 "billing 계정 오류(UserProjectAccountProblem)를 반환했습니다."
@@ -639,6 +760,7 @@ def run_target(
                         group=g, n=n_total, url=url, name=name, out_dir=out_dir, proxy=proxy,
                         opts=opts, history=history, post_date=post_date, force=force,
                         board=board, slot=slot,
+                        target=t, headless=headless, browser_sem=browser_sem, attempt=attempt,
                     )
                 results[idx] = res
                 if res["status"] in DONE_STATES or res.get("fatal"):
@@ -1033,6 +1155,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="본편 근거가 약한 PENDING 후보도 다운로드 시도 (기본값: False, 광고 오인 방지 fail-closed)")
     parser.add_argument("--passive-embed", action="store_true",
                         help="임베드 탐색의 라우팅/스크립트 주입을 끔 (--discover-only와 함께 사용하면 다운로드 없이 진단)")
+    parser.add_argument("--max-url-age", type=float, default=300.0, metavar="SEC",
+                        help="미디어 URL 발급 시각(URL 경로 접두사 epoch-ms)이 이 초보다 오래됐으면 같은 글을 재탐색해 새 URL로 교체 (기본값: 300, 0이면 끄기)")
     parser.add_argument("--log-retain", type=int, default=DEFAULT_RETAIN, metavar="N",
                         help=f"logs/runs 에 보관할 최근 실행 수 (기본값: {DEFAULT_RETAIN}, 0이면 정리 안 함)")
     return parser
@@ -1494,6 +1618,7 @@ def main() -> None:
             library=library,
             allow_pending=args.allow_pending,
             passive_embed=args.passive_embed,
+            max_url_age=args.max_url_age,
         )
         report = _dispatch(args, opts, headless)
         status, f_stage, f_reason = _summarize_report(report)

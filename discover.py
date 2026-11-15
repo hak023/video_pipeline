@@ -114,22 +114,18 @@ def _probe_m3u8_kind(info: dict[str, Any], proxy: str | None = None) -> str:
 
 
 # 브라우저가 실제로 보낸 요청 헤더 중 다운로드 때 그대로 재현할 것들 (쿠키는 별도 처리)
-_REPLAY_HEADERS = {
-    "referer", "origin", "accept", "accept-language", "user-agent",
-    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-    "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "authorization",
-# 브라우저가 실제로 보낸 요청 헤더 중 다운로드 때 그대로 재현할 것들 (쿠키는 별도 처리)
 # GCS(Requester-Pays / Range 기반) 응답을 위해 range/if-range/x-goog-user-project 등을 포함시킨다.
 _REPLAY_HEADERS = {
     "referer", "origin", "accept", "accept-language", "user-agent",
     "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
     "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "authorization",
-    "range", "if-range", "if-none-match", "if-modified-since",
+    # Range 계열: GCS Requester-Pays/Range 기반 응답 재현에 필요. if-none-match/if-modified-since 는
+    # 캐시 검증 헤더라 재현 시 304 빈 응답 위험이 있어 제외한다.
+    "range", "if-range",
     "x-goog-user-project", "x-goog-allow-user-project",
     "x-goog-api-key", "x-goog-request-id",
 }
 
-}
 _SEGMENT_EXT = (".ts", ".m4s", ".aac", ".vtt", ".key", ".webvtt")
 MAX_CAPTURED = 20
 
@@ -481,6 +477,19 @@ def _is_special_stream_url(u: str) -> bool:
     return host.endswith("ssrr.org") or "sora" in [s.lower() for s in p.path.split("/")]
 
 
+def _url_timestamp(u: str) -> int | None:
+    """GCS 미디어 URL 경로에 발급 시각(epoch-ms) 세그먼트가 있으면 그 값을 반환한다.
+    (실제 구조: /mediastorage/<epoch-ms>/<token>/<size>.mp4 — 타임스탬프는 앞쪽 세그먼트 중 하나)
+    13자리 숫자 세그먼트가 없으면 None(알 수 없음 → 만료 검사 대상 아님)."""
+    p = urlparse(u).path.strip("/")
+    if not p:
+        return None
+    for seg in p.split("/")[:3]:
+        if len(seg) == 13 and seg.isdigit():
+            return int(seg)
+    return None
+
+
 def _media_candidate(
     resp,
     referer: str,
@@ -503,7 +512,7 @@ def _media_candidate(
     special = _is_special_stream_url(u)
     if special:
         return {"url": u, "content_type": ctype, "referer": referer, "status": resp.status,
-                "first_seen": now_iso(), "source": "network"}
+                "first_seen": now_iso(), "source": "network", "url_timestamp": _url_timestamp(u)}
     if not (path_media or "mpegurl" in ctype or "video" in ctype):
         return None
 
@@ -548,6 +557,7 @@ def _media_candidate(
         "content_length": _resp_total_length(resp),
         "first_seen": now_iso(),
         "source": "network",
+        "url_timestamp": _url_timestamp(u),
         "request_headers": _safe_request_headers(resp),
     }
 
@@ -1137,6 +1147,7 @@ def _extract_embed_stream(
             "player_id": it.get("player_id") or player_id,
             "source": "dom",
             "first_seen": now_iso(),
+            "url_timestamp": _url_timestamp(u),
         })
         if it.get("from_playlist"):
             c.update(from_playlist=True, playlist_index=it.get("playlist_index"))
@@ -1317,6 +1328,7 @@ def discover_videos(
                 found[url] = {"url": url, "content_type": ctype, "referer": page_url,
                               "status": resp.status, "content_length": _resp_total_length(resp),
                               "first_seen": now_iso(), "play_order": order, "source": "network",
+                              "url_timestamp": _url_timestamp(url),
                               "request_headers": _safe_request_headers(resp)}
         if player_hosts:
             try:
@@ -1601,7 +1613,8 @@ def discover_videos(
                     if not src or str(src).startswith("blob:"):
                         continue
                     c = found.setdefault(src, {"url": src, "content_type": "dom/video", "referer": page_url,
-                                               "first_seen": now_iso(), "source": "dom"})
+                                               "first_seen": now_iso(), "source": "dom",
+                                               "url_timestamp": _url_timestamp(src)})
                     if it.get("duration"):
                         c["dom_duration"] = float(it["duration"])
                     if it.get("from_playlist"):

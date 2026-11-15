@@ -151,7 +151,7 @@ def gen_run_id() -> str:
 
 # 후보/플레이어 로그에 남길 필드 허용 목록 (cookies 등은 구조적으로 제외, request_headers 구조는 보존)
 _CANDIDATE_FIELDS = (
-    "candidate_id", "url", "content_type", "status", "content_length", "duration", "dom_duration",
+    "candidate_id", "url", "url_timestamp", "content_type", "status", "content_length", "duration", "dom_duration",
     "m3u8_kind", "page_url", "frame_url", "embed_url", "player_id", "playlist_index", "from_playlist",
     "first_seen", "last_seen", "play_order", "source", "classification", "main_score", "ad_score",
     "main_evidence", "ad_evidence", "rules", "blacklist_match", "group_id", "duplicate_of",

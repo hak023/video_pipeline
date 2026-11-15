@@ -509,6 +509,11 @@ _REPLAY_OK = {
     "referer", "origin", "accept", "accept-language", "user-agent",
     "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
     "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "authorization",
+    # Range 계열: GCS Requester-Pays/Range 기반 응답 재현에 필요. if-none-match/if-modified-since 는
+    # 캐시 검증 헤더라 재현 시 304 빈 응답 위험이 있어 제외한다.
+    "range", "if-range",
+    "x-goog-user-project", "x-goog-allow-user-project",
+    "x-goog-api-key", "x-goog-request-id",
 }
 _HTTP_AUTH_ERR = re.compile(r"HTTP Error (401|403)")
 _HTTP_ANY_ERR = re.compile(r"HTTP Error (401|403|404|410)")
@@ -530,13 +535,27 @@ def _build_profiles(info: dict[str, Any]) -> list[dict[str, str]]:
     ua = _clean_header(info.get("user_agent") or "") or DEFAULT_UA
     referer = _clean_header(info.get("referer") or "")
     page_url = _clean_header(info.get("page_url") or "")
-    base = {"user-agent": ua}
+
+    # GCS(Requester-Pays / Range 기반)는 Range 없는 전체 GET 을 UserProjectAccountProblem 으로 거부하는
+    # 경우가 있다. 수동 재생은 브라우저가 Range: bytes=0-(len-1) 로 206 을 받으므로, 같은 조건을 기본값으로 둔다.
+    gcs_range: dict[str, str] = {}
+    if "storage.googleapis.com" in (urlparse(info.get("url") or "").hostname or ""):
+        cl = str(info.get("content_length") or "").strip()
+        try:
+            n = int(float(cl))
+        except (TypeError, ValueError):
+            n = 0
+        gcs_range["range"] = f"bytes=0-{n - 1}" if n > 0 else "bytes=0-"
+
+    base = {"user-agent": ua, **gcs_range}
     profiles: list[dict[str, str]] = []
 
     replay = {k.lower(): _clean_header(v) for k, v in (info.get("request_headers") or {}).items()
               if k.lower() in _REPLAY_OK and _clean_header(v)}
     if replay:
         replay.setdefault("user-agent", ua)
+        for k, v in gcs_range.items():
+            replay.setdefault(k, v)
         profiles.append(replay)
     if referer:
         profiles.append({**base, "referer": referer})
@@ -588,10 +607,11 @@ def _write_cookie_file(cookies: list[dict[str, Any]]) -> str | None:
 
 
 def _diagnose_http(url: str, headers: dict[str, str], proxy: str | None = None) -> str:
-    """실패 원인 확인용 1회 요청(Range 0-0). 상태코드와 서버(GCS 등)의 XML 오류 코드를 요약."""
+    """실패 원인 확인용 1회 요청(Range 0-0). 상태코드와 서버(GCS 등)의 XML 오류 코드를 요약.
+    프로필에 range 가 있어도 진단은 항상 작은 bytes=0-0 프로브로 고정한다."""
     h = {"Range": "bytes=0-0", "User-Agent": headers.get("user-agent") or DEFAULT_UA}
     for k, v in headers.items():
-        if k != "user-agent":
+        if k != "user-agent" and k not in ("range", "if-range"):
             h[k.title()] = v
     handlers = []
     if proxy:
