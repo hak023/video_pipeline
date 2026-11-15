@@ -1048,78 +1048,221 @@ def _name_from_url(url: str) -> str:
     return sanitize_filename(slug)
 
 
+
 def _manual_playback(url: str, proxy: str | None = None) -> None:
-    """사용자가 브라우저에서 직접 재생하는 동안 네트워크/플레이어 진단을 수집한다."""
-    from urllib.parse import urlparse
+    """CDP 브라우저에서 사용자가 직접 재생/다운로드하는 동안 네트워크 증거를 수집한다."""
+    from urllib.parse import parse_qsl, urlsplit, urlunsplit, urlencode
 
     diag = get_diagnostics()
-    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
     observed: dict[str, dict[str, Any]] = {}
-    response_count = 0
-    lock = threading.Lock()
+    request_records: dict[int, dict[str, Any]] = {}
+    downloads: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    lock = threading.RLock()
     finished = threading.Event()
+    response_count = 0
+    max_events = 2000
+
+    safe_query_keys = {
+        "userproject", "alt", "generation", "ifgenerationmatch",
+        "prettyprint", "response-content-type", "response-content-disposition",
+    }
+    sensitive_key_re = re.compile(
+        r"(token|signature|credential|authorization|auth|secret|password|api.?key|"
+        r"access.?key|expires|policy|key.?pair|jwt)", re.I
+    )
+
+    def safe_url(raw_url: str) -> str:
+        try:
+            p = urlsplit(raw_url)
+            pairs = []
+            for key, value in parse_qsl(p.query, keep_blank_values=True):
+                lk = key.lower()
+                if lk in safe_query_keys:
+                    pairs.append((key, value))
+                elif sensitive_key_re.search(lk):
+                    pairs.append((key, "[REDACTED]"))
+                else:
+                    pairs.append((key, "[OMITTED]"))
+            return urlunsplit((p.scheme, p.netloc, p.path, urlencode(pairs), ""))
+        except Exception:
+            return mask_text(raw_url)
+
+    request_header_allow = {
+        "user-agent", "referer", "origin", "accept", "accept-language",
+        "range", "if-range", "if-none-match", "if-modified-since",
+        "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+        "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "x-goog-user-project",
+    }
+    response_header_allow = {
+        "content-type", "content-length", "content-range", "accept-ranges",
+        "content-disposition", "cache-control", "etag", "last-modified",
+        "x-goog-generation", "x-goog-metageneration", "x-goog-hash",
+        "x-goog-stored-content-length", "x-goog-stored-content-encoding", "x-goog-storage-class",
+    }
+
+    def pick_headers(raw: dict, allowed: set[str]) -> dict[str, str]:
+        return {
+            str(k).lower(): str(v)[:2000]
+            for k, v in (raw or {}).items()
+            if str(k).lower() in allowed
+        }
+
+    def is_media_or_download(raw_url: str, content_type: str = "", response_headers: dict | None = None) -> bool:
+        try:
+            parsed = urlsplit(raw_url)
+            path, host = parsed.path.lower(), (parsed.hostname or "").lower()
+        except Exception:
+            path, host = raw_url.lower(), ""
+        ct = (content_type or "").lower()
+        cd = ((response_headers or {}).get("content-disposition") or "").lower()
+        return (
+            path.endswith((".mp4", ".m3u8", ".mpd", ".webm", ".m4v", ".ts", ".mov", ".mkv"))
+            or any(x in ct for x in ("video/", "mpegurl", "dash+xml"))
+            or "attachment" in cd
+            or ("storage.googleapis.com" in host and (ct in ("application/octet-stream", "") or "video" in ct))
+        )
+
+    def persist(event: dict | None = None) -> None:
+        with lock:
+            if event:
+                events.append(event)
+                if len(events) > max_events:
+                    del events[:len(events) - max_events]
+            payload = {
+                "page_url": url,
+                "captured_at": datetime.now().astimezone().isoformat(),
+                "response_event_count": response_count,
+                "responses": list(observed.values()),
+                "downloads": list(downloads),
+                "network_events": list(events),
+                "note": "Cookie/Authorization 및 서명 URL 인증 쿼리 값은 저장하지 않음. userProject와 Range 관련 정보는 보존.",
+            }
+        diag.write_json("manual_playback.json", payload)
+
+    def event_record(kind: str, **fields) -> None:
+        persist({
+            "event": kind,
+            "observed_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            **fields,
+        })
+
+    def on_request(req) -> None:
+        try:
+            raw_headers = req.all_headers()
+        except Exception:
+            raw_headers = {}
+        try:
+            frame_url = req.frame.url
+        except Exception:
+            frame_url = ""
+        rec = {
+            "url": safe_url(req.url),
+            "method": req.method,
+            "resource_type": req.resource_type,
+            "request_headers": pick_headers(raw_headers, request_header_allow),
+            "frame_url": safe_url(frame_url) if frame_url else "",
+            "is_navigation_request": req.is_navigation_request(),
+        }
+        request_records[id(req)] = rec
+        if is_media_or_download(req.url):
+            event_record("media_request", **rec)
 
     def on_response(resp) -> None:
         nonlocal response_count
         try:
-            media_url = resp.url
-            path_part = urlparse(media_url).path.lower()
-            headers = resp.headers
-            content_type = (headers.get("content-type") or "").lower()
-            if not (path_part.endswith((".mp4", ".m3u8", ".mpd", ".webm", ".m4v", ".ts"))
-                    or any(x in content_type for x in ("video/", "mpegurl", "dash+xml"))):
-                return
-
+            req = resp.request
             try:
-                raw_headers = resp.request.all_headers()
+                req_headers_raw = req.all_headers()
             except Exception:
-                raw_headers = {}
-            allowed = {
-                "user-agent", "referer", "origin", "accept", "accept-language",
-                "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-                "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
-            }
-            safe_headers = {k.lower(): v for k, v in raw_headers.items() if k.lower() in allowed}
+                req_headers_raw = {}
+            try:
+                resp_headers_raw = resp.headers
+            except Exception:
+                resp_headers_raw = {}
+            req_headers = pick_headers(req_headers_raw, request_header_allow)
+            resp_headers = pick_headers(resp_headers_raw, response_header_allow)
+            if not is_media_or_download(resp.url, resp_headers.get("content-type", ""), resp_headers):
+                return
             try:
                 frame_url = resp.frame.url
             except Exception:
                 frame_url = ""
-
             item = {
-                "url": media_url, "status": resp.status, "content_type": content_type,
-                "content_length": headers.get("content-length"),
-                "content_range": headers.get("content-range"),
-                "accept_ranges": headers.get("accept-ranges"),
-                "frame_url": frame_url, "request_method": resp.request.method,
-                "request_headers": safe_headers,
-                "observed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "url": safe_url(resp.url),
+                "status": resp.status,
+                "status_text": resp.status_text,
+                "content_type": resp_headers.get("content-type"),
+                "content_length": resp_headers.get("content-length"),
+                "content_range": resp_headers.get("content-range"),
+                "accept_ranges": resp_headers.get("accept-ranges"),
+                "content_disposition": resp_headers.get("content-disposition"),
+                "response_headers": resp_headers,
+                "request_headers": req_headers,
+                "request_method": req.method,
+                "resource_type": req.resource_type,
+                "frame_url": safe_url(frame_url) if frame_url else "",
+                "observed_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
             }
+            key = item["url"] + "|" + str(item["status"]) + "|" + str(item.get("content_range") or "")
             with lock:
-                if media_url in observed:
-                    old = observed[media_url]
-                    old["response_count"] = old.get("response_count", 1) + 1
-                    old["last_status"] = resp.status
-                    old["last_content_range"] = headers.get("content-range")
-                else:
-                    item["response_count"] = 1
-                    observed[media_url] = item
+                observed[key] = item
                 response_count += 1
-                snapshot = list(observed.values())
-                total = response_count
-
-            diag.event("manual_playback", "media_response",
-                       f"브라우저 미디어 응답 HTTP {resp.status}",
-                       level="INFO" if resp.status < 400 else "WARNING",
-                       frame_url=frame_url, media_url=media_url,
-                       content_type=content_type, content_length=headers.get("content-length"),
-                       content_range=headers.get("content-range"),
-                       request_method=resp.request.method)
-            diag.write_json("manual_playback.json", {
-                "page_url": url, "responses": snapshot, "response_event_count": total,
-            })
+            event_record("media_response", **item)
+            diag.event(
+                "manual_playback", "media_response",
+                f"브라우저 미디어/다운로드 응답 HTTP {resp.status}",
+                level="INFO" if resp.status < 400 else "WARNING",
+                media_url=item["url"], content_type=item.get("content_type"),
+                content_range=item.get("content_range"),
+                content_disposition=item.get("content_disposition"),
+                request_method=req.method,
+                x_goog_user_project=req_headers.get("x-goog-user-project"),
+            )
         except Exception as exc:
             log_exception("manual_playback_response", exc, page_url=url)
+
+    def on_request_failed(req) -> None:
+        try:
+            if is_media_or_download(req.url):
+                event_record(
+                    "media_request_failed", url=safe_url(req.url), method=req.method,
+                    resource_type=req.resource_type, failure=str(req.failure)[:1000],
+                    request_headers=pick_headers(req.all_headers(), request_header_allow),
+                )
+        except Exception as exc:
+            log_exception("manual_playback_request_failed", exc, page_url=url)
+
+    def on_download(download_obj) -> None:
+        try:
+            item = {
+                "url": safe_url(download_obj.url),
+                "suggested_filename": download_obj.suggested_filename,
+                "page_url": safe_url(download_obj.page.url),
+                "observed_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "save_path": None,
+                "failure": None,
+            }
+            with lock:
+                downloads.append(item)
+            event_record("browser_download", **item)
+        except Exception as exc:
+            log_exception("manual_playback_download", exc, page_url=url)
+
+    def attach_page(target_page) -> None:
+        try:
+            target_page.on("request", on_request)
+            target_page.on("response", on_response)
+            target_page.on("requestfailed", on_request_failed)
+            target_page.on("download", on_download)
+            target_page.on("pageerror", lambda exc: event_record(
+                "page_error", page_url=safe_url(target_page.url), error=str(exc)[:1000]))
+            target_page.on("console", lambda msg: event_record(
+                "console_error", page_url=safe_url(target_page.url), message=msg.text[:1000])
+                if msg.type == "error" else None)
+            event_record("page_attached", page_url=safe_url(target_page.url))
+        except Exception as exc:
+            log_exception("manual_playback_attach_page", exc, page_url=url)
 
     snapshot_js = r"""() => {
       const out = {url: location.href, title: document.title,
@@ -1155,78 +1298,78 @@ def _manual_playback(url: str, proxy: str | None = None) -> None:
 
     def wait_for_enter() -> None:
         try:
-            input("\n브라우저에서 직접 재생을 시도한 뒤 이 콘솔에서 Enter를 누르세요: ")
+            input("\n브라우저에서 직접 재생/다운로드를 수행한 뒤 이 콘솔에서 Enter를 누르세요: ")
         except (EOFError, KeyboardInterrupt):
             pass
         finally:
             finished.set()
 
     log_event("manual_playback", "started",
-              "사용자 직접 재생 진단 시작 (자동 클릭/다운로드 없음)", page_url=url)
+              "사용자 직접 재생/다운로드 진단 시작 (자동 클릭/다운로드 없음)", page_url=url)
     with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(
-            "http://127.0.0.1:9222"
-        )
-
+        browser = p.chromium.connect_over_cdp("http://127.0.0.1:9222")
+        if not browser.contexts:
+            raise RuntimeError("CDP 연결은 되었지만 Chrome browser context를 찾지 못했습니다.")
         context = browser.contexts[0]
-
+        context.on("page", attach_page)
         page = context.new_page()
+        attach_page(page)
         attach_page_diagnostics(page, "manual")
-        page.on("response", on_response)
         try:
             response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
             diag.note_page(url)
             diag.note_frames([frame.url for frame in page.frames])
             log_event("manual_playback", "page_loaded", "수동 재생 페이지 로드",
-                      page_url=url, status=response.status if response else None, final_url=page.url)
-            print("\n[수동 재생 진단]")
-            print("1. 열린 브라우저에서 플레이어를 직접 찾아 재생 버튼을 누르세요.")
-            print("2. 재생 성공 또는 오류가 나타날 때까지 기다리세요.")
-            print("3. 브라우저는 그대로 두고 이 콘솔에서 Enter를 누르세요.")
-            print("4. 쿠키와 Authorization 헤더는 저장하지 않습니다.")
+                      page_url=url, status=response.status if response else None,
+                      final_url=safe_url(page.url))
+            print("\n[수동 재생/다운로드 진단]")
+            print("1. 열린 Chrome에서 동영상을 직접 재생하세요.")
+            print("2. 다운로드 버튼이 있다면 직접 눌러 다운로드를 시도하세요.")
+            print("3. 다운로드가 시작되거나 실패한 뒤 이 콘솔에서 Enter를 누르세요.")
+            print("4. Cookie/Authorization 및 서명 URL 인증 값은 저장하지 않습니다.")
             threading.Thread(target=wait_for_enter, daemon=True).start()
             while not finished.is_set():
                 page.wait_for_timeout(250)
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(1200)
 
             frame_snapshots = []
             for index, frame in enumerate(page.frames):
                 try:
                     data = frame.evaluate(snapshot_js)
                     data["frame_index"] = index
-                    data["frame_url"] = frame.url
+                    data["frame_url"] = safe_url(frame.url)
                     frame_snapshots.append(data)
                 except Exception as exc:
-                    frame_snapshots.append({"frame_index": index, "frame_url": frame.url,
-                        "snapshot_error": f"{type(exc).__name__}: {str(exc)[:250]}"})
-
+                    frame_snapshots.append({
+                        "frame_index": index, "frame_url": safe_url(frame.url),
+                        "snapshot_error": f"{type(exc).__name__}: {str(exc)[:250]}",
+                    })
+            persist({
+                "event": "final_snapshot",
+                "observed_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "frames": frame_snapshots,
+            })
             with lock:
                 responses = list(observed.values())
-                total_events = response_count
-            result = {
-                "page_url": url, "final_url": page.url, "page_title": page.title(),
-                "captured_at": datetime.now().astimezone().isoformat(),
-                "response_event_count": total_events, "responses": responses,
-                "frames": frame_snapshots,
-                "note": "수동 관찰 결과. 자동 다운로드 및 인증정보 저장 없음.",
-            }
-            diag.write_json("manual_playback.json", result)
+                download_snapshot = list(downloads)
             ok_count = sum(1 for x in responses if x.get("status") in (200, 206))
-            error_count = sum(1 for x in responses
-                              if (x.get("last_status") or x.get("status", 0)) >= 400)
-            log_event("manual_playback", "completed", "수동 재생 진단 완료",
-                      page_url=url, unique_media_urls=len(responses),
-                      successful_media_responses=ok_count, error_media_responses=error_count)
-            print(f"\n[수집 완료] 미디어 URL {len(responses)}개 / 정상(200·206) {ok_count}개 / 오류 {error_count}개")
+            error_count = sum(1 for x in responses if x.get("status", 0) >= 400)
+            log_event("manual_playback", "completed", "수동 재생/다운로드 진단 완료",
+                      page_url=url, unique_media_responses=len(responses),
+                      successful_media_responses=ok_count, error_media_responses=error_count,
+                      browser_download_events=len(download_snapshot))
+            print(
+                f"\n[수집 완료] 미디어 응답 {len(responses)}개 / 정상(200·206) {ok_count}개 / "
+                f"오류 {error_count}개 / 브라우저 다운로드 이벤트 {len(download_snapshot)}개"
+            )
             print(f"[로그] {diag.dir / 'manual_playback.json'}")
         except Exception as exc:
             log_exception("manual_playback", exc, page_url=url)
             raise
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
+            # CDP로 연결한 Chrome은 사용자의 브라우저이므로 browser.close()를 호출하지 않는다.
+            # sync_playwright 종료 시 연결만 정리한다.
+            pass
 
 
 def _dispatch(args: argparse.Namespace, opts: Options, headless: bool) -> list[dict] | None:

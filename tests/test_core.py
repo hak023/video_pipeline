@@ -48,10 +48,18 @@ class MaskingTests(unittest.TestCase):
         self.assertNotIn(SECRET, h["referer"])
 
     def test_sanitize_drops_cookies_and_request_headers(self):
-        out = dg.sanitize({"cookies": [{"value": SECRET}], "request_headers": {"authorization": SECRET},
+        # request_headers 구조는 보존하되 내부 민감 키(cookie/authorization 등)는 제거됩니다.
+        out = dg.sanitize({"cookies": [{"value": SECRET}], "request_headers": {"authorization": SECRET, "range": "bytes=0-123", "x-goog-user-project": "my-proj"},
                            "url": f"https://h/x?token={SECRET}", "n": 1})
         self.assertNotIn(SECRET, json.dumps(out))
         self.assertEqual(out["n"], 1)
+        # request_headers는 보존되어야 하며, 내부 authorization은 제거됩니다.
+        self.assertIn("request_headers", out)
+        self.assertNotIn("authorization", out["request_headers"])
+        self.assertEqual(out["request_headers"].get("range"), "bytes=0-123")
+        self.assertEqual(out["request_headers"].get("x-goog-user-project"), "my-proj")
+        # cookies는 항상 제거됩니다.
+        self.assertNotIn("cookies", out)
 
     def test_candidate_view_is_allowlist(self):
         v = dg.candidate_view({"url": "https://h/x.mp4", "cookies": [{"value": SECRET}],

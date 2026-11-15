@@ -118,6 +118,17 @@ _REPLAY_HEADERS = {
     "referer", "origin", "accept", "accept-language", "user-agent",
     "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
     "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "authorization",
+# 브라우저가 실제로 보낸 요청 헤더 중 다운로드 때 그대로 재현할 것들 (쿠키는 별도 처리)
+# GCS(Requester-Pays / Range 기반) 응답을 위해 range/if-range/x-goog-user-project 등을 포함시킨다.
+_REPLAY_HEADERS = {
+    "referer", "origin", "accept", "accept-language", "user-agent",
+    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+    "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "authorization",
+    "range", "if-range", "if-none-match", "if-modified-since",
+    "x-goog-user-project", "x-goog-allow-user-project",
+    "x-goog-api-key", "x-goog-request-id",
+}
+
 }
 _SEGMENT_EXT = (".ts", ".m4s", ".aac", ".vtt", ".key", ".webvtt")
 MAX_CAPTURED = 20

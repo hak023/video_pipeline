@@ -46,7 +46,8 @@ _SENSITIVE_KEY_RE = re.compile(
 _MASK_MIN_LEN = 20                       # 이 길이 이상의 쿼리 값은 키 이름과 무관하게 마스킹
 _SENSITIVE_HEADERS = {"cookie", "set-cookie", "authorization", "proxy-authorization", "x-api-key"}
 _URL_HEADERS = {"referer", "origin", "location"}
-_DROP_KEYS = {"cookies", "cookie", "request_headers", "authorization", "set-cookie", "headers"}
+# request_headers는 보존하되, 내부의 민감 헤더(cookie/authorization 등)는 아래에서 개별 차단한다.
+_DROP_KEYS = {"cookies", "cookie", "authorization", "set-cookie", "headers"}
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>]+")
 _HEADER_IN_TEXT_RE = re.compile(r"(?i)\b(cookie|set-cookie|authorization|proxy-authorization)\b(\s*[:=]\s*)[^\r\n]+")
 _BARE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{24,}(?![A-Za-z0-9])")
@@ -126,7 +127,8 @@ def mask_text(text: Any) -> Any:
 
 
 def sanitize(obj: Any, _depth: int = 0) -> Any:
-    """dict/list 를 재귀적으로 순회해 쿠키·요청 헤더 필드를 제거하고 문자열을 마스킹 (report.json 등 출력용)."""
+    """dict/list 를 재귀적으로 순회해 쿠키·민감 헤더 필드를 제거하고 문자열을 마스킹 (report.json 등 출력용).
+    request_headers 구조는 보존하되 내부 민감 키(cookie, authorization 등)는 제거된다."""
     if _depth > 12:
         return "<depth-limit>"
     if isinstance(obj, dict):
@@ -147,7 +149,7 @@ def gen_run_id() -> str:
     return f"{datetime.now():%Y%m%d_%H%M%S}_{secrets.token_hex(3)}"
 
 
-# 후보/플레이어 로그에 남길 필드 허용 목록 (cookies, request_headers 등은 구조적으로 제외된다)
+# 후보/플레이어 로그에 남길 필드 허용 목록 (cookies 등은 구조적으로 제외, request_headers 구조는 보존)
 _CANDIDATE_FIELDS = (
     "candidate_id", "url", "content_type", "status", "content_length", "duration", "dom_duration",
     "m3u8_kind", "page_url", "frame_url", "embed_url", "player_id", "playlist_index", "from_playlist",
