@@ -5,6 +5,7 @@ history_data/
 probe_out/
 ad_blacklist.json
 ad_domains.txt
+tests/
 
 # Python
 __pycache__/

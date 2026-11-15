@@ -31,7 +31,10 @@ from download import (
 from diagnostics import (
     DEFAULT_RETAIN, diag_context, get_diagnostics, init_diagnostics, log_event, log_exception, mask_text,
     sanitize,
+    attach_page_diagnostics,
 )
+from media_tools import get_browser_launch_kwargs, get_context_kwargs
+from playwright.sync_api import sync_playwright
 from history import HistoryManager, normalize_url
 from progress import ProgressBoard, log, set_board
 from verify import verify
@@ -989,6 +992,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--url", metavar="POST_URL", help="글 1개만 바로 처리하고 결과(debug 포함)를 출력 (테스트/재시도용)")
     parser.add_argument("--discover-only", action="store_true",
                         help="미디어 다운로드 없이 스트림 URL만 탐색/확인")
+    parser.add_argument("--manual-playback", action="store_true",
+                        help="--url 페이지를 실제 브라우저로 열어 사용자가 직접 재생하고 네트워크/플레이어 로그 수집 (다운로드 안 함)")
 
     parser.add_argument("--crawl", metavar="URL",
                         help="일괄 다운로드할 카탈로그 기본 URL (예: https://s28.testonline.co)")
@@ -1043,7 +1048,194 @@ def _name_from_url(url: str) -> str:
     return sanitize_filename(slug)
 
 
+def _manual_playback(url: str, proxy: str | None = None) -> None:
+    """사용자가 브라우저에서 직접 재생하는 동안 네트워크/플레이어 진단을 수집한다."""
+    from urllib.parse import urlparse
+
+    diag = get_diagnostics()
+    ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    observed: dict[str, dict[str, Any]] = {}
+    response_count = 0
+    lock = threading.Lock()
+    finished = threading.Event()
+
+    def on_response(resp) -> None:
+        nonlocal response_count
+        try:
+            media_url = resp.url
+            path_part = urlparse(media_url).path.lower()
+            headers = resp.headers
+            content_type = (headers.get("content-type") or "").lower()
+            if not (path_part.endswith((".mp4", ".m3u8", ".mpd", ".webm", ".m4v", ".ts"))
+                    or any(x in content_type for x in ("video/", "mpegurl", "dash+xml"))):
+                return
+
+            try:
+                raw_headers = resp.request.all_headers()
+            except Exception:
+                raw_headers = {}
+            allowed = {
+                "user-agent", "referer", "origin", "accept", "accept-language",
+                "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+                "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+            }
+            safe_headers = {k.lower(): v for k, v in raw_headers.items() if k.lower() in allowed}
+            try:
+                frame_url = resp.frame.url
+            except Exception:
+                frame_url = ""
+
+            item = {
+                "url": media_url, "status": resp.status, "content_type": content_type,
+                "content_length": headers.get("content-length"),
+                "content_range": headers.get("content-range"),
+                "accept_ranges": headers.get("accept-ranges"),
+                "frame_url": frame_url, "request_method": resp.request.method,
+                "request_headers": safe_headers,
+                "observed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+            with lock:
+                if media_url in observed:
+                    old = observed[media_url]
+                    old["response_count"] = old.get("response_count", 1) + 1
+                    old["last_status"] = resp.status
+                    old["last_content_range"] = headers.get("content-range")
+                else:
+                    item["response_count"] = 1
+                    observed[media_url] = item
+                response_count += 1
+                snapshot = list(observed.values())
+                total = response_count
+
+            diag.event("manual_playback", "media_response",
+                       f"브라우저 미디어 응답 HTTP {resp.status}",
+                       level="INFO" if resp.status < 400 else "WARNING",
+                       frame_url=frame_url, media_url=media_url,
+                       content_type=content_type, content_length=headers.get("content-length"),
+                       content_range=headers.get("content-range"),
+                       request_method=resp.request.method)
+            diag.write_json("manual_playback.json", {
+                "page_url": url, "responses": snapshot, "response_event_count": total,
+            })
+        except Exception as exc:
+            log_exception("manual_playback_response", exc, page_url=url)
+
+    snapshot_js = r"""() => {
+      const out = {url: location.href, title: document.title,
+        readyState: document.readyState, jwplayers: [], videos: [], sources: []};
+      try {
+        if (typeof jwplayer === 'function') {
+          document.querySelectorAll('.jwplayer,[id^="jwplayer"],#player').forEach((el, i) => {
+            try {
+              const p = jwplayer(el.id || undefined);
+              const pl = p && p.getPlaylist ? (p.getPlaylist() || []) : [];
+              out.jwplayers.push({id: el.id || ('player-' + i),
+                state: p && p.getState ? p.getState() : null,
+                position: p && p.getPosition ? p.getPosition() : null,
+                duration: p && p.getDuration ? p.getDuration() : null,
+                playlist: pl.map((x, n) => ({index:n, title:x.title || null,
+                  duration:x.duration || null,
+                  sources:(x.allSources || x.sources || []).map(y => ({
+                    file:y.file || null, type:y.type || null, label:y.label || null}))}))});
+            } catch(e) { out.jwplayers.push({error:String(e)}); }
+          });
+        }
+      } catch(e) { out.jw_error = String(e); }
+      document.querySelectorAll('video').forEach((v, i) => out.videos.push({
+        index:i, src:v.currentSrc || v.src || null, readyState:v.readyState,
+        networkState:v.networkState, paused:v.paused, currentTime:v.currentTime,
+        duration:Number.isFinite(v.duration) ? v.duration : null,
+        videoWidth:v.videoWidth, videoHeight:v.videoHeight,
+        error:v.error ? {code:v.error.code, message:v.error.message} : null}));
+      document.querySelectorAll('source').forEach((x, i) =>
+        out.sources.push({index:i, src:x.src || x.getAttribute('src'), type:x.type || null}));
+      return out;
+    }"""
+
+    def wait_for_enter() -> None:
+        try:
+            input("\n브라우저에서 직접 재생을 시도한 뒤 이 콘솔에서 Enter를 누르세요: ")
+        except (EOFError, KeyboardInterrupt):
+            pass
+        finally:
+            finished.set()
+
+    log_event("manual_playback", "started",
+              "사용자 직접 재생 진단 시작 (자동 클릭/다운로드 없음)", page_url=url)
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(
+            "http://127.0.0.1:9222"
+        )
+
+        context = browser.contexts[0]
+
+        page = context.new_page()
+        attach_page_diagnostics(page, "manual")
+        page.on("response", on_response)
+        try:
+            response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            diag.note_page(url)
+            diag.note_frames([frame.url for frame in page.frames])
+            log_event("manual_playback", "page_loaded", "수동 재생 페이지 로드",
+                      page_url=url, status=response.status if response else None, final_url=page.url)
+            print("\n[수동 재생 진단]")
+            print("1. 열린 브라우저에서 플레이어를 직접 찾아 재생 버튼을 누르세요.")
+            print("2. 재생 성공 또는 오류가 나타날 때까지 기다리세요.")
+            print("3. 브라우저는 그대로 두고 이 콘솔에서 Enter를 누르세요.")
+            print("4. 쿠키와 Authorization 헤더는 저장하지 않습니다.")
+            threading.Thread(target=wait_for_enter, daemon=True).start()
+            while not finished.is_set():
+                page.wait_for_timeout(250)
+            page.wait_for_timeout(1000)
+
+            frame_snapshots = []
+            for index, frame in enumerate(page.frames):
+                try:
+                    data = frame.evaluate(snapshot_js)
+                    data["frame_index"] = index
+                    data["frame_url"] = frame.url
+                    frame_snapshots.append(data)
+                except Exception as exc:
+                    frame_snapshots.append({"frame_index": index, "frame_url": frame.url,
+                        "snapshot_error": f"{type(exc).__name__}: {str(exc)[:250]}"})
+
+            with lock:
+                responses = list(observed.values())
+                total_events = response_count
+            result = {
+                "page_url": url, "final_url": page.url, "page_title": page.title(),
+                "captured_at": datetime.now().astimezone().isoformat(),
+                "response_event_count": total_events, "responses": responses,
+                "frames": frame_snapshots,
+                "note": "수동 관찰 결과. 자동 다운로드 및 인증정보 저장 없음.",
+            }
+            diag.write_json("manual_playback.json", result)
+            ok_count = sum(1 for x in responses if x.get("status") in (200, 206))
+            error_count = sum(1 for x in responses
+                              if (x.get("last_status") or x.get("status", 0)) >= 400)
+            log_event("manual_playback", "completed", "수동 재생 진단 완료",
+                      page_url=url, unique_media_urls=len(responses),
+                      successful_media_responses=ok_count, error_media_responses=error_count)
+            print(f"\n[수집 완료] 미디어 URL {len(responses)}개 / 정상(200·206) {ok_count}개 / 오류 {error_count}개")
+            print(f"[로그] {diag.dir / 'manual_playback.json'}")
+        except Exception as exc:
+            log_exception("manual_playback", exc, page_url=url)
+            raise
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+
 def _dispatch(args: argparse.Namespace, opts: Options, headless: bool) -> list[dict] | None:
+    if args.manual_playback:
+        if not args.url:
+            raise ValueError('--manual-playback 옵션은 --url 과 함께 사용해야 합니다.')
+        _manual_playback(args.url, proxy=args.proxy)
+        return None
+
     if args.url:
         t = {
             "name": _name_from_url(args.url), "page_url": args.url, "wait_ms": 8000,
@@ -1131,7 +1323,7 @@ def main() -> None:
 
     # 진단 세션은 기본 활성화: 성공/실패/예외/중단 어떤 경로로 끝나도 summary.json 이 남는다.
     diag = init_diagnostics(LOG_DIR, retain=args.log_retain, meta={
-        "mode": "url" if args.url else "crawl" if args.crawl else "discover_only" if args.discover_only else "targets",
+        "mode": "manual_playback" if args.manual_playback else "url" if args.url else "crawl" if args.crawl else "discover_only" if args.discover_only else "targets",
         "workers": args.workers, "attempts": args.attempts, "skip_under": args.skip_under,
         "headless": headless, "proxy": bool(args.proxy), "force": args.force, "env": _env_info(),
     })
