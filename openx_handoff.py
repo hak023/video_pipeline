@@ -150,9 +150,36 @@ def _open_embed_frame(page, embed_url: str, page_url: str | None) -> str:
     return "wrapper"
 
 
-def _prime_embed_player(page) -> None:
+def _is_extension_block_url(url: str | None) -> bool:
+    """AdGuard 등이 광고 탭을 막으면 주소가 chrome-extension:// 로 바뀐다."""
+    return (url or "").startswith("chrome-extension://")
+
+
+def _close_extension_block_pages(page, keep_ids: set[int] | None = None) -> None:
+    """이번 작업으로 새로 열린 AdGuard 차단 탭만 닫는다. 기존 탭과 작업 페이지는 유지한다."""
+    try:
+        pages = list(page.context.pages)
+    except Exception:
+        return
+    for other in pages:
+        if other == page or (keep_ids is not None and id(other) in keep_ids):
+            continue
+        try:
+            url = other.url or ""
+        except Exception:
+            continue
+        if not _is_extension_block_url(url):
+            continue
+        try:
+            other.close()
+        except Exception:
+            pass
+
+
+def _prime_embed_player(page, keep_ids: set[int] | None = None) -> None:
     """로더에 멈춘 플레이어를 깨운다. 수동 재생은 웹페이지 클릭 뒤에야 컨트롤바가 생긴다."""
     for rnd in range(_PRIME_ROUNDS):
+        _close_extension_block_pages(page, keep_ids)
         try:
             box = page.locator("#player_frame").bounding_box()
             if box:
@@ -176,6 +203,7 @@ def _prime_embed_player(page) -> None:
             page.wait_for_timeout(800 if rnd == 0 else 1200)
         except Exception:
             pass
+        _close_extension_block_pages(page, keep_ids)
 
 
 def _open_background_tab(session, url: str) -> str | None:
@@ -225,12 +253,26 @@ def open_download_handoff(
                         "download_page": page_url,
                         "target_id": existing,
                     }
+                keep_ids = {id(existing) for existing in getattr(context, "pages", [])}
                 wrapper = context.new_page()
+                keep_ids.add(id(wrapper))
                 embed_host = _open_embed_frame(wrapper, embed_url, article_url)
-                _prime_embed_player(wrapper)
-                wrapper.frame_locator("#player_frame").locator(DOWNLOAD_BUTTON_SELECTOR).first.wait_for(
-                    state="attached", timeout=timeout_ms,
-                )
+                _prime_embed_player(wrapper, keep_ids)
+                try:
+                    wrapper.frame_locator("#player_frame").locator(DOWNLOAD_BUTTON_SELECTOR).first.wait_for(
+                        state="attached", timeout=timeout_ms,
+                    )
+                except Exception as exc:
+                    if type(exc).__name__ != "TimeoutError":
+                        raise
+                    return {
+                        "ok": True,
+                        "no_download_button": True,
+                        "reused": False,
+                        "slug": slug,
+                        "download_page": None,
+                        "reason": "임베드에 download 버튼이 없습니다",
+                    }
                 player_ready = True
                 if session is None:
                     session = _cdp_session(browser, context)

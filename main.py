@@ -279,37 +279,48 @@ def _rediscover_candidates(group: dict, *, t: dict, url: str, proxy: str | None,
 
 def _finish_with_openx_handoff(
     res: dict, group: dict, item_name: str, prior_reason: str, page_url: str = "",
+    history=None, item_url: str = "", post_date: str | None = None,
 ) -> dict:
-    """403 이면 임베드 플레이어가 준비된 뒤 download 페이지를 연다.
+    """403 이면 download 페이지로 넘기거나, 버튼이 없으면 그 자리에서 끝낸다.
 
-    페이지를 열어도 파일이 저장된 것은 아니므로 성공으로 기록하지 않는다.
+    두 경우 모두 이 파이프라인에서 더 받을 방법이 없으므로 완료로 기록하고 종료한다.
     Download Now 와 Turnstile 은 누르거나 우회하지 않는다.
     """
     embed = group.get("embed_url") or ""
-    log(f"  [403 인수] {item_name}: 임베드 플레이어 준비 후 download 페이지로 연결")
+    log(f"  [403 인수] {item_name}: 임베드에서 download 버튼을 확인")
     outcome = open_download_handoff(embed, page_url=page_url)
     if outcome.get("ok"):
-        if outcome.get("reused"):
+        if outcome.get("no_download_button"):
+            reason = "403 이후 임베드에 download 버튼이 없습니다. 대체 경로가 없어 완료로 기록하고 종료합니다."
+        elif outcome.get("reused"):
             reason = (
-                "403 이후 같은 download 페이지가 이미 열려 있어 새로 열지 않았습니다. "
-                "Tampermonkey가 그 탭에서 광고 처리를 진행하며, Download Now는 직접 눌러야 합니다. "
+                "403 이후 같은 download 페이지가 이미 열려 있습니다. "
+                "이후는 Tampermonkey가 처리하므로 완료로 기록하고 종료합니다. "
                 f"{outcome.get('download_page')}"
             )
         else:
             reason = (
-                "403 이후 임베드 플레이어가 준비되어 download 페이지로 연결했습니다. "
-                "Tampermonkey가 광고 처리를 진행하며, Download Now는 직접 눌러야 파일이 저장됩니다. "
+                "403 이후 download 페이지로 연결했습니다. "
+                "이후는 Tampermonkey가 처리하므로 완료로 기록하고 종료합니다. "
                 f"{outcome.get('download_page')}"
             )
         res.update(
-            status="handoff",
+            status="ok",
             fatal=True,
             reason=reason,
+            output=outcome.get("download_page") or "",
             download_page=outcome.get("download_page"),
             handoff=True,
         )
-        log(f"  [403 인수] {item_name}: {outcome.get('download_page')}")
+        if history and item_url:
+            history.record_success(
+                item_url, item_name, outcome.get("download_page") or "",
+                post_date=post_date,
+                extra={"handoff": True, "no_download_button": bool(outcome.get("no_download_button"))},
+            )
+        log(f"  [403 인수 완료] {item_name}: {reason}")
         log_event("download", "openx_handoff", reason, page_url=embed, download_page=outcome.get("download_page"))
+        get_diagnostics().download(status="SUCCESS", reason=reason, output=outcome.get("download_page") or "", handoff=True)
         return res
     fail = str(outcome.get("reason") or "download 페이지 연결 실패")
     reason = f"{prior_reason} | {fail}"
@@ -535,7 +546,10 @@ def _process_item(
                 candidate_id=cand.get("candidate_id"),
                 group_id=group.get("group_id"),
             )
-            return _finish_with_openx_handoff(res, group, item_name, reason, page_url=url)
+            return _finish_with_openx_handoff(
+                res, group, item_name, reason, page_url=url,
+                history=history, item_url=item_url, post_date=post_date,
+            )
 
 
         if st == "ok":
@@ -561,7 +575,10 @@ def _process_item(
             continue
         failed_any = True
         if is_openx_access_denied(str(r.get("reason") or "")):
-            return _finish_with_openx_handoff(res, group, item_name, str(r.get("reason") or "HTTP 403"), page_url=url)
+            return _finish_with_openx_handoff(
+                res, group, item_name, str(r.get("reason") or "HTTP 403"), page_url=url,
+                history=history, item_url=item_url, post_date=post_date,
+            )
         if r.get("fatal"):
             res.update(status="failed", fatal=True)
             return res

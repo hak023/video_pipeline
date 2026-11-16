@@ -263,19 +263,63 @@ def _own_page(ctx):
         _own.flag = False
 
 
-def _close_stray_page(new_p) -> None:
-    if getattr(_own, "flag", False):
-        return
+def _is_extension_block_url(url: str | None) -> bool:
+    """AdGuard 가 광고를 막으면 해당 탭 주소가 chrome-extension:// 로 바뀐다."""
+    return (url or "").startswith("chrome-extension://")
+
+
+def _close_page(new_p, url: str = "") -> None:
     _own.popups = getattr(_own, "popups", 0) + 1
-    try:
-        url = new_p.url
-    except Exception:
-        url = ""
     log_event("browser", "popup_closed", "광고 의심 팝업 탭을 닫음", level="DEBUG", frame_url=url)
     try:
         new_p.close()
     except Exception:
         pass
+
+
+def _close_stray_page(new_p) -> None:
+    if getattr(_own, "flag", False):
+        return
+
+    def _close_if_blocked(frame=None) -> None:
+        try:
+            if new_p.is_closed():
+                return
+        except Exception:
+            pass
+        try:
+            url = new_p.url or ""
+        except Exception:
+            url = ""
+        # 팝업이 뜬 직후는 about:blank 이고, AdGuard 가 막으면 곧 chrome-extension:// 로 바뀐다.
+        if frame is not None and not _is_extension_block_url(url):
+            return
+        _close_page(new_p, url)
+
+    try:
+        new_p.on("framenavigated", lambda frame: _close_if_blocked(frame))
+    except Exception:
+        pass
+    _close_if_blocked()
+
+
+def _close_extension_block_pages(page) -> None:
+    """재생 클릭으로 열린 AdGuard 차단 탭을 닫는다. 지금 다루는 글 페이지는 닫지 않는다."""
+    try:
+        pages = list(page.context.pages)
+    except Exception:
+        return
+    for other in pages:
+        if other == page:
+            continue
+        try:
+            if other.is_closed():
+                continue
+            url = other.url or ""
+        except Exception:
+            continue
+        if _is_extension_block_url(url):
+            _close_page(other, url)
 
 
 def _popup_count() -> int:
@@ -597,6 +641,7 @@ def _play_until_stream(
     click_hosts/video_hosts 로 클릭·재생 대상 프레임을 플레이어로 제한한다 (광고 영상 재생 방지).
     """
     for rnd in range(MAX_PLAY_ROUNDS):
+        _close_extension_block_pages(page)
         if rnd > 0:
             try:
                 pt = click_point
@@ -617,6 +662,7 @@ def _play_until_stream(
 
         _eval_frames(page, _CLICK_BTN_JS, click_hosts, target_frame)
         _eval_frames(page, _PLAY_VIDEO_JS, video_hosts, target_frame)
+        _close_extension_block_pages(page)
         page.wait_for_timeout(2000 if rnd == 0 else 2500)
         longest = max([
             v for v in _eval_frames(page, _VIDEO_STATE_JS, video_hosts, target_frame)
