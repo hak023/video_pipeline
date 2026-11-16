@@ -515,6 +515,20 @@ _REPLAY_OK = {
     "x-goog-user-project", "x-goog-allow-user-project",
     "x-goog-api-key", "x-goog-request-id",
 }
+_DIAGNOSTIC_HEADER_EXCLUDES = {"authorization", "x-goog-api-key"}
+
+
+def _diagnostic_header_values(headers: dict[str, str]) -> dict[str, str]:
+    """Keep replay-relevant values for diagnostics, excluding credential headers."""
+    return {
+        key: _clean_header(value)[:500]
+        for key, value in headers.items()
+        if key in _REPLAY_OK
+        and key not in _DIAGNOSTIC_HEADER_EXCLUDES
+        and _clean_header(value)
+    }
+
+
 _HTTP_AUTH_ERR = re.compile(r"HTTP Error (401|403)")
 _HTTP_ANY_ERR = re.compile(r"HTTP Error (401|403|404|410)")
 # 서버가 "누구에게도 제공되지 않는 파일"이라고 답한 경우 (결제 중지/삭제/없음) → 재시도 무의미
@@ -677,7 +691,12 @@ def download(
             )
             if attempt_log is not None:
                 for ev in events:
-                    attempt_log.append({"profile_no": tried, "profile_headers": sorted(prof.keys()), **ev})
+                    attempt_log.append({
+                        "profile_no": tried,
+                        "profile_headers": sorted(prof.keys()),
+                        "profile_header_values": _diagnostic_header_values(prof),
+                        **ev,
+                    })
             if ok:
                 return True, last_log
             if not _HTTP_AUTH_ERR.search(last_log):

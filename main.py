@@ -39,6 +39,7 @@ from history import HistoryManager, normalize_url
 from progress import ProgressBoard, log, set_board
 from verify import verify
 from ad_blacklist import blacklist
+from openx_handoff import is_openx_access_denied, open_download_handoff
 
 ROOT = Path(__file__).resolve().parent
 OUT_DIR = ROOT / "out"
@@ -276,6 +277,49 @@ def _rediscover_candidates(group: dict, *, t: dict, url: str, proxy: str | None,
     return fresh
 
 
+def _finish_with_openx_handoff(
+    res: dict, group: dict, item_name: str, prior_reason: str, page_url: str = "",
+) -> dict:
+    """403 이면 임베드 플레이어가 준비된 뒤 download 페이지를 연다.
+
+    페이지를 열어도 파일이 저장된 것은 아니므로 성공으로 기록하지 않는다.
+    Download Now 와 Turnstile 은 누르거나 우회하지 않는다.
+    """
+    embed = group.get("embed_url") or ""
+    log(f"  [403 인수] {item_name}: 임베드 플레이어 준비 후 download 페이지로 연결")
+    outcome = open_download_handoff(embed, page_url=page_url)
+    if outcome.get("ok"):
+        if outcome.get("reused"):
+            reason = (
+                "403 이후 같은 download 페이지가 이미 열려 있어 새로 열지 않았습니다. "
+                "Tampermonkey가 그 탭에서 광고 처리를 진행하며, Download Now는 직접 눌러야 합니다. "
+                f"{outcome.get('download_page')}"
+            )
+        else:
+            reason = (
+                "403 이후 임베드 플레이어가 준비되어 download 페이지로 연결했습니다. "
+                "Tampermonkey가 광고 처리를 진행하며, Download Now는 직접 눌러야 파일이 저장됩니다. "
+                f"{outcome.get('download_page')}"
+            )
+        res.update(
+            status="handoff",
+            fatal=True,
+            reason=reason,
+            download_page=outcome.get("download_page"),
+            handoff=True,
+        )
+        log(f"  [403 인수] {item_name}: {outcome.get('download_page')}")
+        log_event("download", "openx_handoff", reason, page_url=embed, download_page=outcome.get("download_page"))
+        return res
+    fail = str(outcome.get("reason") or "download 페이지 연결 실패")
+    reason = f"{prior_reason} | {fail}"
+    res.update(status="failed", fatal=True, reason=reason[:500])
+    log(f"  [403 인수 실패] {item_name}: {fail}")
+    log_event("download", "openx_handoff_failed", fail, level="ERROR", page_url=embed)
+    get_diagnostics().fail("download", reason)
+    return res
+
+
 def _rediscover_and_download(group, *, item_url, item_name, out_dir, proxy, opts, history, post_date, force,
                              on_progress, t, url, name, headless, browser_sem, attempt, prev_output) -> dict | None:
     """만료된 URL 로 추정되는 실패 후 같은 글을 재탐색해 새 후보로 한 번만 재시도한다.
@@ -308,6 +352,9 @@ def _rediscover_and_download(group, *, item_url, item_name, out_dir, proxy, opts
             return res
         if st == "cancelled":
             res["status"] = "cancelled"
+            return res
+        if is_openx_access_denied(str(r.get("reason") or "")):
+            res["status"] = "failed"
             return res
         log(f"  [재탐색 후보 실패] {item_name}: {str(r.get('reason'))[:110]} → 다음 새 후보 시도")
     res["status"] = "failed"
@@ -469,14 +516,17 @@ def _process_item(
                     history=history, post_date=post_date, force=force, on_progress=on_progress, t=target,
                     url=url, name=name, headless=headless, browser_sem=browser_sem, attempt=attempt,
                     prev_output=prev_output)
-                if rr is not None:
+                if rr is not None and not (
+                    rr.get("status") == "failed" and is_openx_access_denied(str(rr.get("reason") or ""))
+                ):
                     return rr
-                log("  [billing 오류] 재탐색으로 새 후보를 얻지 못해 기존 판단(제공자 설정 오류)을 유지합니다")
+                if rr is not None:
+                    res.update(rr)
+                log("  [billing 오류] 재탐색으로 새 후보를 얻지 못해 download 페이지 인수를 시도합니다")
             reason = (
                 "provider_configuration_error: 미디어 제공자가 "
                 "billing 계정 오류(UserProjectAccountProblem)를 반환했습니다."
             )
-            res.update(status="failed", fatal=True, reason=reason)
             log_event(
                 "download",
                 "provider_configuration_error",
@@ -485,8 +535,7 @@ def _process_item(
                 candidate_id=cand.get("candidate_id"),
                 group_id=group.get("group_id"),
             )
-            diag.fail("download", reason)
-            return res
+            return _finish_with_openx_handoff(res, group, item_name, reason, page_url=url)
 
 
         if st == "ok":
@@ -511,6 +560,8 @@ def _process_item(
                 blacklist.observe_ad(cand.get("url", ""), reason="short_unclassified", page_url=url)
             continue
         failed_any = True
+        if is_openx_access_denied(str(r.get("reason") or "")):
+            return _finish_with_openx_handoff(res, group, item_name, str(r.get("reason") or "HTTP 403"), page_url=url)
         if r.get("fatal"):
             res.update(status="failed", fatal=True)
             return res
@@ -565,6 +616,7 @@ def _download_candidate(cand, *, item_url, item_name, out_dir, proxy, opts, forc
     safe_name = _reserve_name(item_name, item_url, out_dir, force, prev_output)
     attempts: list[dict[str, Any]] = []
     rec: dict[str, Any] = {"candidate_id": cand.get("candidate_id"), "group_id": group_id, "url": cand.get("url"),
+                           "url_timestamp": cand.get("url_timestamp"), "url_age_sec": _url_age_sec(cand),
                            "classification": cand.get("classification"), "item_name": item_name}
     t0 = time.monotonic()
     low_space = _free_space_problem(out_dir)
@@ -1306,7 +1358,35 @@ def _manual_playback(url: str, proxy: str | None = None) -> None:
                 resp_headers_raw = {}
             req_headers = pick_headers(req_headers_raw, request_header_allow)
             resp_headers = pick_headers(resp_headers_raw, response_header_allow)
-            if not is_media_or_download(resp.url, resp_headers.get("content-type", ""), resp_headers):
+            is_media = is_media_or_download(resp.url, resp_headers.get("content-type", ""), resp_headers)
+            if not is_media:
+                if resp.status >= 400:
+                    try:
+                        frame_url = resp.frame.url
+                    except Exception:
+                        frame_url = ""
+                    error = {
+                        "url": safe_url(resp.url),
+                        "status": resp.status,
+                        "status_text": resp.status_text,
+                        "content_type": resp_headers.get("content-type"),
+                        "response_headers": resp_headers,
+                        "request_headers": req_headers,
+                        "request_method": req.method,
+                        "resource_type": req.resource_type,
+                        "frame_url": safe_url(frame_url) if frame_url else "",
+                        "observed_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                    }
+                    event_record("http_error_response", **error)
+                    diag.event(
+                        "manual_playback", "http_error_response",
+                        f"브라우저 HTTP 오류 응답 {resp.status}",
+                        level="WARNING",
+                        response_url=error["url"],
+                        content_type=error["content_type"],
+                        request_method=req.method,
+                        resource_type=req.resource_type,
+                    )
                 return
             try:
                 frame_url = resp.frame.url

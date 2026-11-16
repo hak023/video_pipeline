@@ -15,6 +15,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import diagnostics as dg                                    # noqa: E402
+import discover as discovery                                # noqa: E402
+import download as downloader                                # noqa: E402
 from ad_blacklist import AdBlacklistStack                    # noqa: E402
 from media_classifier import classify_candidate              # noqa: E402
 from media_grouping import group_candidates                  # noqa: E402
@@ -68,6 +70,55 @@ class MaskingTests(unittest.TestCase):
         self.assertNotIn("request_headers", v)
         self.assertNotIn("user_agent", v)
         self.assertEqual(v["classification"], "MAIN")
+
+
+class DownloadDiagnosticsTests(unittest.TestCase):
+    def test_attempt_log_records_replay_values_but_not_credentials(self):
+        attempts = []
+
+        def fake_download_once(*args, **kwargs):
+            kwargs["events"].append({"engine": "yt-dlp", "ok": False})
+            return False, "network error"
+
+        with (
+            mock.patch.object(downloader, "validate_url"),
+            mock.patch.object(downloader, "_write_cookie_file", return_value=None),
+            mock.patch.object(downloader, "_download_once", side_effect=fake_download_once),
+        ):
+            ok, _ = downloader.download(
+                {
+                    "url": "https://storage.googleapis.com/bucket/video.mp4",
+                    "content_length": "167382505",
+                    "request_headers": {
+                        "range": "bytes=0-",
+                        "x-goog-user-project": "example-project",
+                        "authorization": "Bearer secret-token",
+                        "x-goog-api-key": "secret-api-key",
+                    },
+                },
+                show_progress=False,
+                attempt_log=attempts,
+            )
+
+        self.assertFalse(ok)
+        values = attempts[0]["profile_header_values"]
+        self.assertEqual(values["range"], "bytes=0-")
+        self.assertEqual(values["x-goog-user-project"], "example-project")
+        self.assertNotIn("authorization", values)
+        self.assertNotIn("x-goog-api-key", values)
+
+
+class URLTimestampTests(unittest.TestCase):
+    def test_timestamp_is_read_from_early_path_segment(self):
+        self.assertEqual(
+            discovery._url_timestamp(
+                "https://storage.googleapis.com/mediastorage/1794754864223/token/video.mp4"
+            ),
+            1794754864223,
+        )
+
+    def test_unrecognized_path_has_no_timestamp(self):
+        self.assertIsNone(discovery._url_timestamp("https://cdn.example/video/1234.mp4"))
 
 
 class DiagnosticsSessionTests(unittest.TestCase):
