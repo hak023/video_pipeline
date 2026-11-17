@@ -350,14 +350,14 @@ def _finish_with_openx_handoff(
     history=None, item_url: str = "", post_date: str | None = None, out_dir: Path | None = None,
     browser_sem=None, max_open_download_pages: int = MAX_OPEN_DOWNLOAD_PAGES,
 ) -> dict:
-    """403 이면 30초 안에 download 버튼을 보고, 없으면 스트리밍으로 본편을 받는다.
+    """403 이면 30초 안에 download 버튼을 확인한다.
 
     Download Now 와 Turnstile 은 누르거나 우회하지 않는다.
-    패킷이 없으면 완료로 기록하지 않는다. 다음 실행에서 다시 시도할 수 있게 한다.
+    버튼이 없고 스트리밍 fallback이 비활성화되어 있으면 완료로 기록하지 않는다.
     """
     embed = group.get("embed_url") or ""
     capture_dir = _playback_capture_dir(out_dir or OUT_DIR, item_name, item_url or page_url or embed)
-    log(f"  [403 인수] {item_name}: download 버튼은 30초만 확인하고, 없으면 스트리밍으로 받습니다")
+    log(f"  [403 인수] {item_name}: download 버튼은 30초만 확인합니다")
     # 탐색 슬롯(최대 3)을 스트리밍 동안 잡으면 재생 탭이 3개를 넘지 못한다.
     # browser_sem 은 탐색에만 쓰고, 스트리밍 동시 수는 Chrome 슬롯이 정한다.
     outcome = open_download_handoff(
@@ -470,11 +470,17 @@ def _finish_with_openx_handoff(
         log_event("download", "openx_handoff", reason, page_url=embed, download_page=outcome.get("download_page"))
         get_diagnostics().download(status="SUCCESS", reason=reason, output=outcome.get("download_page") or "", handoff=True)
         return res
-    if playback:
-        _log_playback(item_name, playback, item_url or page_url)
     fail = str(outcome.get("reason") or "download 페이지 연결 실패")
     reason = f"{prior_reason} | {fail}"
-    res.update(status="failed", fatal=True, reason=reason[:500], playback=playback or None)
+    if playback:
+        _log_playback(item_name, playback, item_url or page_url)
+    res.update(
+        status="failed",
+        fatal=True,
+        reason=reason[:500],
+        no_download_button=bool(outcome.get("no_download_button")),
+        playback=playback or None,
+    )
     log(f"  [403 인수 실패] {item_name}: {fail}")
     log_event("download", "openx_handoff_failed", fail, level="ERROR", page_url=embed)
     get_diagnostics().fail("download", reason)
