@@ -353,7 +353,7 @@ def _finish_with_openx_handoff(
     """403 이면 30초 안에 download 버튼을 확인한다.
 
     Download Now 와 Turnstile 은 누르거나 우회하지 않는다.
-    버튼이 없고 스트리밍 fallback이 비활성화되어 있으면 완료로 기록하지 않는다.
+    스트리밍 fallback이 비활성화되어 있으면 버튼이 없을 때 다운로드 불가로 처리한다.
     """
     embed = group.get("embed_url") or ""
     capture_dir = _playback_capture_dir(out_dir or OUT_DIR, item_name, item_url or page_url or embed)

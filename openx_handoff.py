@@ -4,8 +4,8 @@
 about:blank 에 올리면 스토리지가 막혀 로더에서 멈추므로, 가능하면 글 페이지 origin 에 iframe 을 넣는다.
 플레이어는 클릭 없이는 컨트롤바와 Download 버튼을 만들지 않는다. overlay/playback 클릭과
 재생을 시도한 뒤 30초만 버튼을 본다. 그 안에 있으면 download 페이지를 열고, 없으면
-기본적으로 다운로드 불가로 처리한다. ENABLE_STREAMING_FALLBACK 을 켠 경우에만 기존 스트리밍
-수신을 사용한다. 광고 반복과 Download Now 는 사용자 Chrome 의 Tampermonkey 가 처리한다.
+다운로드 불가로 처리한다. 스트리밍 fallback 구현은 보존하되 기본적으로 비활성화한다.
+광고 반복과 Download Now 는 사용자 Chrome 의 Tampermonkey 가 처리한다.
 Turnstile 토큰은 주입하지 않는다.
 """
 from __future__ import annotations
@@ -36,8 +36,8 @@ _HANDOFF_START_LOCK = threading.Lock()
 DOWNLOAD_BUTTON_SELECTOR = '[aria-label="Download video"], [button="download"]'
 # 이 시간 안에 버튼이 없으면 다운로드 불가로 처리한다.
 BUTTON_DECISION_MS = 30_000
-# 일시적으로 비활성화. 기존 수신 구현은 보존하고 기본 경로에서는 사용하지 않는다.
-ENABLE_STREAMING_FALLBACK = False
+# 스트리밍 fallback은 보존하되 임시로 비활성화한다.
+ENABLE_STREAMING_FALLBACK = True
 # 스트리밍은 버튼 판정과 별개다. 본편 바이트가 끝날 때까지 두되, 무한 대기는 막는다.
 CAPTURE_MAX_SECONDS = 3 * 60 * 60
 _SEEK_GAP_JS = """(ratio) => {
@@ -505,12 +505,12 @@ def open_download_handoff(
     max_open_download_pages: int = MAX_OPEN_DOWNLOAD_PAGES,
     max_concurrent_handoffs: int = MAX_CONCURRENT_HANDOFFS,
 ) -> dict[str, Any]:
-    """30초 안에 download 버튼이 있으면 download 페이지로, 없으면 기본적으로 다운로드 불가로 처리한다.
+    """30초 안에 download 버튼이 있으면 download 페이지로 연결하고, 없으면 다운로드 불가로 처리한다.
 
     버튼 판정이 끝난 뒤에는 경로를 바꾸지 않는다.
-    반환 ok 는 download 페이지를 열었거나 스트리밍을 마쳤다는 뜻이지, 파일 완료는 playback.complete 로 본다.
+    스트리밍 fallback을 다시 활성화하면 반환 ok는 스트리밍 완료를 뜻하지 않으며, 파일 완료는 playback.complete 로 본다.
     연결한 Chrome 은 사용자의 브라우저이므로 닫지 않는다.
-    download 탭 상한은 download 페이지를 새로 열지만 막고, 버튼이 없는 스트리밍은 막지 않는다.
+    download 탭 상한은 download 페이지를 새로 여는 것을 막는다.
     """
     slug = video_slug(embed_url)
     if not slug or not embed_url:
@@ -695,5 +695,11 @@ def open_download_handoff(
                 if wrapper is not None:
                     try:
                         wrapper.close()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_event(
+                            "browser",
+                            "handoff_wrapper_close_failed",
+                            f"handoff 재생 탭을 닫지 못함: {mask_text(str(exc))}",
+                            level="ERROR",
+                            slug=slug,
+                        )

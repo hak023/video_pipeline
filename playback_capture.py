@@ -32,6 +32,9 @@ MEDIA_TYPES = (
     "application/mp2t",
 )
 _NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+# Fetch interception pauses media responses. Keep the tap implementation available,
+# but do not use it in the normal browser capture path.
+ENABLE_CDP_MEDIA_TAP = False
 
 
 def is_media_target(url: str, content_type: str = "") -> bool:
@@ -196,7 +199,7 @@ class PlaybackCapture:
         self.route_installed = False
         self.route_error = ""
         self.cache_error = ""
-        self.capture_mode = "cdp"
+        self.capture_mode = "cdp_network"
         self.cdp_sessions = 0
         self.cdp_responses = 0
         self.cdp_finished = 0
@@ -205,7 +208,7 @@ class PlaybackCapture:
         self.media_seen = 0
         self.tap_bytes = 0
         self.tap_inflight = 0
-        self.tap_status = ""
+        self.tap_status = "disabled_nonblocking"
         self.tap_error = ""
         self.tap_sessions = 0
         self.tap_paused = 0
@@ -235,7 +238,7 @@ class PlaybackCapture:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._page = page
         self._cdp_url = cdp_url or ""
-        # 라우트와 캐시 우회는 설치하지 않는다. 이전 실행이 남긴 가로채기만 끈다.
+        # 라우트, Fetch interception, 캐시 우회는 설치하거나 변경하지 않는다.
         try:
             page.on("frameattached", self._on_frame_attached)
             page.on("framenavigated", self._on_frame_navigated)
@@ -250,7 +253,8 @@ class PlaybackCapture:
                 capture_dir=str(self.out_dir),
             )
         self.attach_frames(page)
-        self._start_tap(page)
+        if ENABLE_CDP_MEDIA_TAP:
+            self._start_tap(page)
         log_event(
             "playback_capture",
             "installed",
@@ -717,17 +721,10 @@ class PlaybackCapture:
         sid = id(session)
         self._cdp_sessions.append(session)
         self.cdp_sessions += 1
-        self._release_interception(session)
         try:
-            session.send("Network.enable", {
-                "maxTotalBufferSize": 1024 * 1024 * 1024,
-                "maxResourceBufferSize": 1024 * 1024 * 1024,
-            })
-        except Exception:
-            try:
-                session.send("Network.enable")
-            except Exception as exc:
-                self.cache_error = self.cache_error or type(exc).__name__
+            session.send("Network.enable")
+        except Exception as exc:
+            self.cache_error = self.cache_error or type(exc).__name__
         session.on("Network.requestWillBeSent", lambda event, key=sid: self._on_cdp_request(key, event))
         session.on("Network.responseReceived", lambda event, key=sid: self._on_cdp_response(key, event))
         session.on("Network.dataReceived", lambda event, key=sid: self._on_cdp_data(key, event))
@@ -765,8 +762,20 @@ class PlaybackCapture:
 
     def _on_cdp_data(self, sid: int, event: dict[str, Any]) -> None:
         """이벤트 안에서는 디스크에만 이어 쓴다. CDP 호출은 재생을 멈출 수 있다."""
-        encoded = event.get("data")
         request_id = str(event.get("requestId") or "")
+        slot = self._cdp_meta.get(self._meta_key(sid, request_id))
+        if not request_id or slot is None:
+            return
+        url = str(slot.get("url") or "")
+        resource_type = str(slot.get("resource_type") or "")
+        content_type = str(slot.get("content_type") or "")
+        content_range = str(slot.get("content_range") or "")
+        if not self._response_might_be_media(url, resource_type, content_type, content_range):
+            if not looks_like_playback_request(
+                url, resource_type, {"range": slot.get("request_range") or ""},
+            ):
+                return
+        encoded = event.get("data")
         if not encoded or not request_id:
             return
         try:
@@ -800,6 +809,7 @@ class PlaybackCapture:
         headers = response.get("headers")
         slot["content_type"] = response.get("mimeType") or _cdp_header(headers, "content-type")
         slot["content_range"] = _cdp_header(headers, "content-range")
+        slot["content_length"] = _cdp_header(headers, "content-length")
         slot["resource_type"] = _cdp_resource_type(str(event.get("type") or slot.get("resource_type") or ""))
         interesting = self._response_might_be_media(
             slot["url"], slot["resource_type"], slot["content_type"], slot["content_range"],
@@ -835,6 +845,7 @@ class PlaybackCapture:
         status = int(slot.get("status") or 0)
         ctype = str(slot.get("content_type") or "")
         content_range = str(slot.get("content_range") or "")
+        content_length = str(slot.get("content_length") or "")
         request_range = str(slot.get("request_range") or "")
         resource_type = str(slot.get("resource_type") or "")
         if not self._response_might_be_media(url, resource_type, ctype, content_range):
@@ -852,6 +863,7 @@ class PlaybackCapture:
             "status": status,
             "content_type": ctype,
             "content_range": content_range,
+            "content_length": content_length,
             "request_range": request_range,
             "resource_type": resource_type,
             "claim": claim,
@@ -937,19 +949,27 @@ class PlaybackCapture:
         status = item["status"]
         ctype = item["content_type"]
         content_range = item["content_range"]
+        content_length = item.get("content_length") or ""
         request_range = item["request_range"]
         resource_type = item["resource_type"]
         claim = item["claim"]
         body = self._take_chunk(item.get("sid"), request_id)
+        expected_length = None
+        parsed_range = parse_byte_range(content_range)
+        if parsed_range is not None:
+            expected_length = parsed_range[1] - parsed_range[0]
+        elif content_length.isdigit():
+            expected_length = int(content_length)
         error_name = ""
-        try:
-            payload = session.send("Network.getResponseBody", {"requestId": request_id})
-            raw = (payload or {}).get("body") or ""
-            decoded = base64.b64decode(raw) if (payload or {}).get("base64Encoded") else raw.encode("utf-8", errors="replace")
-            if len(decoded) > len(body):
-                body = decoded
-        except Exception as exc:
-            error_name = type(exc).__name__
+        if not body or (expected_length is not None and len(body) < expected_length):
+            try:
+                payload = session.send("Network.getResponseBody", {"requestId": request_id})
+                raw = (payload or {}).get("body") or ""
+                decoded = base64.b64decode(raw) if (payload or {}).get("base64Encoded") else raw.encode("utf-8", errors="replace")
+                if len(decoded) > len(body):
+                    body = decoded
+            except Exception as exc:
+                error_name = type(exc).__name__
         if not body:
             self._claimed.discard(claim)
             self._note_skipped(url, status, ctype, 0, f"cdp_body_error:{error_name or 'empty'}")
