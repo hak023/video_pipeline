@@ -277,22 +277,110 @@ def _rediscover_candidates(group: dict, *, t: dict, url: str, proxy: str | None,
     return fresh
 
 
+def _playback_capture_dir(out_dir: Path, item_name: str, item_url: str) -> Path:
+    digest = hashlib.sha1(item_url.encode("utf-8", "replace")).hexdigest()[:8]
+    safe = sanitize_filename(item_name) or "item"
+    return Path(out_dir) / f"{safe}_{digest}_playback"
+
+
+def _log_playback(item_name: str, playback: dict | None, item_url: str = "") -> None:
+    """재생 패킷 결과를 콘솔과 실행 진단 JSON에 남긴다. 서명 URL은 진단 쪽에서 마스킹된다."""
+    playback = playback or {}
+    files = playback.get("files") or []
+    skipped = playback.get("skipped") or []
+    log(
+        f"  [재생 캡처] {item_name}: 저장 {len(files)}개 / {playback.get('bytes') or 0} bytes, "
+        f"건너뜀 {playback.get('skipped_count', len(skipped))}개"
+    )
+    for item in files[:12]:
+        log(
+            f"    - {Path(item.get('path') or '').name} status={item.get('status')} "
+            f"{item.get('content_type') or ''} {item.get('size') or 0} bytes "
+            f"range={item.get('content_range') or item.get('request_range') or '-'}"
+        )
+    if len(files) > 12:
+        log(f"    - ... 외 {len(files) - 12}개. 전체 목록은 playback_capture.json")
+    reasons: dict[str, int] = {}
+    for item in skipped:
+        key = str(item.get("reason") or "?")
+        reasons[key] = reasons.get(key, 0) + 1
+    if reasons:
+        log("    건너뜀 사유: " + ", ".join(f"{key}={count}" for key, count in reasons.items()))
+    capture_dir = playback.get("capture_dir")
+    if capture_dir:
+        log(f"    디렉터리: {capture_dir}")
+        log(f"    목록: {Path(capture_dir) / 'playback_capture.json'}")
+    diag = get_diagnostics()
+    if item_url and diag.enabled:
+        digest = hashlib.sha1(item_url.encode("utf-8", "replace")).hexdigest()[:8]
+        rel = f"playback_{digest}.json"
+        diag.write_json(rel, playback)
+        log(f"    진단: {diag.dir / rel}")
+
+
 def _finish_with_openx_handoff(
     res: dict, group: dict, item_name: str, prior_reason: str, page_url: str = "",
-    history=None, item_url: str = "", post_date: str | None = None,
+    history=None, item_url: str = "", post_date: str | None = None, out_dir: Path | None = None,
 ) -> dict:
-    """403 이면 download 페이지로 넘기거나, 버튼이 없으면 그 자리에서 끝낸다.
+    """403 이면 download 페이지로 넘긴다. 버튼이 없으면 재생 패킷을 결과로 남긴다.
 
-    두 경우 모두 이 파이프라인에서 더 받을 방법이 없으므로 완료로 기록하고 종료한다.
     Download Now 와 Turnstile 은 누르거나 우회하지 않는다.
+    패킷이 없으면 완료로 기록하지 않는다. 다음 실행에서 다시 시도할 수 있게 한다.
     """
     embed = group.get("embed_url") or ""
+    capture_dir = _playback_capture_dir(out_dir or OUT_DIR, item_name, item_url or page_url or embed)
     log(f"  [403 인수] {item_name}: 임베드에서 download 버튼을 확인")
-    outcome = open_download_handoff(embed, page_url=page_url)
+    outcome = open_download_handoff(embed, page_url=page_url, capture_dir=capture_dir)
+    playback = outcome.get("playback") or {}
+    if outcome.get("ok") and outcome.get("no_download_button"):
+        _log_playback(item_name, playback, item_url or page_url)
+        files = playback.get("files") or []
+        if not files:
+            reason = (
+                "403 이후 임베드에 download 버튼이 없고, 재생 패킷도 저장되지 않았습니다. "
+                "완료로 기록하지 않습니다. 건너뜀 사유와 playback_capture.json 을 확인한 뒤 다시 실행하세요."
+            )
+            res.update(status="failed", fatal=True, reason=reason, handoff=True, no_download_button=True, playback=playback)
+            log(f"  [403 인수 실패] {item_name}: {reason}")
+            log_event("download", "playback_capture_empty", reason, level="ERROR", page_url=embed)
+            get_diagnostics().fail("download", reason)
+            return res
+        largest = max(files, key=lambda item: item.get("size") or 0)
+        reason = (
+            f"403 이후 download 버튼이 없어 재생 패킷 {len(files)}개"
+            f"({playback.get('bytes') or 0} bytes)를 저장했습니다. {capture_dir}"
+        )
+        res.update(
+            status="ok",
+            fatal=True,
+            reason=reason,
+            output=largest.get("path") or "",
+            download_page=None,
+            handoff=True,
+            no_download_button=True,
+            playback=playback,
+        )
+        if history and item_url:
+            history.record_success(
+                item_url, item_name, largest.get("path") or "",
+                post_date=post_date,
+                size=int(largest.get("size") or 0) or None,
+                extra={
+                    "handoff": True,
+                    "no_download_button": True,
+                    "playback_dir": str(capture_dir),
+                    "playback_files": len(files),
+                    "playback_bytes": playback.get("bytes") or 0,
+                },
+            )
+        log(f"  [403 인수 완료] {item_name}: {reason}")
+        log_event("download", "playback_capture_saved", reason, page_url=embed, output=largest.get("path") or "")
+        get_diagnostics().download(
+            status="SUCCESS", reason=reason, output=largest.get("path") or "", handoff=True, playback=True,
+        )
+        return res
     if outcome.get("ok"):
-        if outcome.get("no_download_button"):
-            reason = "403 이후 임베드에 download 버튼이 없습니다. 대체 경로가 없어 완료로 기록하고 종료합니다."
-        elif outcome.get("reused"):
+        if outcome.get("reused"):
             reason = (
                 "403 이후 같은 download 페이지가 이미 열려 있습니다. "
                 "이후는 Tampermonkey가 처리하므로 완료로 기록하고 종료합니다. "
@@ -316,15 +404,17 @@ def _finish_with_openx_handoff(
             history.record_success(
                 item_url, item_name, outcome.get("download_page") or "",
                 post_date=post_date,
-                extra={"handoff": True, "no_download_button": bool(outcome.get("no_download_button"))},
+                extra={"handoff": True, "no_download_button": False},
             )
         log(f"  [403 인수 완료] {item_name}: {reason}")
         log_event("download", "openx_handoff", reason, page_url=embed, download_page=outcome.get("download_page"))
         get_diagnostics().download(status="SUCCESS", reason=reason, output=outcome.get("download_page") or "", handoff=True)
         return res
+    if playback:
+        _log_playback(item_name, playback, item_url or page_url)
     fail = str(outcome.get("reason") or "download 페이지 연결 실패")
     reason = f"{prior_reason} | {fail}"
-    res.update(status="failed", fatal=True, reason=reason[:500])
+    res.update(status="failed", fatal=True, reason=reason[:500], playback=playback or None)
     log(f"  [403 인수 실패] {item_name}: {fail}")
     log_event("download", "openx_handoff_failed", fail, level="ERROR", page_url=embed)
     get_diagnostics().fail("download", reason)
@@ -548,7 +638,7 @@ def _process_item(
             )
             return _finish_with_openx_handoff(
                 res, group, item_name, reason, page_url=url,
-                history=history, item_url=item_url, post_date=post_date,
+                history=history, item_url=item_url, post_date=post_date, out_dir=out_dir,
             )
 
 
@@ -577,7 +667,7 @@ def _process_item(
         if is_openx_access_denied(str(r.get("reason") or "")):
             return _finish_with_openx_handoff(
                 res, group, item_name, str(r.get("reason") or "HTTP 403"), page_url=url,
-                history=history, item_url=item_url, post_date=post_date,
+                history=history, item_url=item_url, post_date=post_date, out_dir=out_dir,
             )
         if r.get("fatal"):
             res.update(status="failed", fatal=True)

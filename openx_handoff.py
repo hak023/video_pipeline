@@ -11,11 +11,14 @@ from __future__ import annotations
 import html
 import re
 import threading
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from diagnostics import mask_text
+from diagnostics import log_event, mask_text
+from playback_capture import PlaybackCapture
 from playwright.sync_api import sync_playwright
+from progress import log
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 DOWNLOAD_PAGE_ORIGIN = "https://download.openx.xyz/"
@@ -222,10 +225,12 @@ def open_download_handoff(
     cdp_url: str = DEFAULT_CDP_URL,
     timeout_ms: int = 60_000,
     playwright=None,
+    capture_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """플레이어 Download 버튼이 생긴 뒤 download 페이지를 연다.
 
     반환 ok 는 페이지를 열었다는 뜻이지 파일이 저장됐다는 뜻이 아니다.
+    버튼이 없으면, 재생 시작 전에 켜 둔 캡처의 패킷을 playback 으로 돌려준다.
     연결한 Chrome 은 사용자의 브라우저이므로 닫지 않는다.
     """
     slug = video_slug(embed_url)
@@ -237,6 +242,8 @@ def open_download_handoff(
     wrapper = None
     player_ready = False
     session = None
+    capture: PlaybackCapture | None = None
+    keep_capture = False
     # 같은 영상 id만 직렬화한다. 다른 영상은 --workers 수만큼 각자 download 페이지를 연다.
     with _slug_lock(slug):
         try:
@@ -256,6 +263,10 @@ def open_download_handoff(
                 keep_ids = {id(existing) for existing in getattr(context, "pages", [])}
                 wrapper = context.new_page()
                 keep_ids.add(id(wrapper))
+                if capture_dir:
+                    capture = PlaybackCapture(Path(capture_dir))
+                    capture.install(wrapper)
+                    log(f"  [재생 캡처] 버튼 확인 전에 패킷 기록을 시작합니다: {capture.out_dir}")
                 embed_host = _open_embed_frame(wrapper, embed_url, article_url)
                 _prime_embed_player(wrapper, keep_ids)
                 try:
@@ -265,18 +276,36 @@ def open_download_handoff(
                 except Exception as exc:
                     if type(exc).__name__ != "TimeoutError":
                         raise
+                    keep_capture = True
+                    playback = capture.summary() if capture else None
+                    saved = len((playback or {}).get("files") or [])
+                    log(
+                        f"  [재생 캡처] download 버튼 없음. "
+                        f"저장 {saved}개 / 건너뜀 {(playback or {}).get('skipped_count', 0)}개"
+                    )
+                    log_event(
+                        "playback_capture",
+                        "kept_no_download_button",
+                        "download 버튼이 없어 재생 패킷을 유지",
+                        page_url=embed_url,
+                        saved=saved,
+                        capture_dir=str(capture.out_dir) if capture else "",
+                    )
                     return {
                         "ok": True,
                         "no_download_button": True,
                         "reused": False,
                         "slug": slug,
                         "download_page": None,
+                        "playback": playback,
                         "reason": "임베드에 download 버튼이 없습니다",
                     }
                 player_ready = True
                 if session is None:
                     session = _cdp_session(browser, context)
                 target_id = _open_background_tab(session, page_url)
+                if capture:
+                    log("  [재생 캡처] download 버튼이 있어 임시 패킷은 지우고 download 페이지로 넘깁니다")
                 return {
                     "ok": True,
                     "reused": False,
@@ -287,6 +316,8 @@ def open_download_handoff(
                 }
         except Exception as exc:
             detail = f"{type(exc).__name__}: {mask_text(str(exc))[:180]}"
+            keep_capture = capture is not None
+            playback = capture.summary() if capture else None
             if browser is None:
                 reason = (
                     f"Tampermonkey가 설치된 Chrome(CDP {cdp_url})에 연결하지 못했습니다. "
@@ -297,8 +328,20 @@ def open_download_handoff(
                 reason = f"임베드 플레이어가 준비되지 않아 download 페이지로 연결하지 않았습니다. ({detail})"
             else:
                 reason = f"플레이어는 준비됐지만 download 페이지를 열지 못했습니다. ({detail})"
-            return {"ok": False, "slug": slug, "download_page": page_url, "reason": reason}
+            if playback and playback.get("files"):
+                reason += f" 그때까지 받은 재생 패킷 {len(playback['files'])}개는 남겨 두었습니다."
+            return {
+                "ok": False,
+                "slug": slug,
+                "download_page": page_url,
+                "playback": playback,
+                "reason": reason,
+            }
         finally:
+            if capture is not None:
+                capture.uninstall(wrapper)
+                if not keep_capture:
+                    capture.discard()
             if session is not None:
                 try:
                     session.detach()
