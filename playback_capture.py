@@ -3,11 +3,14 @@
 직접 URL 재요청이 403이어도, 페이지가 재생하면서 받은 본문은 그 응답에만 있을 수 있다.
 그때는 같은 URL을 다시 받지 않고 이미 도착한 응답 바이트를 저장한다.
 이 플레이어의 본편은 Range 요청의 206일 수 있으므로 200과 206을 모두 남긴다.
-이미 열린 Chrome의 디스크 캐시·서비스워커 응답은 page.route에 안 잡힐 수 있다.
-그때는 응답 이벤트에서 본문을 읽고, 둘 다 없으면 관찰 건수를 매니페스트에 남긴다.
+page.route("**/*") 는 교차 출처 iframe 요청을 멈추고 핸들러에 안 넘길 수 있다.
+그러면 재생이 시작되지 않고 다운로드 버튼도 생기지 않는다.
+그래서 라우트는 걸지 않고, 페이지와 iframe CDP 세션의 Network.getResponseBody 로 본문을 읽는다.
+같은 세션에서만 보이는 응답은 response 이벤트로 보완한다.
 """
 from __future__ import annotations
 
+import base64
 import json
 import re
 from pathlib import Path
@@ -77,6 +80,21 @@ def saved_media_name(url: str, index: int, content_range: str = "") -> str:
     return f"{index:03d}_{stem}"
 
 
+def _cdp_header(headers: Any, name: str) -> str:
+    if isinstance(headers, list):
+        wanted = name.lower()
+        for item in headers:
+            if str((item or {}).get("name") or "").lower() == wanted:
+                return str((item or {}).get("value") or "")
+        return ""
+    return _header(headers, name)
+
+
+def _cdp_resource_type(value: str) -> str:
+    kind = (value or "").lower()
+    return "media" if kind == "media" else kind
+
+
 def _header(headers: Any, name: str) -> str:
     if not headers:
         return ""
@@ -92,9 +110,9 @@ def _header(headers: Any, name: str) -> str:
 
 
 class PlaybackCapture:
-    """재생 요청을 가로채 응답 바이트를 저장한 뒤 플레이어에 그대로 전달한다.
+    """재생 중 받은 미디어 본문을 저장한다.
 
-    동기 Playwright에서 response.body()를 나중에 읽으면 멈출 수 있어, route.fetch()로 받는다.
+    교차 출처 플레이어는 별도 CDP 세션이다. page.route 로 멈추지 않고 그 세션에서 본문을 읽는다.
     설치는 재생 클릭보다 먼저 해야 한다. 버튼 확인이 끝난 뒤에 켜면 이미 지나간 본문은 없다.
     """
 
@@ -114,30 +132,29 @@ class PlaybackCapture:
         self.route_installed = False
         self.route_error = ""
         self.cache_error = ""
+        self.capture_mode = "cdp"
+        self.cdp_sessions = 0
+        self.cdp_responses = 0
+        self.cdp_finished = 0
+        self.frame_attach_skipped = 0
+        self.frame_errors: list[str] = []
         self._seen: set[str] = set()
         self._claimed: set[str] = set()
         self._page = None
-        self._cdp = None
+        self._attached_ids: set[int] = set()
+        self._skipped_frame_url: dict[int, str] = {}
+        self._cdp_sessions: list[Any] = []
+        self._cdp_meta: dict[tuple[int, str], dict[str, Any]] = {}
         self._saved_logs = 0
         self._skipped_logs = 0
 
     def install(self, page) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._page = page
-        self.cache_disabled = self._disable_cache(page)
+        # page.route("**/*") 는 OOPIF 요청을 핸들러 없이 멈출 수 있어 설치하지 않는다.
         try:
-            page.route("**/*", self._handle)
-            self.route_installed = True
-        except Exception as exc:
-            self.route_error = type(exc).__name__
-            log_event(
-                "playback_capture",
-                "route_failed",
-                f"route 설치 실패: {type(exc).__name__}",
-                level="ERROR",
-                capture_dir=str(self.out_dir),
-            )
-        try:
+            page.on("frameattached", self._on_frame_attached)
+            page.on("framenavigated", self._on_frame_navigated)
             page.on("request", self._on_request)
             page.on("response", self._on_response)
         except Exception as exc:
@@ -148,6 +165,7 @@ class PlaybackCapture:
                 level="ERROR",
                 capture_dir=str(self.out_dir),
             )
+        self.attach_frames(page)
         log_event(
             "playback_capture",
             "installed",
@@ -156,53 +174,31 @@ class PlaybackCapture:
             cache_disabled=self.cache_disabled,
             service_worker_bypassed=self.service_worker_bypassed,
             route_installed=self.route_installed,
+            capture_mode=self.capture_mode,
+            cdp_sessions=self.cdp_sessions,
         )
-
-    def _disable_cache(self, page) -> bool:
-        """이 페이지만 캐시와 서비스워커를 우회한다. 사용자 Chrome 전체를 건드리지 않는다."""
-        try:
-            session = page.context.new_cdp_session(page)
-        except Exception as exc:
-            self.cache_error = type(exc).__name__
-            return False
-        self._cdp = session
-        ok = False
-        try:
-            session.send("Network.enable")
-            session.send("Network.setCacheDisabled", {"cacheDisabled": True})
-            ok = True
-        except Exception as exc:
-            self.cache_error = type(exc).__name__
-        try:
-            session.send("Network.setBypassServiceWorker", {"bypass": True})
-            self.service_worker_bypassed = True
-        except Exception:
-            self.service_worker_bypassed = False
-        return ok
 
     def uninstall(self, page=None) -> None:
         page = page or self._page
         if page is None:
             return
         try:
+            page.remove_listener("frameattached", self._on_frame_attached)
+            page.remove_listener("framenavigated", self._on_frame_navigated)
             page.remove_listener("request", self._on_request)
             page.remove_listener("response", self._on_response)
         except Exception:
             pass
-        try:
-            page.unroute("**/*", self._handle)
-        except Exception:
-            pass
-        if self._cdp is not None:
+        for session in self._cdp_sessions:
             try:
-                self._cdp.send("Network.setCacheDisabled", {"cacheDisabled": False})
+                session.send("Network.setCacheDisabled", {"cacheDisabled": False})
             except Exception:
                 pass
             try:
-                self._cdp.detach()
+                session.detach()
             except Exception:
                 pass
-            self._cdp = None
+        self._cdp_sessions.clear()
         self._page = None
 
     def discard(self) -> None:
@@ -240,6 +236,12 @@ class PlaybackCapture:
             "route_installed": self.route_installed,
             "route_error": self.route_error,
             "cache_error": self.cache_error,
+            "capture_mode": self.capture_mode,
+            "cdp_sessions": self.cdp_sessions,
+            "cdp_responses": self.cdp_responses,
+            "cdp_finished": self.cdp_finished,
+            "frame_attach_skipped": self.frame_attach_skipped,
+            "frame_errors": list(self.frame_errors),
             "bytes": sum(item["size"] for item in self.files),
             "capture_dir": str(self.out_dir),
         }
@@ -264,6 +266,10 @@ class PlaybackCapture:
             responses=self.response_count,
             cache_disabled=self.cache_disabled,
             route_installed=self.route_installed,
+            capture_mode=self.capture_mode,
+            cdp_sessions=self.cdp_sessions,
+            cdp_responses=self.cdp_responses,
+            cdp_finished=self.cdp_finished,
         )
         return payload
 
@@ -280,6 +286,173 @@ class PlaybackCapture:
 
     def _claim_key(self, url: str, request_range: str) -> str:
         return f"{url}|{request_range}"
+
+    def _on_frame_attached(self, frame) -> None:
+        self.attach_frames(frames=[frame])
+
+    def _on_frame_navigated(self, frame) -> None:
+        self.attach_frames(frames=[frame])
+
+    def attach_frames(self, page=None, frames=None) -> None:
+        """페이지와 교차 출처 iframe에 Network 관찰을 붙인다. 이미 붙은 대상은 다시 붙이지 않는다."""
+        page = page or self._page
+        targets: list[Any] = []
+        if frames is not None:
+            targets.extend(frames)
+        elif page is not None:
+            targets.append(page)
+            try:
+                targets.extend(list(page.frames))
+            except Exception:
+                pass
+        main = getattr(page, "main_frame", None) if page is not None else None
+        for target in targets:
+            if target is None or target is main:
+                continue
+            self._try_attach(target)
+
+    def _try_attach(self, target) -> None:
+        key = id(target)
+        if key in self._attached_ids:
+            return
+        url = str(getattr(target, "url", "") or "")
+        if self._skipped_frame_url.get(key) == url:
+            self.frame_attach_skipped += 1
+            return
+        context = getattr(target, "context", None)
+        if context is None:
+            page = getattr(target, "page", None)
+            context = getattr(page, "context", None)
+        if context is None or not hasattr(context, "new_cdp_session"):
+            self._note_frame_error("no_cdp_context")
+            return
+        try:
+            session = context.new_cdp_session(target)
+        except Exception as exc:
+            text = str(exc)
+            if "separate CDP session" in text:
+                self.frame_attach_skipped += 1
+                self._skipped_frame_url[key] = url
+                return
+            self._note_frame_error(f"{type(exc).__name__}: {text[:120]}")
+            return
+        self._attached_ids.add(key)
+        self._wire_session(session)
+
+    def _note_frame_error(self, message: str) -> None:
+        if len(self.frame_errors) < 12:
+            self.frame_errors.append(message)
+        if not self.cache_error:
+            self.cache_error = message.split(":", 1)[0]
+
+    def _wire_session(self, session) -> None:
+        sid = id(session)
+        self._cdp_sessions.append(session)
+        self.cdp_sessions += 1
+        try:
+            session.send("Network.enable")
+            session.send("Network.setCacheDisabled", {"cacheDisabled": True})
+            self.cache_disabled = True
+        except Exception as exc:
+            self.cache_error = self.cache_error or type(exc).__name__
+        try:
+            session.send("Network.setBypassServiceWorker", {"bypass": True})
+            self.service_worker_bypassed = True
+        except Exception:
+            pass
+        session.on("Network.requestWillBeSent", lambda event, key=sid: self._on_cdp_request(key, event))
+        session.on("Network.responseReceived", lambda event, key=sid: self._on_cdp_response(key, event))
+        session.on(
+            "Network.loadingFinished",
+            lambda event, sess=session, key=sid: self._on_cdp_finished(sess, key, event),
+        )
+        session.on("Network.loadingFailed", lambda event, key=sid: self._on_cdp_failed(key, event))
+
+    def _meta_key(self, sid: int, request_id: str) -> tuple[int, str]:
+        return sid, str(request_id or "")
+
+    def _on_cdp_request(self, sid: int, event: dict[str, Any]) -> None:
+        request = event.get("request") or {}
+        url = str(request.get("url") or "")
+        request_id = str(event.get("requestId") or "")
+        if not url or not request_id:
+            return
+        headers = request.get("headers")
+        slot = self._cdp_meta.setdefault(self._meta_key(sid, request_id), {})
+        slot["url"] = url
+        slot["request_range"] = _cdp_header(headers, "range")
+        slot["resource_type"] = _cdp_resource_type(str(event.get("type") or slot.get("resource_type") or ""))
+
+    def _on_cdp_response(self, sid: int, event: dict[str, Any]) -> None:
+        self.cdp_responses += 1
+        self.response_count += 1
+        response = event.get("response") or {}
+        request_id = str(event.get("requestId") or "")
+        url = str(response.get("url") or "")
+        slot = self._cdp_meta.setdefault(self._meta_key(sid, request_id), {})
+        slot["url"] = url or slot.get("url") or ""
+        slot["status"] = int(response.get("status") or 0)
+        headers = response.get("headers")
+        slot["content_type"] = response.get("mimeType") or _cdp_header(headers, "content-type")
+        slot["content_range"] = _cdp_header(headers, "content-range")
+        slot["resource_type"] = _cdp_resource_type(str(event.get("type") or slot.get("resource_type") or ""))
+        interesting = self._response_might_be_media(
+            slot["url"], slot["resource_type"], slot["content_type"], slot["content_range"],
+        ) or looks_like_playback_request(slot["url"], slot["resource_type"], {"range": slot.get("request_range", "")})
+        self._sample(self.response_samples, {
+            "url": slot["url"],
+            "status": slot["status"],
+            "resource_type": slot["resource_type"],
+            "content_type": slot["content_type"],
+            "content_range": slot["content_range"],
+            "range": slot.get("request_range") or "",
+            "interesting": interesting,
+            "via": "cdp",
+        }, interesting=interesting)
+
+    def _on_cdp_failed(self, sid: int, event: dict[str, Any]) -> None:
+        slot = self._cdp_meta.pop(self._meta_key(sid, str(event.get("requestId") or "")), None)
+        if not slot:
+            return
+        url = str(slot.get("url") or "")
+        if looks_like_playback_request(url, slot.get("resource_type") or "", {"range": slot.get("request_range") or ""}):
+            self._note_skipped(url, int(slot.get("status") or 0), str(slot.get("content_type") or ""), 0, "cdp_loading_failed")
+
+    def _on_cdp_finished(self, session, sid: int, event: dict[str, Any]) -> None:
+        self.cdp_finished += 1
+        request_id = str(event.get("requestId") or "")
+        slot = self._cdp_meta.pop(self._meta_key(sid, request_id), None)
+        if not slot:
+            return
+        url = str(slot.get("url") or "")
+        status = int(slot.get("status") or 0)
+        ctype = str(slot.get("content_type") or "")
+        content_range = str(slot.get("content_range") or "")
+        request_range = str(slot.get("request_range") or "")
+        resource_type = str(slot.get("resource_type") or "")
+        if not self._response_might_be_media(url, resource_type, ctype, content_range):
+            if not looks_like_playback_request(url, resource_type, {"range": request_range}):
+                return
+        claim = self._claim_key(url, request_range)
+        if claim in self._claimed:
+            return
+        self._claimed.add(claim)
+        try:
+            payload = session.send("Network.getResponseBody", {"requestId": request_id})
+        except Exception as exc:
+            self._claimed.discard(claim)
+            self._note_skipped(url, status, ctype, 0, f"cdp_body_error:{type(exc).__name__}")
+            return
+        raw = (payload or {}).get("body") or ""
+        try:
+            body = base64.b64decode(raw) if (payload or {}).get("base64Encoded") else raw.encode("utf-8", errors="replace")
+        except Exception as exc:
+            self._claimed.discard(claim)
+            self._note_skipped(url, status, ctype, 0, f"cdp_decode_error:{type(exc).__name__}")
+            return
+        if resource_type != "media" and looks_like_playback_request(url, resource_type, {"range": request_range}):
+            resource_type = "media" if not is_media_target(url, ctype) else resource_type
+        self._store(url, status, ctype, content_range, request_range, body, resource_type)
 
     def _on_request(self, request) -> None:
         self.request_count += 1

@@ -298,14 +298,14 @@ def _log_playback(item_name: str, playback: dict | None, item_url: str = "") -> 
     log(
         f"  [재생 캡처] {item_name}: 저장 {len(files)}개 / {playback.get('bytes') or 0} bytes, "
         f"건너뜀 {playback.get('skipped_count', len(skipped))}개, "
-        f"route {playback.get('seen_count', 0)} / request {playback.get('request_count', 0)} / "
-        f"response {playback.get('response_count', 0)}"
+        f"cdp 세션 {playback.get('cdp_sessions', 0)} / cdp 응답 {playback.get('cdp_responses', 0)} / "
+        f"request {playback.get('request_count', 0)} / response {playback.get('response_count', 0)}"
     )
     log(
         f"    관찰: cache_disabled={playback.get('cache_disabled')} "
         f"service_worker_bypassed={playback.get('service_worker_bypassed')} "
-        f"route_installed={playback.get('route_installed')} "
-        f"route_error={playback.get('route_error') or '-'} "
+        f"capture_mode={playback.get('capture_mode') or '-'} "
+        f"frame_errors={','.join(playback.get('frame_errors') or []) or '-'} "
         f"cache_error={playback.get('cache_error') or '-'}"
     )
     for item in files[:12]:

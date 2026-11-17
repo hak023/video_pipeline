@@ -221,9 +221,11 @@ def _close_extension_block_pages(page, keep_ids: set[int] | None = None) -> None
             pass
 
 
-def _prime_embed_player(page, keep_ids: set[int] | None = None) -> None:
+def _prime_embed_player(page, keep_ids: set[int] | None = None, capture=None) -> None:
     """로더에 멈춘 플레이어를 깨운다. 수동 재생은 웹페이지 클릭 뒤에야 컨트롤바가 생긴다."""
     for rnd in range(_PRIME_ROUNDS):
+        if capture is not None:
+            capture.attach_frames(page)
         _close_extension_block_pages(page, keep_ids)
         try:
             box = page.locator("#player_frame").bounding_box()
@@ -340,7 +342,15 @@ def open_download_handoff(
                         capture.install(wrapper)
                         log(f"  [재생 캡처] 버튼 확인 전에 패킷 기록을 시작합니다: {capture.out_dir}")
                     embed_host = _open_embed_frame(wrapper, embed_url, article_url)
-                    _prime_embed_player(wrapper, keep_ids)
+                    if capture is not None:
+                        capture.attach_frames(wrapper)
+                    _prime_embed_player(wrapper, keep_ids, capture)
+                    if capture is not None:
+                        log(
+                            f"  [재생 캡처] CDP 세션 {getattr(capture, 'cdp_sessions', 0)}개 "
+                            f"(iframe 별도 세션이 없으면 1개), "
+                            f"같은 세션 프레임 {getattr(capture, 'frame_attach_skipped', 0)}개"
+                        )
                     try:
                         wrapper.frame_locator("#player_frame").locator(DOWNLOAD_BUTTON_SELECTOR).first.wait_for(
                             state="attached", timeout=timeout_ms,
@@ -354,7 +364,8 @@ def open_download_handoff(
                         log(
                             f"  [재생 캡처] download 버튼 없음. "
                             f"저장 {saved}개 / 건너뜀 {(playback or {}).get('skipped_count', 0)}개 / "
-                            f"route {(playback or {}).get('seen_count', 0)} / "
+                            f"cdp 세션 {(playback or {}).get('cdp_sessions', 0)} / "
+                            f"cdp 응답 {(playback or {}).get('cdp_responses', 0)} / "
                             f"response {(playback or {}).get('response_count', 0)}"
                         )
                         log_event(
