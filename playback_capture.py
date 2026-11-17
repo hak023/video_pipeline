@@ -3,10 +3,9 @@
 직접 URL 재요청이 403이어도, 페이지가 재생하면서 받은 본문은 그 응답에만 있을 수 있다.
 그때는 같은 URL을 다시 받지 않고 이미 도착한 응답 바이트를 저장한다.
 이 플레이어의 본편은 Range 요청의 206일 수 있으므로 200과 206을 모두 남긴다.
-page.route("**/*") 는 교차 출처 iframe 요청을 멈추고 핸들러에 안 넘길 수 있다.
-그러면 재생이 시작되지 않고 다운로드 버튼도 생기지 않는다.
-그래서 라우트는 걸지 않고, 페이지와 iframe CDP 세션의 Network.getResponseBody 로 본문을 읽는다.
-같은 세션에서만 보이는 응답은 response 이벤트로 보완한다.
+요청을 가로채거나 캐시를 끄면 이 플레이어는 재생을 시작하지 않는다.
+그래서 route, Fetch 가로채기, 캐시 우회는 쓰지 않는다.
+CDP 세션은 내비게이션 이벤트가 끝난 뒤에만 붙이고, 본문도 그 밖에서 읽는다.
 """
 from __future__ import annotations
 
@@ -147,6 +146,7 @@ class PlaybackCapture:
         self._cdp_meta: dict[tuple[int, str], dict[str, Any]] = {}
         self._cdp_queue: list[dict[str, Any]] = []
         self._response_queue: list[Any] = []
+        self._pending_frames: list[Any] = []
         self._draining = False
         self._saved_logs = 0
         self._skipped_logs = 0
@@ -154,7 +154,7 @@ class PlaybackCapture:
     def install(self, page) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._page = page
-        # page.route("**/*") 는 OOPIF 요청을 핸들러 없이 멈출 수 있어 설치하지 않는다.
+        # 라우트와 캐시 우회는 설치하지 않는다. 이전 실행이 남긴 가로채기만 끈다.
         try:
             page.on("frameattached", self._on_frame_attached)
             page.on("framenavigated", self._on_frame_navigated)
@@ -193,10 +193,6 @@ class PlaybackCapture:
         except Exception:
             pass
         for session in self._cdp_sessions:
-            try:
-                session.send("Network.setCacheDisabled", {"cacheDisabled": False})
-            except Exception:
-                pass
             try:
                 session.detach()
             except Exception:
@@ -309,15 +305,18 @@ class PlaybackCapture:
         return f"{url}|{request_range}"
 
     def _on_frame_attached(self, frame) -> None:
-        self.attach_frames(frames=[frame])
+        self._pending_frames.append(frame)
 
     def _on_frame_navigated(self, frame) -> None:
-        self.attach_frames(frames=[frame])
+        self._pending_frames.append(frame)
 
     def attach_frames(self, page=None, frames=None) -> None:
-        """페이지와 교차 출처 iframe에 Network 관찰을 붙인다. 이미 붙은 대상은 다시 붙이지 않는다."""
+        """페이지와 교차 출처 iframe에 Network 관찰을 붙인다. 이벤트 안에서는 호출하지 않는다."""
         page = page or self._page
         targets: list[Any] = []
+        pending = self._pending_frames
+        self._pending_frames = []
+        targets.extend(pending)
         if frames is not None:
             targets.extend(frames)
         elif page is not None:
@@ -370,17 +369,11 @@ class PlaybackCapture:
         sid = id(session)
         self._cdp_sessions.append(session)
         self.cdp_sessions += 1
+        self._release_interception(session)
         try:
             session.send("Network.enable")
-            session.send("Network.setCacheDisabled", {"cacheDisabled": True})
-            self.cache_disabled = True
         except Exception as exc:
             self.cache_error = self.cache_error or type(exc).__name__
-        try:
-            session.send("Network.setBypassServiceWorker", {"bypass": True})
-            self.service_worker_bypassed = True
-        except Exception:
-            pass
         session.on("Network.requestWillBeSent", lambda event, key=sid: self._on_cdp_request(key, event))
         session.on("Network.responseReceived", lambda event, key=sid: self._on_cdp_response(key, event))
         session.on(
@@ -388,6 +381,17 @@ class PlaybackCapture:
             lambda event, sess=session, key=sid: self._on_cdp_finished(sess, key, event),
         )
         session.on("Network.loadingFailed", lambda event, key=sid: self._on_cdp_failed(key, event))
+
+    def _release_interception(self, session) -> None:
+        """이전 page.route 가 Chrome에 남긴 요청 멈춤을 푼다. 캐시와 서비스워커는 건드리지 않는다."""
+        for method, params in (
+            ("Fetch.disable", {}),
+            ("Network.setRequestInterception", {"patterns": []}),
+        ):
+            try:
+                session.send(method, params)
+            except Exception:
+                continue
 
     def _meta_key(self, sid: int, request_id: str) -> tuple[int, str]:
         return sid, str(request_id or "")
