@@ -145,6 +145,9 @@ class PlaybackCapture:
         self._skipped_frame_url: dict[int, str] = {}
         self._cdp_sessions: list[Any] = []
         self._cdp_meta: dict[tuple[int, str], dict[str, Any]] = {}
+        self._cdp_queue: list[dict[str, Any]] = []
+        self._response_queue: list[Any] = []
+        self._draining = False
         self._saved_logs = 0
         self._skipped_logs = 0
 
@@ -201,6 +204,23 @@ class PlaybackCapture:
         self._cdp_sessions.clear()
         self._page = None
 
+    def drain(self) -> None:
+        """이벤트 밖에서 본문을 읽는다. 핸들러 안에서 읽으면 동기 Playwright가 재생을 멈춘다."""
+        if self._draining:
+            return
+        self._draining = True
+        try:
+            queued = self._cdp_queue
+            self._cdp_queue = []
+            for item in queued:
+                self._read_cdp_body(item)
+            responses = self._response_queue
+            self._response_queue = []
+            for response in responses:
+                self._read_response_body(response)
+        finally:
+            self._draining = False
+
     def discard(self) -> None:
         """download 버튼이 있어 패킷이 필요 없을 때 임시 파일을 지운다."""
         for item in self.files:
@@ -220,6 +240,7 @@ class PlaybackCapture:
         log_event("playback_capture", "discarded", "download 버튼이 있어 임시 재생 패킷을 삭제", capture_dir=str(self.out_dir))
 
     def summary(self) -> dict[str, Any]:
+        self.drain()
         payload = {
             "ok": bool(self.files),
             "files": list(self.files),
@@ -437,22 +458,17 @@ class PlaybackCapture:
         if claim in self._claimed:
             return
         self._claimed.add(claim)
-        try:
-            payload = session.send("Network.getResponseBody", {"requestId": request_id})
-        except Exception as exc:
-            self._claimed.discard(claim)
-            self._note_skipped(url, status, ctype, 0, f"cdp_body_error:{type(exc).__name__}")
-            return
-        raw = (payload or {}).get("body") or ""
-        try:
-            body = base64.b64decode(raw) if (payload or {}).get("base64Encoded") else raw.encode("utf-8", errors="replace")
-        except Exception as exc:
-            self._claimed.discard(claim)
-            self._note_skipped(url, status, ctype, 0, f"cdp_decode_error:{type(exc).__name__}")
-            return
-        if resource_type != "media" and looks_like_playback_request(url, resource_type, {"range": request_range}):
-            resource_type = "media" if not is_media_target(url, ctype) else resource_type
-        self._store(url, status, ctype, content_range, request_range, body, resource_type)
+        self._cdp_queue.append({
+            "session": session,
+            "request_id": request_id,
+            "url": url,
+            "status": status,
+            "content_type": ctype,
+            "content_range": content_range,
+            "request_range": request_range,
+            "resource_type": resource_type,
+            "claim": claim,
+        })
 
     def _on_request(self, request) -> None:
         self.request_count += 1
@@ -473,10 +489,7 @@ class PlaybackCapture:
         }, interesting=interesting)
 
     def _on_response(self, response) -> None:
-        """route가 캐시 때문에 못 본 재생 응답을 여기서 저장한다.
-
-        route.fetch() 도중인 같은 요청의 body()는 동기 Playwright에서 멈출 수 있어 읽지 않는다.
-        """
+        """응답 이벤트에서는 기록만 한다. body()를 여기서 읽으면 재생이 멈춘다."""
         self.response_count += 1
         try:
             request = response.request
@@ -500,11 +513,56 @@ class PlaybackCapture:
         }, interesting=interesting)
         if self._claim_key(url, request_range) in self._claimed:
             return
-        if not self._response_might_be_media(url, resource_type, ctype, content_range):
+        if not interesting:
             return
+        self._response_queue.append(response)
+
+    def _read_cdp_body(self, item: dict[str, Any]) -> None:
+        session = item["session"]
+        request_id = item["request_id"]
+        url = item["url"]
+        status = item["status"]
+        ctype = item["content_type"]
+        content_range = item["content_range"]
+        request_range = item["request_range"]
+        resource_type = item["resource_type"]
+        claim = item["claim"]
+        try:
+            payload = session.send("Network.getResponseBody", {"requestId": request_id})
+        except Exception as exc:
+            self._claimed.discard(claim)
+            self._note_skipped(url, status, ctype, 0, f"cdp_body_error:{type(exc).__name__}")
+            return
+        raw = (payload or {}).get("body") or ""
+        try:
+            body = base64.b64decode(raw) if (payload or {}).get("base64Encoded") else raw.encode("utf-8", errors="replace")
+        except Exception as exc:
+            self._claimed.discard(claim)
+            self._note_skipped(url, status, ctype, 0, f"cdp_decode_error:{type(exc).__name__}")
+            return
+        if resource_type != "media" and looks_like_playback_request(url, resource_type, {"range": request_range}):
+            resource_type = "media" if not is_media_target(url, ctype) else resource_type
+        self._store(url, status, ctype, content_range, request_range, body, resource_type)
+
+    def _read_response_body(self, response) -> None:
+        try:
+            request = response.request
+            url = response.url
+            status = int(response.status)
+            resource_type = getattr(request, "resource_type", "") or ""
+            ctype = _header(response.headers, "content-type")
+            content_range = _header(response.headers, "content-range")
+            request_range = _header(getattr(request, "headers", None), "range")
+        except Exception:
+            return
+        claim = self._claim_key(url, request_range)
+        if claim in self._claimed:
+            return
+        self._claimed.add(claim)
         try:
             body = response.body()
         except Exception as exc:
+            self._claimed.discard(claim)
             self._note_skipped(url, status, ctype, 0, f"body_error:{type(exc).__name__}")
             return
         self._store(url, status, ctype, content_range, request_range, body, resource_type)
@@ -640,7 +698,12 @@ def capture_playback(page, out_dir: Path, play, *, timeout_ms: int = 8000) -> di
     capture.install(page)
     try:
         play()
-        page.wait_for_timeout(min(timeout_ms, 1500))
+        waited = 0
+        limit = min(timeout_ms, 1500)
+        while waited < limit:
+            page.wait_for_timeout(min(300, limit - waited))
+            capture.drain()
+            waited += 300
     finally:
         capture.uninstall(page)
     return capture.summary()

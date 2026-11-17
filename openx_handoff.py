@@ -221,6 +221,31 @@ def _close_extension_block_pages(page, keep_ids: set[int] | None = None) -> None
             pass
 
 
+def _wait_for_download_button(page, timeout_ms: int, capture=None) -> None:
+    """버튼 대기 중에도 본문 읽기를 이벤트 밖에서 한다. 즉시 실패하면 재시도로 시간을 끌지 않는다."""
+    import time
+
+    locator = page.frame_locator("#player_frame").locator(DOWNLOAD_BUTTON_SELECTOR).first
+    deadline = time.monotonic() + max(int(timeout_ms), 0) / 1000
+    while True:
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            raise TimeoutError("download button wait timed out")
+        started = time.monotonic()
+        try:
+            locator.wait_for(state="attached", timeout=min(500, remaining_ms))
+            return
+        except Exception as exc:
+            if type(exc).__name__ != "TimeoutError":
+                raise
+            if time.monotonic() - started < 0.05 and remaining_ms > 500:
+                raise
+        if capture is not None:
+            drain = getattr(capture, "drain", None)
+            if drain is not None:
+                drain()
+
+
 def _prime_embed_player(page, keep_ids: set[int] | None = None, capture=None) -> None:
     """로더에 멈춘 플레이어를 깨운다. 수동 재생은 웹페이지 클릭 뒤에야 컨트롤바가 생긴다."""
     for rnd in range(_PRIME_ROUNDS):
@@ -250,6 +275,10 @@ def _prime_embed_player(page, keep_ids: set[int] | None = None, capture=None) ->
             page.wait_for_timeout(800 if rnd == 0 else 1200)
         except Exception:
             pass
+        if capture is not None:
+            drain = getattr(capture, "drain", None)
+            if drain is not None:
+                drain()
         _close_extension_block_pages(page, keep_ids)
 
 
@@ -352,9 +381,7 @@ def open_download_handoff(
                             f"같은 세션 프레임 {getattr(capture, 'frame_attach_skipped', 0)}개"
                         )
                     try:
-                        wrapper.frame_locator("#player_frame").locator(DOWNLOAD_BUTTON_SELECTOR).first.wait_for(
-                            state="attached", timeout=timeout_ms,
-                        )
+                        _wait_for_download_button(wrapper, timeout_ms, capture)
                     except Exception as exc:
                         if type(exc).__name__ != "TimeoutError":
                             raise
