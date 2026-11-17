@@ -14,7 +14,7 @@ import re
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
 from diagnostics import log_event, mask_text
@@ -24,13 +24,14 @@ from progress import log
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 DOWNLOAD_PAGE_ORIGIN = "https://download.openx.xyz/"
-# 스트리밍은 한 탭이 영상 길이만큼 붙잡는다. 직렬이면 배치가 너무 느려서 재생 탭은 10개까지 연다.
-MAX_CONCURRENT_HANDOFFS = 10
+# 재생 탭은 최대 5개를 유지하되, 새 플레이어 초기화는 하나씩 진행한다.
+MAX_CONCURRENT_HANDOFFS = 5
 # download 탭은 Tampermonkey용으로 닫지 않는다. 그래서 배치가 상한 없이 쌓지 않게 한다.
 MAX_OPEN_DOWNLOAD_PAGES = 3
 _HANDOFF_GUARD = threading.Lock()
 _HANDOFF_ACTIVE = 0
 _HANDOFF_COND = threading.Condition(_HANDOFF_GUARD)
+_HANDOFF_START_LOCK = threading.Lock()
 DOWNLOAD_BUTTON_SELECTOR = '[aria-label="Download video"], [button="download"]'
 # 이 시간 안에 버튼이 없으면 버튼이 없는 영상으로 보고, 스트리밍 수신을 유지한다.
 BUTTON_DECISION_MS = 30_000
@@ -140,7 +141,7 @@ def _cdp_session(browser, context):
 def _handoff_slot(limit: int):
     """사용자 Chrome에서 동시에 재생·캡처하는 수를 제한한다."""
     global _HANDOFF_ACTIVE
-    slots = max(1, int(limit))
+    slots = max(1, min(int(limit), MAX_CONCURRENT_HANDOFFS))
     with _HANDOFF_COND:
         while _HANDOFF_ACTIVE >= slots:
             _HANDOFF_COND.wait()
@@ -151,6 +152,26 @@ def _handoff_slot(limit: int):
         with _HANDOFF_COND:
             _HANDOFF_ACTIVE -= 1
             _HANDOFF_COND.notify_all()
+
+
+@contextmanager
+def _handoff_start():
+    """수신이 진행되거나 현재 탭이 정리될 때까지 다음 플레이어 생성을 막는다."""
+    if not _HANDOFF_START_LOCK.acquire(blocking=False):
+        log("  [순차 시작] 앞선 재생 탭의 수신 확인 또는 정리가 끝날 때까지 기다립니다.")
+        _HANDOFF_START_LOCK.acquire()
+    released = False
+
+    def release():
+        nonlocal released
+        if not released:
+            released = True
+            _HANDOFF_START_LOCK.release()
+
+    try:
+        yield release
+    finally:
+        release()
 
 
 def download_page_count(session) -> int | None:
@@ -223,34 +244,76 @@ def _is_extension_block_url(url: str | None) -> bool:
     return (url or "").startswith("chrome-extension://")
 
 
-def _close_extension_block_pages(page, keep_ids: set[int] | None = None) -> None:
-    """이번 작업으로 새로 열린 AdGuard 차단 탭만 닫는다. 기존 탭과 작업 페이지는 유지한다."""
+def _close_extension_block_pages(page, keep_ids: set[int] | None = None) -> int:
+    """이번 작업으로 새로 열린 AdGuard 차단 탭만 닫는다. 기존 탭과 작업 페이지는 유지한다.
+
+    광고는 재생 클릭 한 번에만 뜨지 않는다. 버튼 대기와 스트리밍 중에도
+    about:blank 로 열렸다가 chrome-extension:// 로 바뀌므로, 그 주소가 된 뒤에 닫는다.
+    """
     try:
         pages = list(page.context.pages)
     except Exception:
-        return
+        return 0
+    closed = 0
     for other in pages:
-        if other == page or (keep_ids is not None and id(other) in keep_ids):
+        if keep_ids is not None and id(other) in keep_ids:
             continue
+        if getattr(other, "closed", False):
+            continue
+        try:
+            if other.is_closed():
+                continue
+        except Exception:
+            pass
         try:
             url = other.url or ""
         except Exception:
+            continue
+        # 호출한 페이지가 작업 탭이면 닫지 않는다. 광고 탭 자신에서 호출된 경우는 닫는다.
+        if other == page and not _is_extension_block_url(url):
             continue
         if not _is_extension_block_url(url):
             continue
         try:
             other.close()
+            closed += 1
         except Exception:
             pass
+    if closed:
+        log(f"  [광고 탭] chrome-extension 차단 탭 {closed}개를 닫았습니다.")
+    return closed
 
 
-def _wait_for_download_button(page, timeout_ms: int, capture=None) -> None:
+def _arm_extension_block_watch(context, keep_ids: set[int]) -> None:
+    """새 탭이 나중에 chrome-extension:// 로 바뀌면 닫는다. download 페이지와 기존 탭은 닫지 않는다."""
+
+    def _on_page(new_p) -> None:
+        if id(new_p) in keep_ids:
+            return
+
+        def _on_navigated(_frame=None) -> None:
+            _close_extension_block_pages(new_p, keep_ids)
+
+        try:
+            new_p.on("framenavigated", _on_navigated)
+        except Exception:
+            pass
+        _on_navigated()
+
+    try:
+        context.on("page", _on_page)
+    except Exception:
+        pass
+
+
+def _wait_for_download_button(page, timeout_ms: int, capture=None, keep_ids: set[int] | None = None) -> None:
     """버튼 대기 중에도 본문 읽기를 이벤트 밖에서 한다. 즉시 실패하면 재시도로 시간을 끌지 않는다."""
     import time
 
     locator = page.frame_locator("#player_frame").locator(DOWNLOAD_BUTTON_SELECTOR).first
     deadline = time.monotonic() + max(int(timeout_ms), 0) / 1000
     while True:
+        _close_extension_block_pages(page, keep_ids)
         remaining_ms = int((deadline - time.monotonic()) * 1000)
         if remaining_ms <= 0:
             raise TimeoutError("download button wait timed out")
@@ -263,6 +326,7 @@ def _wait_for_download_button(page, timeout_ms: int, capture=None) -> None:
                 raise
             if time.monotonic() - started < 0.05 and remaining_ms > 500:
                 raise
+            _close_extension_block_pages(page, keep_ids)
         if capture is not None:
             drain = getattr(capture, "drain", None)
             if drain is not None:
@@ -308,7 +372,13 @@ def streaming_stop_reason(
     return ""
 
 
-def _capture_until_full(page, capture, max_seconds: int = CAPTURE_MAX_SECONDS) -> None:
+def _capture_until_full(
+    page,
+    capture,
+    max_seconds: int = CAPTURE_MAX_SECONDS,
+    keep_ids: set[int] | None = None,
+    on_started: Callable[[], None] | None = None,
+) -> None:
     """버튼이 없다고 판정한 뒤의 스트리밍 수신이다. 이후 버튼이 생겨도 download 페이지로 바꾸지 않는다."""
     import time
 
@@ -316,9 +386,11 @@ def _capture_until_full(page, capture, max_seconds: int = CAPTURE_MAX_SECONDS) -
     last_signature = None
     quiet_since = time.monotonic()
     last_log = 0.0
+    first_received = None
     # 이 탭을 앞으로 가져오면 다른 재생 탭이 백그라운드로 내려가 요청이 멈출 수 있다.
     log("  [재생 캡처] 다른 재생 탭을 멈추지 않도록 이 탭을 앞으로 가져오지 않습니다.")
     while time.monotonic() < deadline:
+        _close_extension_block_pages(page, keep_ids)
         try:
             capture.attach_frames(page)
         except Exception:
@@ -333,6 +405,14 @@ def _capture_until_full(page, capture, max_seconds: int = CAPTURE_MAX_SECONDS) -
         media_seen = int(getattr(capture, "media_seen", 0) or 0)
         inflight = int(getattr(capture, "tap_inflight", 0) or 0)
         tap_bytes = int(getattr(capture, "tap_bytes", 0) or 0)
+        received = max(covered, tap_bytes)
+        if on_started is not None and received > 0:
+            if progress.get("complete") or (first_received is not None and received > first_received):
+                log("  [순차 시작] 실제 미디어 바이트 수신을 확인했습니다. 다음 재생 탭의 시작을 허용합니다.")
+                on_started()
+                on_started = None
+            elif first_received is None:
+                first_received = received
         signature = (covered, total, progress.get("file_count"), media_seen, inflight, tap_bytes)
         now = time.monotonic()
         if signature != last_signature:
@@ -456,9 +536,9 @@ def open_download_handoff(
     capture: PlaybackCapture | None = None
     keep_capture = False
     page_limit = max(0, int(max_open_download_pages))
-    # 같은 Chrome을 여러 워커가 동시에 재생하지 않는다. 같은 영상 id는 그 안에서도 한 번만 연다.
+    # 수신은 병렬로 유지하되 초기화는 직렬화한다. 같은 영상 id는 한 번만 연다.
     with _handoff_slot(max_concurrent_handoffs):
-        with _slug_lock(slug):
+        with _slug_lock(slug), _handoff_start() as release_start:
             try:
                 with (playwright or sync_playwright()) as p:
                     browser = p.chromium.connect_over_cdp(cdp_url)
@@ -474,6 +554,7 @@ def open_download_handoff(
                             "target_id": existing,
                         }
                     keep_ids = {id(existing) for existing in getattr(context, "pages", [])}
+                    _arm_extension_block_watch(context, keep_ids)
                     wrapper = context.new_page()
                     keep_ids.add(id(wrapper))
                     if capture_dir:
@@ -499,13 +580,13 @@ def open_download_handoff(
                     decision_ms = max(0, int(timeout_ms))
                     log(f"  [분기] download 버튼은 {decision_ms // 1000}초만 확인합니다. 없으면 스트리밍을 유지합니다.")
                     try:
-                        _wait_for_download_button(wrapper, decision_ms, capture)
+                        _wait_for_download_button(wrapper, decision_ms, capture, keep_ids)
                     except Exception as exc:
                         if type(exc).__name__ != "TimeoutError":
                             raise
                         log(f"  [분기] {decision_ms // 1000}초 안에 download 버튼이 없어 스트리밍 다운로드를 유지합니다.")
                         if capture is not None and hasattr(capture, "media_progress"):
-                            _capture_until_full(wrapper, capture)
+                            _capture_until_full(wrapper, capture, keep_ids=keep_ids, on_started=release_start)
                         keep_capture = True
                         playback = capture.summary() if capture else None
                         saved = len((playback or {}).get("files") or [])

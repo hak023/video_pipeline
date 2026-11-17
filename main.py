@@ -125,7 +125,7 @@ class Library:
 
 @dataclass
 class Options:
-    workers: int = 10
+    workers: int = 5
     attempts: int = 3                 # 총 시도 횟수 (최초 1회 + 재시도 2회)
     total_timeout: int = DEFAULT_TOTAL_TIMEOUT
     stall_timeout: int = DEFAULT_STALL_TIMEOUT
@@ -1069,7 +1069,8 @@ def _run_batch(
     sem = threading.Semaphore(browser_slots)
     log(
         f"동시 처리 상한: 게시글 {opts.workers}개, 탐색 브라우저 {browser_slots}개, "
-        f"Chrome 스트리밍 {MAX_CONCURRENT_HANDOFFS}개, download 탭 {opts.max_open_download_pages}개"
+        f"Chrome 스트리밍 {min(max(1, opts.workers), MAX_CONCURRENT_HANDOFFS)}개 (수신 확인 후 순차 시작), "
+        f"download 탭 {opts.max_open_download_pages}개"
     )
     board = ProgressBoard(len(targets))
     set_board(board)
@@ -1355,7 +1356,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--headful", action="store_true", help="브라우저 창을 띄워 실행")
     parser.add_argument("--force", action="store_true", help="중복 검사를 무시하고 강제 재다운로드")
 
-    parser.add_argument("--workers", type=int, default=10, help="동시에 처리할 게시글 수 (기본값: 10)")
+    parser.add_argument("--workers", type=int, default=5, help="동시에 처리할 게시글 수 (기본값: 5, Chrome 스트리밍은 최대 5개)")
     parser.add_argument(
         "--max-download-pages", type=int, default=MAX_OPEN_DOWNLOAD_PAGES,
         help=f"사용자 Chrome에 남겨 둘 download 탭 상한 (기본값: {MAX_OPEN_DOWNLOAD_PAGES}). 넘으면 새 탭을 열지 않습니다",

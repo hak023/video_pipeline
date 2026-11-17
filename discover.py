@@ -303,8 +303,18 @@ def _close_stray_page(new_p) -> None:
     _close_if_blocked()
 
 
+def _wait_closing_extension_blocks(page, ms: int) -> None:
+    """대기 도중에도 AdGuard 가 광고 탭을 chrome-extension:// 로 바꾸면 닫는다."""
+    remaining = max(int(ms), 0)
+    while remaining > 0:
+        step = min(500, remaining)
+        page.wait_for_timeout(step)
+        _close_extension_block_pages(page)
+        remaining -= step
+
+
 def _close_extension_block_pages(page) -> None:
-    """재생 클릭으로 열린 AdGuard 차단 탭을 닫는다. 지금 다루는 글 페이지는 닫지 않는다."""
+    """재생 클릭 때만 아니라 대기 중에도 열린 AdGuard 차단 탭을 닫는다. 지금 다루는 글 페이지는 닫지 않는다."""
     try:
         pages = list(page.context.pages)
     except Exception:
@@ -658,12 +668,12 @@ def _play_until_stream(
             except Exception as e:
                 if _is_closed_error(e):
                     raise
-            page.wait_for_timeout(800)
+            _wait_closing_extension_blocks(page, 800)
 
         _eval_frames(page, _CLICK_BTN_JS, click_hosts, target_frame)
         _eval_frames(page, _PLAY_VIDEO_JS, video_hosts, target_frame)
         _close_extension_block_pages(page)
-        page.wait_for_timeout(2000 if rnd == 0 else 2500)
+        _wait_closing_extension_blocks(page, 2000 if rnd == 0 else 2500)
         longest = max([
             v for v in _eval_frames(page, _VIDEO_STATE_JS, video_hosts, target_frame)
             if isinstance(v, (int, float))
@@ -672,10 +682,10 @@ def _play_until_stream(
             isinstance(c, dict) and (c.get("dom_duration") or 0) >= REAL_VIDEO_SECONDS for c in captured.values())
         if _has_real_stream(captured.values() if isinstance(captured, dict) else captured) or longest > REAL_VIDEO_SECONDS:
             if not confirmed:
-                page.wait_for_timeout(2500)   # 길이로 확인되지 않은 스트림: 광고 뒤에 본편 요청이 이어지는지 추가 관찰
-            page.wait_for_timeout(1000)   # 플레이리스트/후속 요청이 잡히도록 잠깐 대기
+                _wait_closing_extension_blocks(page, 2500)   # 길이로 확인되지 않은 스트림: 광고 뒤에 본편 요청이 이어지는지 추가 관찰
+            _wait_closing_extension_blocks(page, 1000)   # 플레이리스트/후속 요청이 잡히도록 잠깐 대기
             return True
-    page.wait_for_timeout(wait_ms)
+    _wait_closing_extension_blocks(page, wait_ms)
     return _has_real_stream(captured.values() if isinstance(captured, dict) else captured)
 
 
@@ -1011,8 +1021,8 @@ def _extract_embed_stream(
                 page.set_content(wrapper_html)
         else:
             page.set_content(wrapper_html)
-        # 플레이어 스크립트 로딩 + jwplayer 초기화를 위해 충분히 대기
-        page.wait_for_timeout(5000)
+        # 플레이어 스크립트 로딩 + jwplayer 초기화를 위해 충분히 대기. 이 사이 광고 탭도 닫는다.
+        _wait_closing_extension_blocks(page, 5000)
 
         # jwplayer 초기화 완료될 때까지 폴링. 5회(약 10초 시점) 지나도 어느 프레임에도 jwplayer 자체가 없으면
         # JW 플레이어가 아닌 것으로 보고 기다리지 않는다 (JW 가 있으면 기존처럼 최대 15회까지 대기).
@@ -1034,7 +1044,7 @@ def _extract_embed_stream(
                 break
             if _poll >= 4 and not jw_present:
                 break
-            page.wait_for_timeout(1000)
+            _wait_closing_extension_blocks(page, 1000)
 
         # JWPlayer 및 실행 환경(sessionStorage 등) 세부 진단 수집
         jw_diagnostics = None
@@ -1080,8 +1090,8 @@ def _extract_embed_stream(
                     setup_result = fr.evaluate(_JW_SETUP_JS)
                     if setup_result == 'setup_called':
                         log(f"    [JW SETUP] jwplayer.setup() 직접 호출 성공 ({fr.url[:60]})")
-                        # setup 후 3초 더 대기 후 재확인
-                        page.wait_for_timeout(3000)
+                        # setup 후 3초 더 대기 후 재확인. 이 사이 광고 탭도 닫는다.
+                        _wait_closing_extension_blocks(page, 3000)
                         for _poll2 in range(5):
                             try:
                                 srcs = fr.evaluate(_JW_READY_JS)
@@ -1091,7 +1101,7 @@ def _extract_embed_stream(
                                     break
                             except Exception:
                                 pass
-                            page.wait_for_timeout(1000)
+                            _wait_closing_extension_blocks(page, 1000)
                         if jw_ready:
                             break
                     elif setup_result == 'already_ready':
