@@ -3,7 +3,8 @@
 임베드를 최상위로 열면 프레임 탈출로 리다이렉트되므로 iframe 안에서 플레이어를 준비한다.
 about:blank 에 올리면 스토리지가 막혀 로더에서 멈추므로, 가능하면 글 페이지 origin 에 iframe 을 넣는다.
 플레이어는 클릭 없이는 컨트롤바와 Download 버튼을 만들지 않는다. overlay/playback 클릭과
-재생을 시도한 뒤에만 download 페이지를 연다. 광고 반복과 Download Now 는 사용자 Chrome 의
+재생을 시도한 뒤 30초만 버튼을 본다. 그 안에 있으면 download 페이지를 열고, 없으면
+스트리밍으로 본편 mp4가 모일 때까지 유지한다. 광고 반복과 Download Now 는 사용자 Chrome 의
 Tampermonkey 가 처리한다. Turnstile 토큰은 주입하지 않는다.
 """
 from __future__ import annotations
@@ -31,6 +32,26 @@ _HANDOFF_GUARD = threading.Lock()
 _HANDOFF_ACTIVE = 0
 _HANDOFF_COND = threading.Condition(_HANDOFF_GUARD)
 DOWNLOAD_BUTTON_SELECTOR = '[aria-label="Download video"], [button="download"]'
+# 이 시간 안에 버튼이 없으면 버튼이 없는 영상으로 보고, 스트리밍 수신을 유지한다.
+BUTTON_DECISION_MS = 30_000
+# 스트리밍은 버튼 판정과 별개다. 본편 바이트가 끝날 때까지 두되, 무한 대기는 막는다.
+CAPTURE_MAX_SECONDS = 3 * 60 * 60
+_SEEK_GAP_JS = """(ratio) => {
+    const videos = Array.from(document.querySelectorAll('video'));
+    const video = videos.sort((a, b) => (b.duration || 0) - (a.duration || 0))[0];
+    if (!video) return {ok: false};
+    if (video.paused) {
+        video.play().catch(() => {});
+    }
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    if (ratio != null && duration > 1) {
+        const target = Math.min(duration - 0.05, Math.max(0, Number(ratio) * duration));
+        if (Math.abs((video.currentTime || 0) - target) > 1.5) {
+            video.currentTime = target;
+        }
+    }
+    return {ok: true, duration, current: video.currentTime || 0, paused: video.paused};
+}"""
 _PRIME_ROUNDS = 4
 _PRIME_PLAYER_JS = """() => {
     const sels = ['#overlay', '#playback', '#player-button', '.play-button', '.vjs-big-play-button',
@@ -246,6 +267,76 @@ def _wait_for_download_button(page, timeout_ms: int, capture=None) -> None:
                 drain()
 
 
+def _seek_playback_gap(page, ratio) -> None:
+    """비어 있는 바이트 위치로 재생을 옮겨, 브라우저가 그 Range를 받게 한다."""
+    for frame in getattr(page, "frames", []):
+        if frame == getattr(page, "main_frame", None):
+            continue
+        try:
+            frame.evaluate(_SEEK_GAP_JS, ratio)
+        except Exception:
+            continue
+
+
+def _capture_until_full(page, capture, max_seconds: int = CAPTURE_MAX_SECONDS) -> None:
+    """버튼이 없다고 판정한 뒤의 스트리밍 수신이다. 이후 버튼이 생겨도 download 페이지로 바꾸지 않는다."""
+    import time
+
+    deadline = time.monotonic() + max(int(max_seconds), 1)
+    last_signature = None
+    quiet_since = time.monotonic()
+    last_log = 0.0
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
+    while time.monotonic() < deadline:
+        try:
+            capture.attach_frames(page)
+        except Exception:
+            pass
+        try:
+            capture.drain()
+        except Exception:
+            pass
+        progress = capture.media_progress()
+        signature = (progress.get("covered"), progress.get("total"), progress.get("file_count"))
+        now = time.monotonic()
+        if signature != last_signature:
+            last_signature = signature
+            quiet_since = now
+        if progress.get("complete") and now - quiet_since >= 3:
+            log(
+                f"  [재생 캡처] 본편 전체 수신 "
+                f"{progress.get('covered')}/{progress.get('total')} bytes"
+            )
+            return
+        if now - last_log >= 5:
+            last_log = now
+            total = int(progress.get("total") or 0)
+            covered = int(progress.get("covered") or 0)
+            if total:
+                log(f"  [재생 캡처] 받는 중 {covered}/{total} bytes ({covered * 100 // total}%)")
+            else:
+                log(f"  [재생 캡처] 받는 중 {covered} bytes, 전체 길이 아직 모름")
+        quiet = now - quiet_since
+        if quiet >= 8 and progress.get("gap_ratio") is not None:
+            _seek_playback_gap(page, progress.get("gap_ratio"))
+        if quiet >= 90 and total_known(progress):
+            log("  [재생 캡처] 90초 동안 새 본문이 없어 전체 수신 전에 중단")
+            return
+        if quiet >= 45 and not int(progress.get("total") or 0) and not int(progress.get("covered") or 0):
+            return
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            return
+
+
+def total_known(progress: dict) -> bool:
+    return bool(int(progress.get("total") or 0))
+
+
 def _prime_embed_player(page, keep_ids: set[int] | None = None, capture=None) -> None:
     """로더에 멈춘 플레이어를 깨운다. 수동 재생은 웹페이지 클릭 뒤에야 컨트롤바가 생긴다."""
     for rnd in range(_PRIME_ROUNDS):
@@ -296,16 +387,16 @@ def open_download_handoff(
     *,
     page_url: str | None = None,
     cdp_url: str = DEFAULT_CDP_URL,
-    timeout_ms: int = 60_000,
+    timeout_ms: int = BUTTON_DECISION_MS,
     playwright=None,
     capture_dir: str | Path | None = None,
     max_open_download_pages: int = MAX_OPEN_DOWNLOAD_PAGES,
     max_concurrent_handoffs: int = MAX_CONCURRENT_HANDOFFS,
 ) -> dict[str, Any]:
-    """플레이어 Download 버튼이 생긴 뒤 download 페이지를 연다.
+    """30초 안에 download 버튼이 있으면 download 페이지로, 없으면 스트리밍으로 본편을 받는다.
 
-    반환 ok 는 페이지를 열었다는 뜻이지 파일이 저장됐다는 뜻이 아니다.
-    버튼이 없으면, 재생 시작 전에 켜 둔 캡처의 패킷을 playback 으로 돌려준다.
+    버튼 판정이 끝난 뒤에는 경로를 바꾸지 않는다.
+    반환 ok 는 download 페이지를 열었거나 스트리밍을 마쳤다는 뜻이지, 파일 완료는 playback.complete 로 본다.
     연결한 Chrome 은 사용자의 브라우저이므로 닫지 않는다.
     download 탭이 상한 이상이면 새 탭과 재생을 시작하지 않는다.
     """
@@ -380,20 +471,24 @@ def open_download_handoff(
                             f"(iframe 별도 세션이 없으면 1개), "
                             f"같은 세션 프레임 {getattr(capture, 'frame_attach_skipped', 0)}개"
                         )
+                    decision_ms = max(0, int(timeout_ms))
+                    log(f"  [분기] download 버튼은 {decision_ms // 1000}초만 확인합니다. 없으면 스트리밍을 유지합니다.")
                     try:
-                        _wait_for_download_button(wrapper, timeout_ms, capture)
+                        _wait_for_download_button(wrapper, decision_ms, capture)
                     except Exception as exc:
                         if type(exc).__name__ != "TimeoutError":
                             raise
+                        log(f"  [분기] {decision_ms // 1000}초 안에 download 버튼이 없어 스트리밍 다운로드를 유지합니다.")
+                        if capture is not None and hasattr(capture, "media_progress"):
+                            _capture_until_full(wrapper, capture)
                         keep_capture = True
                         playback = capture.summary() if capture else None
                         saved = len((playback or {}).get("files") or [])
                         log(
                             f"  [재생 캡처] download 버튼 없음. "
-                            f"저장 {saved}개 / 건너뜀 {(playback or {}).get('skipped_count', 0)}개 / "
-                            f"cdp 세션 {(playback or {}).get('cdp_sessions', 0)} / "
-                            f"cdp 응답 {(playback or {}).get('cdp_responses', 0)} / "
-                            f"response {(playback or {}).get('response_count', 0)}"
+                            f"전체={bool((playback or {}).get('complete'))} "
+                            f"{(playback or {}).get('covered') or 0}/{(playback or {}).get('total') or 0} bytes, "
+                            f"조각 {saved}개 / 건너뜀 {(playback or {}).get('skipped_count', 0)}개"
                         )
                         log_event(
                             "playback_capture",
@@ -416,8 +511,9 @@ def open_download_handoff(
                     if session is None:
                         session = _cdp_session(browser, context)
                     target_id = _open_background_tab(session, page_url)
+                    log(f"  [분기] {decision_ms // 1000}초 안에 download 버튼이 있어 download 페이지로 넘깁니다.")
                     if capture:
-                        log("  [재생 캡처] download 버튼이 있어 임시 패킷은 지우고 download 페이지로 넘깁니다")
+                        log("  [재생 캡처] 임시 스트리밍 패킷은 지웁니다.")
                     return {
                         "ok": True,
                         "reused": False,

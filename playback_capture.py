@@ -69,6 +69,56 @@ def should_save_media(
     return is_media_target(url, content_type) or resource_type == "media"
 
 
+_BYTE_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
+
+
+def parse_byte_range(value: str) -> tuple[int, int, int | None] | None:
+    """Content-Range를 반열림 구간 [start, end)와 전체 길이로 해석한다."""
+    match = _BYTE_RANGE_RE.search(value or "")
+    if not match:
+        return None
+    start, end = int(match.group(1)), int(match.group(2)) + 1
+    if end <= start:
+        return None
+    total = None if match.group(3) == "*" else int(match.group(3))
+    return start, end, total
+
+
+def range_coverage(spans: list[tuple[int, int]], total: int | None) -> tuple[int, float | None]:
+    """겹치는 구간을 합쳐 받은 바이트와, 아직 비어 있는 첫 위치의 비율을 돌려준다."""
+    ordered = sorted((start, end) for start, end in spans if end > start)
+    if not ordered:
+        return 0, 0.0 if total else None
+    merged: list[list[int]] = []
+    for start, end in ordered:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    covered = 0
+    for start, end in merged:
+        lo = start
+        hi = end if total is None else min(end, total)
+        if total is not None and lo >= total:
+            continue
+        if hi > lo:
+            covered += hi - lo
+    cursor = 0
+    gap_at: int | None = None
+    for start, end in merged:
+        if start > cursor:
+            gap_at = cursor
+            break
+        cursor = max(cursor, end)
+        if total is not None and cursor >= total:
+            cursor = total
+            break
+    if gap_at is None and total is not None and cursor < total:
+        gap_at = cursor
+    gap_ratio = None if gap_at is None or not total else min(1.0, gap_at / total)
+    return covered, gap_ratio
+
+
 def saved_media_name(url: str, index: int, content_range: str = "") -> str:
     """쿼리(일회용 토큰)는 파일명에 넣지 않는다. Range가 다르면 파일도 나눈다."""
     stem = Path(urlsplit(url).path).name or f"media_{index}"
@@ -235,8 +285,94 @@ class PlaybackCapture:
             pass
         log_event("playback_capture", "discarded", "download 버튼이 있어 임시 재생 패킷을 삭제", capture_dir=str(self.out_dir))
 
+    def media_progress(self) -> dict[str, Any]:
+        """가장 큰 본편이 0부터 끝까지 모였는지 본다. 광고처럼 작은 완성 파일은 끝으로 치지 않는다."""
+        groups: dict[str, dict[str, Any]] = {}
+        for item in self.files:
+            url = str(item.get("url") or "")
+            group = groups.setdefault(url, {"spans": [], "total": None, "status": 0, "size": 0, "item": item})
+            group["size"] += int(item.get("size") or 0)
+            status = int(item.get("status") or 0)
+            if status == 200:
+                group["status"] = 200
+                group["total"] = int(item.get("size") or 0)
+                group["spans"] = [(0, group["total"])]
+                group["item"] = item
+                continue
+            parsed = parse_byte_range(str(item.get("content_range") or ""))
+            if parsed is None:
+                continue
+            start, end, total = parsed
+            group["spans"].append((start, end))
+            if total is not None:
+                group["total"] = max(int(group["total"] or 0), total)
+            if group["status"] != 200:
+                group["status"] = status
+                group["item"] = item
+        if not groups:
+            return {"complete": False, "covered": 0, "total": 0, "gap_ratio": None, "file_count": 0, "url": ""}
+        def rank(group: dict[str, Any]) -> tuple[int, int]:
+            return int(group["total"] or 0), int(group["size"] or 0)
+        url, group = max(groups.items(), key=lambda pair: rank(pair[1]))
+        total = int(group["total"] or 0)
+        covered, gap_ratio = range_coverage(group["spans"], total or None)
+        complete = bool(total and gap_ratio is None and covered >= total)
+        return {
+            "complete": complete,
+            "covered": covered,
+            "total": total,
+            "gap_ratio": gap_ratio,
+            "file_count": len(self.files),
+            "url": url,
+        }
+
+    def assemble(self) -> dict[str, Any] | None:
+        """전체 범위가 모인 본편만 하나의 mp4로 합친다. 구멍 난 조각은 합치지 않는다."""
+        progress = self.media_progress()
+        if not progress["complete"]:
+            return None
+        url = progress["url"]
+        pieces = []
+        direct = None
+        for item in self.files:
+            if item.get("url") != url:
+                continue
+            if int(item.get("status") or 0) == 200:
+                direct = item
+                continue
+            parsed = parse_byte_range(str(item.get("content_range") or ""))
+            if parsed is None:
+                continue
+            pieces.append((parsed[0], parsed[1], item))
+        if direct is not None and int(direct.get("size") or 0) >= int(progress["total"] or 0):
+            return {"path": direct["path"], "size": direct["size"], "url": url}
+        pieces.sort(key=lambda item: item[0])
+        if not pieces or pieces[0][0] != 0:
+            return None
+        stem = Path(urlsplit(url).path).name or "media.mp4"
+        stem = _NAME_RE.sub("_", stem).strip("._")[:80] or "media.mp4"
+        if not stem.lower().endswith(".mp4"):
+            stem = f"{stem}.mp4"
+        path = self.out_dir / f"full_{stem}"
+        cursor = 0
+        try:
+            with path.open("wb") as handle:
+                for start, end, item in pieces:
+                    if start > cursor:
+                        return None
+                    body = Path(item["path"]).read_bytes()
+                    handle.write(body)
+                    cursor = max(cursor, start + len(body), end)
+        except Exception:
+            return None
+        if progress["total"] and cursor < int(progress["total"]):
+            return None
+        return {"path": str(path), "size": path.stat().st_size, "url": url}
+
     def summary(self) -> dict[str, Any]:
         self.drain()
+        assembled = self.assemble()
+        progress = self.media_progress()
         payload = {
             "ok": bool(self.files),
             "files": list(self.files),
@@ -260,6 +396,10 @@ class PlaybackCapture:
             "frame_attach_skipped": self.frame_attach_skipped,
             "frame_errors": list(self.frame_errors),
             "bytes": sum(item["size"] for item in self.files),
+            "covered": progress["covered"],
+            "total": progress["total"],
+            "complete": bool(assembled),
+            "output": (assembled or {}).get("path") or "",
             "capture_dir": str(self.out_dir),
         }
         try:

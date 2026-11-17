@@ -350,14 +350,14 @@ def _finish_with_openx_handoff(
     history=None, item_url: str = "", post_date: str | None = None, out_dir: Path | None = None,
     browser_sem=None, max_open_download_pages: int = MAX_OPEN_DOWNLOAD_PAGES,
 ) -> dict:
-    """403 이면 download 페이지로 넘긴다. 버튼이 없으면 재생 패킷을 결과로 남긴다.
+    """403 이면 30초 안에 download 버튼을 보고, 없으면 스트리밍으로 본편을 받는다.
 
     Download Now 와 Turnstile 은 누르거나 우회하지 않는다.
     패킷이 없으면 완료로 기록하지 않는다. 다음 실행에서 다시 시도할 수 있게 한다.
     """
     embed = group.get("embed_url") or ""
     capture_dir = _playback_capture_dir(out_dir or OUT_DIR, item_name, item_url or page_url or embed)
-    log(f"  [403 인수] {item_name}: 임베드에서 download 버튼을 확인")
+    log(f"  [403 인수] {item_name}: download 버튼은 30초만 확인하고, 없으면 스트리밍으로 받습니다")
     # 탐색 브라우저와 Chrome 재생이 동시에 최대로 뜨지 않게 탐색 슬롯도 하나 잡는다.
     with (browser_sem or nullcontext()):
         outcome = open_download_handoff(
@@ -368,6 +368,17 @@ def _finish_with_openx_handoff(
     if outcome.get("ok") and outcome.get("no_download_button"):
         _log_playback(item_name, playback, item_url or page_url)
         files = playback.get("files") or []
+        if files and not playback.get("complete"):
+            reason = (
+                "403 이후 download 버튼이 없고, 재생으로 받은 본편이 아직 전체가 아닙니다. "
+                f"{playback.get('covered') or 0}/{playback.get('total') or 0} bytes, 조각 {len(files)}개. "
+                "부분 파일은 완료로 기록하지 않습니다. 다시 실행하면 이어서 받지 않고 처음부터 재생합니다."
+            )
+            res.update(status="failed", fatal=True, reason=reason, handoff=True, no_download_button=True, playback=playback)
+            log(f"  [403 인수 실패] {item_name}: {reason}")
+            log_event("download", "playback_capture_partial", reason, level="ERROR", page_url=embed)
+            get_diagnostics().fail("download", reason)
+            return res
         if not files:
             reason = (
                 "403 이후 임베드에 download 버튼이 없고, 재생 패킷도 저장되지 않았습니다. "
@@ -381,15 +392,16 @@ def _finish_with_openx_handoff(
             get_diagnostics().fail("download", reason)
             return res
         largest = max(files, key=lambda item: item.get("size") or 0)
+        output = playback.get("output") or largest.get("path") or ""
         reason = (
-            f"403 이후 download 버튼이 없어 재생 패킷 {len(files)}개"
-            f"({playback.get('bytes') or 0} bytes)를 저장했습니다. {capture_dir}"
+            f"403 이후 download 버튼이 없어 본편 mp4 전체를 저장했습니다. "
+            f"{playback.get('covered') or playback.get('bytes') or 0} bytes. {output}"
         )
         res.update(
             status="ok",
             fatal=True,
             reason=reason,
-            output=largest.get("path") or "",
+            output=output,
             download_page=None,
             handoff=True,
             no_download_button=True,
@@ -397,9 +409,9 @@ def _finish_with_openx_handoff(
         )
         if history and item_url:
             history.record_success(
-                item_url, item_name, largest.get("path") or "",
+                item_url, item_name, output,
                 post_date=post_date,
-                size=int(largest.get("size") or 0) or None,
+                size=int(playback.get("total") or playback.get("bytes") or 0) or None,
                 extra={
                     "handoff": True,
                     "no_download_button": True,
