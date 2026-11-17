@@ -30,6 +30,7 @@ from download import (
 )
 from diagnostics import (
     DEFAULT_RETAIN, diag_context, get_diagnostics, init_diagnostics, log_event, log_exception, mask_text,
+    mask_url,
     sanitize,
     attach_page_diagnostics,
 )
@@ -39,7 +40,12 @@ from history import HistoryManager, normalize_url
 from progress import ProgressBoard, log, set_board
 from verify import verify
 from ad_blacklist import blacklist
-from openx_handoff import is_openx_access_denied, open_download_handoff
+from openx_handoff import (
+    MAX_CONCURRENT_HANDOFFS,
+    MAX_OPEN_DOWNLOAD_PAGES,
+    is_openx_access_denied,
+    open_download_handoff,
+)
 
 ROOT = Path(__file__).resolve().parent
 OUT_DIR = ROOT / "out"
@@ -132,6 +138,7 @@ class Options:
     allow_pending: bool = False       # fail-closed: 본편 확인(MAIN) 안 된 PENDING 후보 다운로드 허용 여부
     passive_embed: bool = False       # 진단 모드: 임베드 탐색 시 라우팅/스크립트 주입 비활성화
     max_url_age: float = 300.0        # 후보 URL 발급 시각(경로 접두사 epoch-ms)이 이 초보다 오래됐으면 재탐색 (0 = 끄기)
+    max_open_download_pages: int = MAX_OPEN_DOWNLOAD_PAGES  # 사용자 Chrome에 남겨 둘 download 탭 상한
 
 
 # ------------------------------------------------------------------ names
@@ -290,7 +297,16 @@ def _log_playback(item_name: str, playback: dict | None, item_url: str = "") -> 
     skipped = playback.get("skipped") or []
     log(
         f"  [재생 캡처] {item_name}: 저장 {len(files)}개 / {playback.get('bytes') or 0} bytes, "
-        f"건너뜀 {playback.get('skipped_count', len(skipped))}개"
+        f"건너뜀 {playback.get('skipped_count', len(skipped))}개, "
+        f"route {playback.get('seen_count', 0)} / request {playback.get('request_count', 0)} / "
+        f"response {playback.get('response_count', 0)}"
+    )
+    log(
+        f"    관찰: cache_disabled={playback.get('cache_disabled')} "
+        f"service_worker_bypassed={playback.get('service_worker_bypassed')} "
+        f"route_installed={playback.get('route_installed')} "
+        f"route_error={playback.get('route_error') or '-'} "
+        f"cache_error={playback.get('cache_error') or '-'}"
     )
     for item in files[:12]:
         log(
@@ -306,6 +322,17 @@ def _log_playback(item_name: str, playback: dict | None, item_url: str = "") -> 
         reasons[key] = reasons.get(key, 0) + 1
     if reasons:
         log("    건너뜀 사유: " + ", ".join(f"{key}={count}" for key, count in reasons.items()))
+    shown = 0
+    for sample in playback.get("response_samples") or []:
+        if shown >= 8:
+            break
+        if not sample.get("interesting") and shown >= 3:
+            continue
+        log(
+            f"    응답 status={sample.get('status')} type={sample.get('resource_type') or '-'} "
+            f"{sample.get('content_type') or ''} {mask_url(sample.get('url') or '')}"
+        )
+        shown += 1
     capture_dir = playback.get("capture_dir")
     if capture_dir:
         log(f"    디렉터리: {capture_dir}")
@@ -321,6 +348,7 @@ def _log_playback(item_name: str, playback: dict | None, item_url: str = "") -> 
 def _finish_with_openx_handoff(
     res: dict, group: dict, item_name: str, prior_reason: str, page_url: str = "",
     history=None, item_url: str = "", post_date: str | None = None, out_dir: Path | None = None,
+    browser_sem=None, max_open_download_pages: int = MAX_OPEN_DOWNLOAD_PAGES,
 ) -> dict:
     """403 이면 download 페이지로 넘긴다. 버튼이 없으면 재생 패킷을 결과로 남긴다.
 
@@ -330,7 +358,12 @@ def _finish_with_openx_handoff(
     embed = group.get("embed_url") or ""
     capture_dir = _playback_capture_dir(out_dir or OUT_DIR, item_name, item_url or page_url or embed)
     log(f"  [403 인수] {item_name}: 임베드에서 download 버튼을 확인")
-    outcome = open_download_handoff(embed, page_url=page_url, capture_dir=capture_dir)
+    # 탐색 브라우저와 Chrome 재생이 동시에 최대로 뜨지 않게 탐색 슬롯도 하나 잡는다.
+    with (browser_sem or nullcontext()):
+        outcome = open_download_handoff(
+            embed, page_url=page_url, capture_dir=capture_dir,
+            max_open_download_pages=max_open_download_pages,
+        )
     playback = outcome.get("playback") or {}
     if outcome.get("ok") and outcome.get("no_download_button"):
         _log_playback(item_name, playback, item_url or page_url)
@@ -338,7 +371,9 @@ def _finish_with_openx_handoff(
         if not files:
             reason = (
                 "403 이후 임베드에 download 버튼이 없고, 재생 패킷도 저장되지 않았습니다. "
-                "완료로 기록하지 않습니다. 건너뜀 사유와 playback_capture.json 을 확인한 뒤 다시 실행하세요."
+                f"route {playback.get('seen_count', 0)}건, request {playback.get('request_count', 0)}건, "
+                f"response {playback.get('response_count', 0)}건. "
+                "완료로 기록하지 않습니다. playback_capture.json 의 response_samples 를 확인한 뒤 다시 실행하세요."
             )
             res.update(status="failed", fatal=True, reason=reason, handoff=True, no_download_button=True, playback=playback)
             log(f"  [403 인수 실패] {item_name}: {reason}")
@@ -639,6 +674,7 @@ def _process_item(
             return _finish_with_openx_handoff(
                 res, group, item_name, reason, page_url=url,
                 history=history, item_url=item_url, post_date=post_date, out_dir=out_dir,
+                browser_sem=browser_sem, max_open_download_pages=opts.max_open_download_pages,
             )
 
 
@@ -668,6 +704,7 @@ def _process_item(
             return _finish_with_openx_handoff(
                 res, group, item_name, str(r.get("reason") or "HTTP 403"), page_url=url,
                 history=history, item_url=item_url, post_date=post_date, out_dir=out_dir,
+                browser_sem=browser_sem, max_open_download_pages=opts.max_open_download_pages,
             )
         if r.get("fatal"):
             res.update(status="failed", fatal=True)
@@ -1003,7 +1040,12 @@ def _run_batch(
     if not targets:
         return []
     results: list[dict | None] = [None] * len(targets)
-    sem = threading.Semaphore(max(1, min(opts.workers, MAX_CONCURRENT_BROWSERS)))
+    browser_slots = max(1, min(opts.workers, MAX_CONCURRENT_BROWSERS))
+    sem = threading.Semaphore(browser_slots)
+    log(
+        f"동시 처리 상한: 게시글 {opts.workers}개, 탐색 브라우저 {browser_slots}개, "
+        f"Chrome 인수 {MAX_CONCURRENT_HANDOFFS}개, download 탭 {opts.max_open_download_pages}개"
+    )
     board = ProgressBoard(len(targets))
     set_board(board)
     board.start()
@@ -1289,6 +1331,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true", help="중복 검사를 무시하고 강제 재다운로드")
 
     parser.add_argument("--workers", type=int, default=5, help="동시에 처리할 게시글 수 (기본값: 5)")
+    parser.add_argument(
+        "--max-download-pages", type=int, default=MAX_OPEN_DOWNLOAD_PAGES,
+        help=f"사용자 Chrome에 남겨 둘 download 탭 상한 (기본값: {MAX_OPEN_DOWNLOAD_PAGES}). 넘으면 새 탭을 열지 않습니다",
+    )
     parser.add_argument("--attempts", type=int, default=3, help="항목당 총 시도 횟수 (기본값: 3)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TOTAL_TIMEOUT,
                         help="파일당 최대 소요 시간(초)")
@@ -1779,6 +1825,7 @@ def main() -> None:
     diag = init_diagnostics(LOG_DIR, retain=args.log_retain, meta={
         "mode": "manual_playback" if args.manual_playback else "url" if args.url else "crawl" if args.crawl else "discover_only" if args.discover_only else "targets",
         "workers": args.workers, "attempts": args.attempts, "skip_under": args.skip_under,
+        "max_download_pages": args.max_download_pages,
         "headless": headless, "proxy": bool(args.proxy), "force": args.force, "env": _env_info(),
     })
     diag.add_snapshot("blacklist.json", blacklist.snapshot)
@@ -1806,6 +1853,7 @@ def main() -> None:
             allow_pending=args.allow_pending,
             passive_embed=args.passive_embed,
             max_url_age=args.max_url_age,
+            max_open_download_pages=max(0, args.max_download_pages),
         )
         report = _dispatch(args, opts, headless)
         status, f_stage, f_reason = _summarize_report(report)
