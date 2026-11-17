@@ -24,8 +24,8 @@ from progress import log
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 DOWNLOAD_PAGE_ORIGIN = "https://download.openx.xyz/"
-# 사용자 Chrome 하나에서 재생·라우팅을 동시에 하면 메모리와 CPU가 바로 찬다.
-MAX_CONCURRENT_HANDOFFS = 1
+# 스트리밍은 한 탭이 영상 길이만큼 붙잡는다. 직렬이면 배치가 너무 느려서 재생 탭은 10개까지 연다.
+MAX_CONCURRENT_HANDOFFS = 10
 # download 탭은 Tampermonkey용으로 닫지 않는다. 그래서 배치가 상한 없이 쌓지 않게 한다.
 MAX_OPEN_DOWNLOAD_PAGES = 3
 _HANDOFF_GUARD = threading.Lock()
@@ -76,6 +76,8 @@ _PRIME_PLAYER_JS = """() => {
         }
     } catch (e) {}
     document.querySelectorAll('video').forEach(v => {
+        // muted는 소리만 끈다. 이 플레이어는 하나의 mp4를 Range로 받으므로 수신 바이트는 줄지 않는다.
+        // 끄면 제스처 없는 play()가 막혀 요청 자체가 시작되지 않을 수 있다.
         try { v.muted = true; const p = v.play(); if (p && p.catch) p.catch(() => {}); n++; } catch (e) {}
     });
     return n;
@@ -278,6 +280,34 @@ def _seek_playback_gap(page, ratio) -> None:
             continue
 
 
+def streaming_stop_reason(
+    *,
+    quiet: float,
+    complete: bool,
+    covered: int,
+    total: int,
+    media_seen: int,
+    inflight: int,
+    tap_bytes: int = 0,
+) -> str:
+    """수신이 멈춘 이유. 빈 문자열이면 계속 기다린다.
+
+    미디어 응답을 보기만 하고 본문이 아직 없으면 45초에 끊지 않는다.
+    그때 끊으면 재생은 됐는데 저장은 0인 채로 끝난다.
+    """
+    if inflight:
+        return ""
+    if complete and quiet >= 3:
+        return "complete"
+    if quiet >= 90 and total and covered < total:
+        return "stalled"
+    if quiet >= 45 and covered <= 0 and media_seen <= 0 and tap_bytes <= 0:
+        return "no_media"
+    if quiet >= 90 and covered <= 0 and (media_seen > 0 or tap_bytes > 0):
+        return "media_unreadable"
+    return ""
+
+
 def _capture_until_full(page, capture, max_seconds: int = CAPTURE_MAX_SECONDS) -> None:
     """버튼이 없다고 판정한 뒤의 스트리밍 수신이다. 이후 버튼이 생겨도 download 페이지로 바꾸지 않는다."""
     import time
@@ -286,10 +316,8 @@ def _capture_until_full(page, capture, max_seconds: int = CAPTURE_MAX_SECONDS) -
     last_signature = None
     quiet_since = time.monotonic()
     last_log = 0.0
-    try:
-        page.bring_to_front()
-    except Exception:
-        pass
+    # 이 탭을 앞으로 가져오면 다른 재생 탭이 백그라운드로 내려가 요청이 멈출 수 있다.
+    log("  [재생 캡처] 다른 재생 탭을 멈추지 않도록 이 탭을 앞으로 가져오지 않습니다.")
     while time.monotonic() < deadline:
         try:
             capture.attach_frames(page)
@@ -300,37 +328,51 @@ def _capture_until_full(page, capture, max_seconds: int = CAPTURE_MAX_SECONDS) -
         except Exception:
             pass
         progress = capture.media_progress()
-        signature = (progress.get("covered"), progress.get("total"), progress.get("file_count"))
+        covered = int(progress.get("covered") or 0)
+        total = int(progress.get("total") or 0)
+        media_seen = int(getattr(capture, "media_seen", 0) or 0)
+        inflight = int(getattr(capture, "tap_inflight", 0) or 0)
+        tap_bytes = int(getattr(capture, "tap_bytes", 0) or 0)
+        signature = (covered, total, progress.get("file_count"), media_seen, inflight, tap_bytes)
         now = time.monotonic()
         if signature != last_signature:
             last_signature = signature
             quiet_since = now
-        if progress.get("complete") and now - quiet_since >= 3:
-            log(
-                f"  [재생 캡처] 본편 전체 수신 "
-                f"{progress.get('covered')}/{progress.get('total')} bytes"
-            )
+        quiet = now - quiet_since
+        reason = streaming_stop_reason(
+            quiet=quiet,
+            complete=bool(progress.get("complete")),
+            covered=covered,
+            total=total,
+            media_seen=media_seen,
+            inflight=inflight,
+            tap_bytes=tap_bytes,
+        )
+        if reason == "complete":
+            log(f"  [재생 캡처] 본편 전체 수신 {covered}/{total} bytes")
+            capture.stop_reason = reason
+            return
+        if reason:
+            capture.stop_reason = reason
+            log(f"  [재생 캡처] 중단 사유: {reason}. 받은 본문 {covered}/{total} bytes, 미디어 응답 {media_seen}건")
             return
         if now - last_log >= 5:
             last_log = now
-            total = int(progress.get("total") or 0)
-            covered = int(progress.get("covered") or 0)
             if total:
                 log(f"  [재생 캡처] 받는 중 {covered}/{total} bytes ({covered * 100 // total}%)")
+            elif tap_bytes:
+                log(f"  [재생 캡처] 미디어 응답을 파일로 받는 중 {tap_bytes} bytes")
             else:
                 log(f"  [재생 캡처] 받는 중 {covered} bytes, 전체 길이 아직 모름")
-        quiet = now - quiet_since
-        if quiet >= 8 and progress.get("gap_ratio") is not None:
+        if quiet >= 8 and covered and inflight == 0 and progress.get("gap_ratio") is not None:
             _seek_playback_gap(page, progress.get("gap_ratio"))
-        if quiet >= 90 and total_known(progress):
-            log("  [재생 캡처] 90초 동안 새 본문이 없어 전체 수신 전에 중단")
-            return
-        if quiet >= 45 and not int(progress.get("total") or 0) and not int(progress.get("covered") or 0):
-            return
         try:
             page.wait_for_timeout(1000)
         except Exception:
+            capture.stop_reason = capture.stop_reason or "page_closed"
             return
+    capture.stop_reason = getattr(capture, "stop_reason", "") or "limit"
+    log("  [재생 캡처] 최대 대기 시간에 도달해 중단")
 
 
 def total_known(progress: dict) -> bool:
@@ -340,6 +382,8 @@ def total_known(progress: dict) -> bool:
 def _prime_embed_player(page, keep_ids: set[int] | None = None, capture=None) -> None:
     """로더에 멈춘 플레이어를 깨운다. 수동 재생은 웹페이지 클릭 뒤에야 컨트롤바가 생긴다."""
     for rnd in range(_PRIME_ROUNDS):
+        if rnd == 0 and capture is not None:
+            log("  [재생 캡처] 음소거로 재생합니다. 자동재생용이며 mp4 Range 수신량에는 영향 없습니다.")
         if capture is not None:
             capture.attach_frames(page)
         _close_extension_block_pages(page, keep_ids)
@@ -398,7 +442,7 @@ def open_download_handoff(
     버튼 판정이 끝난 뒤에는 경로를 바꾸지 않는다.
     반환 ok 는 download 페이지를 열었거나 스트리밍을 마쳤다는 뜻이지, 파일 완료는 playback.complete 로 본다.
     연결한 Chrome 은 사용자의 브라우저이므로 닫지 않는다.
-    download 탭이 상한 이상이면 새 탭과 재생을 시작하지 않는다.
+    download 탭 상한은 download 페이지를 새로 열지만 막고, 버튼이 없는 스트리밍은 막지 않는다.
     """
     slug = video_slug(embed_url)
     if not slug or not embed_url:
@@ -429,38 +473,19 @@ def open_download_handoff(
                             "download_page": page_url,
                             "target_id": existing,
                         }
-                    open_count = download_page_count(session)
-                    if open_count is not None and open_count >= page_limit:
-                        reason = (
-                            f"Chrome에 download 페이지가 이미 {open_count}개 열려 있습니다 "
-                            f"(상한 {page_limit}). PC 부하를 막기 위해 새 탭과 재생 캡처를 시작하지 않았습니다. "
-                            "download.openx.xyz 탭을 닫은 뒤 다시 실행하세요. 이번 항목은 완료로 기록하지 않습니다."
-                        )
-                        log(f"  [페이지 상한] {reason}")
-                        log_event(
-                            "playback_capture",
-                            "page_limit",
-                            reason,
-                            level="WARNING",
-                            page_url=embed_url,
-                            open_download_pages=open_count,
-                            max_open_download_pages=page_limit,
-                        )
-                        return {
-                            "ok": False,
-                            "page_limit": True,
-                            "slug": slug,
-                            "download_page": None,
-                            "open_download_pages": open_count,
-                            "reason": reason,
-                        }
                     keep_ids = {id(existing) for existing in getattr(context, "pages", [])}
                     wrapper = context.new_page()
                     keep_ids.add(id(wrapper))
                     if capture_dir:
                         capture = PlaybackCapture(Path(capture_dir))
-                        capture.install(wrapper)
+                        capture.install(wrapper, cdp_url=cdp_url)
                         log(f"  [재생 캡처] 버튼 확인 전에 패킷 기록을 시작합니다: {capture.out_dir}")
+                        tap_status = getattr(capture, "tap_status", "")
+                        tap_error = getattr(capture, "tap_error", "")
+                        log(
+                            f"  [재생 캡처] 이 탭의 미디어 응답 저장 연결: {tap_status}"
+                            + (f" ({tap_error})" if tap_error else "")
+                        )
                     embed_host = _open_embed_frame(wrapper, embed_url, article_url)
                     if capture is not None:
                         capture.attach_frames(wrapper)
@@ -488,7 +513,8 @@ def open_download_handoff(
                             f"  [재생 캡처] download 버튼 없음. "
                             f"전체={bool((playback or {}).get('complete'))} "
                             f"{(playback or {}).get('covered') or 0}/{(playback or {}).get('total') or 0} bytes, "
-                            f"조각 {saved}개 / 건너뜀 {(playback or {}).get('skipped_count', 0)}개"
+                            f"조각 {saved}개 / 건너뜀 {(playback or {}).get('skipped_count', 0)}개, "
+                            f"중단 {(playback or {}).get('stop_reason') or 'limit'}"
                         )
                         log_event(
                             "playback_capture",
@@ -510,6 +536,31 @@ def open_download_handoff(
                     player_ready = True
                     if session is None:
                         session = _cdp_session(browser, context)
+                    open_count = download_page_count(session)
+                    if open_count is not None and open_count >= page_limit:
+                        reason = (
+                            f"download 버튼은 있으나 Chrome에 download 페이지가 이미 {open_count}개입니다 "
+                            f"(상한 {page_limit}). 새 download 탭은 열지 않습니다. "
+                            "스트리밍으로 전환하지 않으며, 이번 항목은 완료로 기록하지 않습니다."
+                        )
+                        log(f"  [페이지 상한] {reason}")
+                        log_event(
+                            "playback_capture",
+                            "page_limit",
+                            reason,
+                            level="WARNING",
+                            page_url=embed_url,
+                            open_download_pages=open_count,
+                            max_open_download_pages=page_limit,
+                        )
+                        return {
+                            "ok": False,
+                            "page_limit": True,
+                            "slug": slug,
+                            "download_page": None,
+                            "open_download_pages": open_count,
+                            "reason": reason,
+                        }
                     target_id = _open_background_tab(session, page_url)
                     log(f"  [분기] {decision_ms // 1000}초 안에 download 버튼이 있어 download 페이지로 넘깁니다.")
                     if capture:

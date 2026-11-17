@@ -4,7 +4,9 @@
 그때는 같은 URL을 다시 받지 않고 이미 도착한 응답 바이트를 저장한다.
 이 플레이어의 본편은 Range 요청의 206일 수 있으므로 200과 206을 모두 남긴다.
 요청을 가로채거나 캐시를 끄면 이 플레이어는 재생을 시작하지 않는다.
-그래서 route, Fetch 가로채기, 캐시 우회는 쓰지 않는다.
+그래서 page.route, 캐시 우회, 이벤트 안에서의 CDP 호출은 쓰지 않는다.
+교차 출처 iframe의 본문은 페이지 세션에서 읽히지 않으므로, 그 탭에만
+응답 단계 Fetch를 별도 소켓으로 붙인다. 읽은 뒤에는 반드시 요청을 푼다.
 CDP 세션은 내비게이션 이벤트가 끝난 뒤에만 붙이고, 본문도 그 밖에서 읽는다.
 """
 from __future__ import annotations
@@ -12,6 +14,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+import threading
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -82,6 +85,18 @@ def parse_byte_range(value: str) -> tuple[int, int, int | None] | None:
         return None
     total = None if match.group(3) == "*" else int(match.group(3))
     return start, end, total
+
+
+def clamp_byte_range(content_range: str, body_len: int) -> tuple[str, bool]:
+    """헤더가 약속한 길이보다 짧게 읽은 본문은 그 길이까지만 받은 것으로 본다."""
+    parsed = parse_byte_range(content_range)
+    if parsed is None or body_len <= 0:
+        return content_range, False
+    start, end, total = parsed
+    if body_len >= end - start:
+        return content_range, False
+    total_text = "*" if total is None else str(total)
+    return f"bytes {start}-{start + body_len - 1}/{total_text}", True
 
 
 def range_coverage(spans: list[tuple[int, int]], total: int | None) -> tuple[int, float | None]:
@@ -187,11 +202,26 @@ class PlaybackCapture:
         self.cdp_finished = 0
         self.frame_attach_skipped = 0
         self.frame_errors: list[str] = []
+        self.media_seen = 0
+        self.tap_bytes = 0
+        self.tap_inflight = 0
+        self.tap_status = ""
+        self.tap_error = ""
+        self.tap_sessions = 0
+        self.tap_paused = 0
+        self.tap_saved = 0
+        self.stop_reason = ""
+        self.tap_cancel = False
+        self._io_lock = threading.Lock()
+        self._tap = None
+        self._cdp_url = ""
         self._seen: set[str] = set()
         self._claimed: set[str] = set()
         self._page = None
-        self._attached_ids: set[int] = set()
-        self._skipped_frame_url: dict[int, str] = {}
+        self._attached_ids: set[str] = set()
+        self._dead_frames: set[str] = set()
+        self._skipped_frame_url: dict[str, str] = {}
+        self._chunk_paths: dict[tuple[int, str], Path] = {}
         self._cdp_sessions: list[Any] = []
         self._cdp_meta: dict[tuple[int, str], dict[str, Any]] = {}
         self._cdp_queue: list[dict[str, Any]] = []
@@ -201,9 +231,10 @@ class PlaybackCapture:
         self._saved_logs = 0
         self._skipped_logs = 0
 
-    def install(self, page) -> None:
+    def install(self, page, cdp_url: str = "") -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._page = page
+        self._cdp_url = cdp_url or ""
         # 라우트와 캐시 우회는 설치하지 않는다. 이전 실행이 남긴 가로채기만 끈다.
         try:
             page.on("frameattached", self._on_frame_attached)
@@ -219,6 +250,7 @@ class PlaybackCapture:
                 capture_dir=str(self.out_dir),
             )
         self.attach_frames(page)
+        self._start_tap(page)
         log_event(
             "playback_capture",
             "installed",
@@ -231,7 +263,131 @@ class PlaybackCapture:
             cdp_sessions=self.cdp_sessions,
         )
 
+    def _start_tap(self, page) -> None:
+        """페이지 세션이 못 읽는 교차 출처 미디어를 이 탭에서만 받는다."""
+        if not self._cdp_url:
+            self.tap_status = "no_endpoint"
+            return
+        target_id = self._page_target_id(page)
+        from cdp_media_tap import MediaTap
+
+        tap = MediaTap(self, self._cdp_url)
+        tap.start(target_id)
+        self._tap = tap
+        self.tap_status = tap.status
+        self.tap_error = tap.error
+        self.tap_sessions = tap.sessions
+
+    def _finish_tap(self, abort: bool = False) -> None:
+        tap = self._tap
+        if tap is None:
+            return
+        self._tap = None
+        if abort:
+            self.tap_cancel = True
+        try:
+            tap.finish(abort=abort)
+        except Exception as exc:
+            self.tap_error = self.tap_error or f"{type(exc).__name__}: {exc}"[:240]
+        self.tap_status = tap.status or self.tap_status
+        self.tap_error = tap.error or self.tap_error
+        self.tap_sessions = tap.sessions
+        self.tap_paused = tap.paused
+        self.tap_saved = tap.saved
+
+    def _page_target_id(self, page) -> str:
+        context = getattr(page, "context", None)
+        if context is None or not hasattr(context, "new_cdp_session"):
+            self.tap_error = "no_cdp_context"
+            return ""
+        session = None
+        try:
+            session = context.new_cdp_session(page)
+            info = session.send("Target.getTargetInfo")
+            return str((info.get("targetInfo") or {}).get("targetId") or "")
+        except Exception as exc:
+            self.tap_error = f"{type(exc).__name__}: {exc}"[:240]
+            return ""
+        finally:
+            if session is not None:
+                try:
+                    session.detach()
+                except Exception:
+                    pass
+
+    def note_tap_bytes(self, size: int) -> None:
+        if size > 0:
+            self.tap_bytes += int(size)
+
+    def temp_media_path(self, request_id: str) -> Path:
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        safe_id = _NAME_RE.sub("_", request_id)[:40] or "request"
+        return self.out_dir / f".tap_{safe_id}.bin"
+
+    def accept_tap_file(
+        self,
+        url: str,
+        status: int,
+        content_type: str,
+        content_range: str,
+        request_range: str,
+        path: Path,
+        size: int,
+        resource_type: str,
+    ) -> str:
+        """탭에서 받은 본문 파일을 조각으로 남긴다. 저장한 경로를 돌려준다."""
+        content_range, truncated = clamp_byte_range(content_range, size)
+        if not path.is_file() or size <= 0:
+            return ""
+        if not should_save_media(url, status, content_type, b"x", resource_type):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._note_skipped(url, status, content_type, size, "not_media")
+            return ""
+        key = f"{url}|{request_range}|{content_range}|{size}|tap"
+        with self._io_lock:
+            if key in self._seen:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self._note_skipped(url, status, content_type, size, "duplicate")
+                return ""
+            self._seen.add(key)
+            dest = self.out_dir / saved_media_name(url, len(self.files) + 1, content_range)
+            path.replace(dest)
+            item = {
+                "url": url,
+                "status": status,
+                "content_type": content_type,
+                "content_range": content_range,
+                "request_range": request_range,
+                "path": str(dest),
+                "size": size,
+                "truncated": truncated,
+                "via": "tap",
+            }
+            self.files.append(item)
+        if self._saved_logs < 80:
+            self._saved_logs += 1
+            log_event(
+                "playback_capture",
+                "packet_saved",
+                f"tap {status} {size} bytes {mask_url(url)}",
+                media_url=url,
+                status=status,
+                bytes=size,
+                content_type=content_type,
+                content_range=content_range,
+                request_range=request_range,
+                output=dest.name,
+            )
+        return str(dest)
+
     def uninstall(self, page=None) -> None:
+        self._finish_tap()
         page = page or self._page
         if page is None:
             return
@@ -248,6 +404,12 @@ class PlaybackCapture:
             except Exception:
                 pass
         self._cdp_sessions.clear()
+        for path in self._chunk_paths.values():
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        self._chunk_paths.clear()
         self._page = None
 
     def drain(self) -> None:
@@ -269,6 +431,7 @@ class PlaybackCapture:
 
     def discard(self) -> None:
         """download 버튼이 있어 패킷이 필요 없을 때 임시 파일을 지운다."""
+        self._finish_tap(abort=True)
         for item in self.files:
             try:
                 Path(item["path"]).unlink(missing_ok=True)
@@ -287,8 +450,10 @@ class PlaybackCapture:
 
     def media_progress(self) -> dict[str, Any]:
         """가장 큰 본편이 0부터 끝까지 모였는지 본다. 광고처럼 작은 완성 파일은 끝으로 치지 않는다."""
+        with self._io_lock:
+            files = list(self.files)
         groups: dict[str, dict[str, Any]] = {}
-        for item in self.files:
+        for item in files:
             url = str(item.get("url") or "")
             group = groups.setdefault(url, {"spans": [], "total": None, "status": 0, "size": 0, "item": item})
             group["size"] += int(item.get("size") or 0)
@@ -303,6 +468,11 @@ class PlaybackCapture:
             if parsed is None:
                 continue
             start, end, total = parsed
+            size = int(item.get("size") or 0)
+            if size and end - start > size:
+                end = start + size
+            if end <= start:
+                continue
             group["spans"].append((start, end))
             if total is not None:
                 group["total"] = max(int(group["total"] or 0), total)
@@ -322,7 +492,7 @@ class PlaybackCapture:
             "covered": covered,
             "total": total,
             "gap_ratio": gap_ratio,
-            "file_count": len(self.files),
+            "file_count": len(files),
             "url": url,
         }
 
@@ -334,7 +504,9 @@ class PlaybackCapture:
         url = progress["url"]
         pieces = []
         direct = None
-        for item in self.files:
+        with self._io_lock:
+            files = list(self.files)
+        for item in files:
             if item.get("url") != url:
                 continue
             if int(item.get("status") or 0) == 200:
@@ -359,17 +531,31 @@ class PlaybackCapture:
             with path.open("wb") as handle:
                 for start, end, item in pieces:
                     if start > cursor:
+                        path.unlink(missing_ok=True)
                         return None
                     body = Path(item["path"]).read_bytes()
+                    if start + len(body) < end:
+                        end = start + len(body)
+                    if end <= start:
+                        path.unlink(missing_ok=True)
+                        return None
+                    if start < cursor:
+                        skip = cursor - start
+                        if skip >= len(body):
+                            continue
+                        body = body[skip:]
                     handle.write(body)
-                    cursor = max(cursor, start + len(body), end)
+                    cursor += len(body)
         except Exception:
+            path.unlink(missing_ok=True)
             return None
-        if progress["total"] and cursor < int(progress["total"]):
+        if progress["total"] and (cursor < int(progress["total"]) or path.stat().st_size < int(progress["total"])):
+            path.unlink(missing_ok=True)
             return None
         return {"path": str(path), "size": path.stat().st_size, "url": url}
 
     def summary(self) -> dict[str, Any]:
+        self._finish_tap()
         self.drain()
         assembled = self.assemble()
         progress = self.media_progress()
@@ -395,6 +581,14 @@ class PlaybackCapture:
             "cdp_finished": self.cdp_finished,
             "frame_attach_skipped": self.frame_attach_skipped,
             "frame_errors": list(self.frame_errors),
+            "media_seen": self.media_seen,
+            "tap_status": self.tap_status,
+            "tap_error": self.tap_error,
+            "tap_sessions": self.tap_sessions,
+            "tap_paused": self.tap_paused,
+            "tap_saved": self.tap_saved,
+            "tap_bytes": self.tap_bytes,
+            "stop_reason": self.stop_reason,
             "bytes": sum(item["size"] for item in self.files),
             "covered": progress["covered"],
             "total": progress["total"],
@@ -441,8 +635,15 @@ class PlaybackCapture:
         if plain < 15:
             bucket.append(item)
 
-    def _claim_key(self, url: str, request_range: str) -> str:
-        return f"{url}|{request_range}"
+    def _claim_key(self, url: str, request_range: str, content_range: str = "", request_id: str = "") -> str:
+        """같은 URL의 다른 Range를 하나로 합치지 않는다. 요청 Range가 비어 있어도 본문 범위로 구분한다."""
+        if request_id:
+            return f"{url}|id:{request_id}"
+        if content_range:
+            return f"{url}|cr:{content_range}"
+        if request_range:
+            return f"{url}|rr:{request_range}"
+        return ""
 
     def _on_frame_attached(self, frame) -> None:
         self._pending_frames.append(frame)
@@ -471,9 +672,16 @@ class PlaybackCapture:
                 continue
             self._try_attach(target)
 
+    def _frame_key(self, target) -> str:
+        for owner in (target, getattr(target, "_impl_obj", None)):
+            guid = getattr(owner, "_guid", None)
+            if guid:
+                return str(guid)
+        return f"id:{id(target)}"
+
     def _try_attach(self, target) -> None:
-        key = id(target)
-        if key in self._attached_ids:
+        key = self._frame_key(target)
+        if key in self._attached_ids or key in self._dead_frames:
             return
         url = str(getattr(target, "url", "") or "")
         if self._skipped_frame_url.get(key) == url:
@@ -490,9 +698,12 @@ class PlaybackCapture:
             session = context.new_cdp_session(target)
         except Exception as exc:
             text = str(exc)
-            if "separate CDP session" in text:
+            if "separate CDP session" in text or "No target with given id" in text or "Frame has been detached" in text:
                 self.frame_attach_skipped += 1
-                self._skipped_frame_url[key] = url
+                if "separate CDP session" in text:
+                    self._skipped_frame_url[key] = url
+                else:
+                    self._dead_frames.add(key)
                 return
             self._note_frame_error(f"{type(exc).__name__}: {text[:120]}")
             return
@@ -502,20 +713,24 @@ class PlaybackCapture:
     def _note_frame_error(self, message: str) -> None:
         if len(self.frame_errors) < 12:
             self.frame_errors.append(message)
-        if not self.cache_error:
-            self.cache_error = message.split(":", 1)[0]
-
     def _wire_session(self, session) -> None:
         sid = id(session)
         self._cdp_sessions.append(session)
         self.cdp_sessions += 1
         self._release_interception(session)
         try:
-            session.send("Network.enable")
-        except Exception as exc:
-            self.cache_error = self.cache_error or type(exc).__name__
+            session.send("Network.enable", {
+                "maxTotalBufferSize": 1024 * 1024 * 1024,
+                "maxResourceBufferSize": 1024 * 1024 * 1024,
+            })
+        except Exception:
+            try:
+                session.send("Network.enable")
+            except Exception as exc:
+                self.cache_error = self.cache_error or type(exc).__name__
         session.on("Network.requestWillBeSent", lambda event, key=sid: self._on_cdp_request(key, event))
         session.on("Network.responseReceived", lambda event, key=sid: self._on_cdp_response(key, event))
+        session.on("Network.dataReceived", lambda event, key=sid: self._on_cdp_data(key, event))
         session.on(
             "Network.loadingFinished",
             lambda event, sess=session, key=sid: self._on_cdp_finished(sess, key, event),
@@ -548,6 +763,31 @@ class PlaybackCapture:
         slot["request_range"] = _cdp_header(headers, "range")
         slot["resource_type"] = _cdp_resource_type(str(event.get("type") or slot.get("resource_type") or ""))
 
+    def _on_cdp_data(self, sid: int, event: dict[str, Any]) -> None:
+        """이벤트 안에서는 디스크에만 이어 쓴다. CDP 호출은 재생을 멈출 수 있다."""
+        encoded = event.get("data")
+        request_id = str(event.get("requestId") or "")
+        if not encoded or not request_id:
+            return
+        try:
+            raw = base64.b64decode(encoded) if event.get("base64Encoded", True) else str(encoded).encode("utf-8", "replace")
+        except Exception:
+            return
+        if not raw:
+            return
+        key = self._meta_key(sid, request_id)
+        path = self._chunk_paths.get(key)
+        try:
+            if path is None:
+                self.out_dir.mkdir(parents=True, exist_ok=True)
+                safe_id = _NAME_RE.sub("_", request_id)[:40] or "request"
+                path = self.out_dir / f".chunk_{sid}_{safe_id}.bin"
+                self._chunk_paths[key] = path
+            with path.open("ab") as handle:
+                handle.write(raw)
+        except Exception:
+            return
+
     def _on_cdp_response(self, sid: int, event: dict[str, Any]) -> None:
         self.cdp_responses += 1
         self.response_count += 1
@@ -564,6 +804,8 @@ class PlaybackCapture:
         interesting = self._response_might_be_media(
             slot["url"], slot["resource_type"], slot["content_type"], slot["content_range"],
         ) or looks_like_playback_request(slot["url"], slot["resource_type"], {"range": slot.get("request_range", "")})
+        if interesting:
+            self.media_seen += 1
         self._sample(self.response_samples, {
             "url": slot["url"],
             "status": slot["status"],
@@ -598,10 +840,11 @@ class PlaybackCapture:
         if not self._response_might_be_media(url, resource_type, ctype, content_range):
             if not looks_like_playback_request(url, resource_type, {"range": request_range}):
                 return
-        claim = self._claim_key(url, request_range)
-        if claim in self._claimed:
+        claim = self._claim_key(url, "", "", request_id)
+        if claim and claim in self._claimed:
             return
-        self._claimed.add(claim)
+        if claim:
+            self._claimed.add(claim)
         self._cdp_queue.append({
             "session": session,
             "request_id": request_id,
@@ -612,6 +855,7 @@ class PlaybackCapture:
             "request_range": request_range,
             "resource_type": resource_type,
             "claim": claim,
+            "sid": sid,
         })
 
     def _on_request(self, request) -> None:
@@ -646,6 +890,8 @@ class PlaybackCapture:
         except Exception:
             return
         interesting = self._response_might_be_media(url, resource_type, ctype, content_range)
+        if interesting:
+            self.media_seen += 1
         self._sample(self.response_samples, {
             "url": url,
             "status": status,
@@ -655,11 +901,34 @@ class PlaybackCapture:
             "range": request_range,
             "interesting": interesting,
         }, interesting=interesting)
-        if self._claim_key(url, request_range) in self._claimed:
+        if any(
+            key and key in self._claimed
+            for key in (self._claim_key(url, request_range), self._claim_key(url, "", content_range))
+        ):
             return
         if not interesting:
             return
         self._response_queue.append(response)
+
+    def _take_chunk(self, sid: int | None, request_id: str) -> bytes:
+        keys = [self._meta_key(sid, request_id)] if sid is not None else []
+        keys.extend(key for key in self._chunk_paths if key[1] == request_id and key not in keys)
+        body = b""
+        for key in keys:
+            path = self._chunk_paths.pop(key, None)
+            if path is None or not path.is_file():
+                continue
+            try:
+                raw = path.read_bytes()
+            except Exception:
+                raw = b""
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            if len(raw) > len(body):
+                body = raw
+        return body
 
     def _read_cdp_body(self, item: dict[str, Any]) -> None:
         session = item["session"]
@@ -671,18 +940,19 @@ class PlaybackCapture:
         request_range = item["request_range"]
         resource_type = item["resource_type"]
         claim = item["claim"]
+        body = self._take_chunk(item.get("sid"), request_id)
+        error_name = ""
         try:
             payload = session.send("Network.getResponseBody", {"requestId": request_id})
+            raw = (payload or {}).get("body") or ""
+            decoded = base64.b64decode(raw) if (payload or {}).get("base64Encoded") else raw.encode("utf-8", errors="replace")
+            if len(decoded) > len(body):
+                body = decoded
         except Exception as exc:
+            error_name = type(exc).__name__
+        if not body:
             self._claimed.discard(claim)
-            self._note_skipped(url, status, ctype, 0, f"cdp_body_error:{type(exc).__name__}")
-            return
-        raw = (payload or {}).get("body") or ""
-        try:
-            body = base64.b64decode(raw) if (payload or {}).get("base64Encoded") else raw.encode("utf-8", errors="replace")
-        except Exception as exc:
-            self._claimed.discard(claim)
-            self._note_skipped(url, status, ctype, 0, f"cdp_decode_error:{type(exc).__name__}")
+            self._note_skipped(url, status, ctype, 0, f"cdp_body_error:{error_name or 'empty'}")
             return
         if resource_type != "media" and looks_like_playback_request(url, resource_type, {"range": request_range}):
             resource_type = "media" if not is_media_target(url, ctype) else resource_type
@@ -699,16 +969,17 @@ class PlaybackCapture:
             request_range = _header(getattr(request, "headers", None), "range")
         except Exception:
             return
-        claim = self._claim_key(url, request_range)
-        if claim in self._claimed:
+        claims = [
+            key for key in (self._claim_key(url, request_range), self._claim_key(url, "", content_range)) if key
+        ]
+        if any(key in self._claimed for key in claims):
             return
-        self._claimed.add(claim)
         try:
             body = response.body()
         except Exception as exc:
-            self._claimed.discard(claim)
             self._note_skipped(url, status, ctype, 0, f"body_error:{type(exc).__name__}")
             return
+        self._claimed.update(claims)
         self._store(url, status, ctype, content_range, request_range, body, resource_type)
 
     def _response_might_be_media(self, url: str, resource_type: str, content_type: str, content_range: str) -> bool:
@@ -750,7 +1021,8 @@ class PlaybackCapture:
         body: bytes,
         resource_type: str,
     ) -> None:
-        key = f"{url}|{request_range}|{content_range}"
+        content_range, truncated = clamp_byte_range(content_range, len(body))
+        key = f"{url}|{request_range}|{content_range}|{len(body)}"
         if key in self._seen:
             self._note_skipped(url, status, ctype, len(body), "duplicate")
             return
@@ -760,19 +1032,24 @@ class PlaybackCapture:
                 reason = "not_media"
             self._note_skipped(url, status, ctype, len(body), reason)
             return
-        self._seen.add(key)
-        path = self.out_dir / saved_media_name(url, len(self.files) + 1, content_range)
-        path.write_bytes(body)
-        item = {
-            "url": url,
-            "status": status,
-            "content_type": ctype,
-            "content_range": content_range,
-            "request_range": request_range,
-            "path": str(path),
-            "size": len(body),
-        }
-        self.files.append(item)
+        with self._io_lock:
+            if key in self._seen:
+                self._note_skipped(url, status, ctype, len(body), "duplicate")
+                return
+            self._seen.add(key)
+            path = self.out_dir / saved_media_name(url, len(self.files) + 1, content_range)
+            path.write_bytes(body)
+            item = {
+                "url": url,
+                "status": status,
+                "content_type": ctype,
+                "content_range": content_range,
+                "request_range": request_range,
+                "path": str(path),
+                "size": len(body),
+                "truncated": truncated,
+            }
+            self.files.append(item)
         if self._saved_logs < 80:
             self._saved_logs += 1
             log_event(
@@ -806,7 +1083,8 @@ class PlaybackCapture:
             route.continue_()
             return
         claim = self._claim_key(url, request_range)
-        self._claimed.add(claim)
+        if claim:
+            self._claimed.add(claim)
         fetched = None
         body = b""
         try:
@@ -824,6 +1102,9 @@ class PlaybackCapture:
                 pass
             return
         try:
+            range_claim = self._claim_key(url, "", content_range)
+            if range_claim:
+                self._claimed.add(range_claim)
             self._store(url, status, ctype, content_range, request_range, body, resource_type)
         except Exception as exc:
             self._note_skipped(url, status, ctype, len(body), f"write_error:{type(exc).__name__}")

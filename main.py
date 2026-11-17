@@ -125,7 +125,7 @@ class Library:
 
 @dataclass
 class Options:
-    workers: int = 5
+    workers: int = 10
     attempts: int = 3                 # 총 시도 횟수 (최초 1회 + 재시도 2회)
     total_timeout: int = DEFAULT_TOTAL_TIMEOUT
     stall_timeout: int = DEFAULT_STALL_TIMEOUT
@@ -358,12 +358,13 @@ def _finish_with_openx_handoff(
     embed = group.get("embed_url") or ""
     capture_dir = _playback_capture_dir(out_dir or OUT_DIR, item_name, item_url or page_url or embed)
     log(f"  [403 인수] {item_name}: download 버튼은 30초만 확인하고, 없으면 스트리밍으로 받습니다")
-    # 탐색 브라우저와 Chrome 재생이 동시에 최대로 뜨지 않게 탐색 슬롯도 하나 잡는다.
-    with (browser_sem or nullcontext()):
-        outcome = open_download_handoff(
-            embed, page_url=page_url, capture_dir=capture_dir,
-            max_open_download_pages=max_open_download_pages,
-        )
+    # 탐색 슬롯(최대 3)을 스트리밍 동안 잡으면 재생 탭이 3개를 넘지 못한다.
+    # browser_sem 은 탐색에만 쓰고, 스트리밍 동시 수는 Chrome 슬롯이 정한다.
+    outcome = open_download_handoff(
+        embed, page_url=page_url, capture_dir=capture_dir,
+        max_open_download_pages=max_open_download_pages,
+        max_concurrent_handoffs=MAX_CONCURRENT_HANDOFFS,
+    )
     playback = outcome.get("playback") or {}
     if outcome.get("ok") and outcome.get("no_download_button"):
         _log_playback(item_name, playback, item_url or page_url)
@@ -393,6 +394,18 @@ def _finish_with_openx_handoff(
             return res
         largest = max(files, key=lambda item: item.get("size") or 0)
         output = playback.get("output") or largest.get("path") or ""
+        output_size = Path(output).stat().st_size if output and Path(output).is_file() else 0
+        total = int(playback.get("total") or 0)
+        if total and output_size < total:
+            reason = (
+                "403 이후 download 버튼이 없고, 저장된 mp4가 Content-Range 전체보다 짧습니다. "
+                f"파일 {output_size}/{total} bytes. 헤더만으로 완료 처리하지 않습니다. {output}"
+            )
+            res.update(status="failed", fatal=True, reason=reason, handoff=True, no_download_button=True, playback=playback)
+            log(f"  [403 인수 실패] {item_name}: {reason}")
+            log_event("download", "playback_capture_partial", reason, level="ERROR", page_url=embed)
+            get_diagnostics().fail("download", reason)
+            return res
         reason = (
             f"403 이후 download 버튼이 없어 본편 mp4 전체를 저장했습니다. "
             f"{playback.get('covered') or playback.get('bytes') or 0} bytes. {output}"
@@ -1056,7 +1069,7 @@ def _run_batch(
     sem = threading.Semaphore(browser_slots)
     log(
         f"동시 처리 상한: 게시글 {opts.workers}개, 탐색 브라우저 {browser_slots}개, "
-        f"Chrome 인수 {MAX_CONCURRENT_HANDOFFS}개, download 탭 {opts.max_open_download_pages}개"
+        f"Chrome 스트리밍 {MAX_CONCURRENT_HANDOFFS}개, download 탭 {opts.max_open_download_pages}개"
     )
     board = ProgressBoard(len(targets))
     set_board(board)
@@ -1342,7 +1355,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--headful", action="store_true", help="브라우저 창을 띄워 실행")
     parser.add_argument("--force", action="store_true", help="중복 검사를 무시하고 강제 재다운로드")
 
-    parser.add_argument("--workers", type=int, default=5, help="동시에 처리할 게시글 수 (기본값: 5)")
+    parser.add_argument("--workers", type=int, default=10, help="동시에 처리할 게시글 수 (기본값: 10)")
     parser.add_argument(
         "--max-download-pages", type=int, default=MAX_OPEN_DOWNLOAD_PAGES,
         help=f"사용자 Chrome에 남겨 둘 download 탭 상한 (기본값: {MAX_OPEN_DOWNLOAD_PAGES}). 넘으면 새 탭을 열지 않습니다",
