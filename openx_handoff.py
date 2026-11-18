@@ -37,25 +37,9 @@ DOWNLOAD_BUTTON_SELECTOR = '[aria-label="Download video"], [button="download"]'
 # 이 시간 안에 버튼이 없으면 다운로드 불가로 처리한다.
 BUTTON_DECISION_MS = 30_000
 # 스트리밍 fallback은 보존하되 임시로 비활성화한다.
-ENABLE_STREAMING_FALLBACK = True
+ENABLE_STREAMING_FALLBACK = False
 # 스트리밍은 버튼 판정과 별개다. 본편 바이트가 끝날 때까지 두되, 무한 대기는 막는다.
 CAPTURE_MAX_SECONDS = 3 * 60 * 60
-_SEEK_GAP_JS = """(ratio) => {
-    const videos = Array.from(document.querySelectorAll('video'));
-    const video = videos.sort((a, b) => (b.duration || 0) - (a.duration || 0))[0];
-    if (!video) return {ok: false};
-    if (video.paused) {
-        video.play().catch(() => {});
-    }
-    const duration = Number.isFinite(video.duration) ? video.duration : 0;
-    if (ratio != null && duration > 1) {
-        const target = Math.min(duration - 0.05, Math.max(0, Number(ratio) * duration));
-        if (Math.abs((video.currentTime || 0) - target) > 1.5) {
-            video.currentTime = target;
-        }
-    }
-    return {ok: true, duration, current: video.currentTime || 0, paused: video.paused};
-}"""
 _PRIME_ROUNDS = 4
 _PRIME_PLAYER_JS = """() => {
     const sels = ['#overlay', '#playback', '#player-button', '.play-button', '.vjs-big-play-button',
@@ -316,17 +300,6 @@ def _wait_for_download_button(page, timeout_ms: int, capture=None, popup_watch: 
                 drain()
 
 
-def _seek_playback_gap(page, ratio) -> None:
-    """비어 있는 바이트 위치로 재생을 옮겨, 브라우저가 그 Range를 받게 한다."""
-    for frame in getattr(page, "frames", []):
-        if frame == getattr(page, "main_frame", None):
-            continue
-        try:
-            frame.evaluate(_SEEK_GAP_JS, ratio)
-        except Exception:
-            continue
-
-
 def streaming_stop_reason(
     *,
     quiet: float,
@@ -428,8 +401,6 @@ def _capture_until_full(
                 log(f"  [재생 캡처] 미디어 응답을 파일로 받는 중 {tap_bytes} bytes")
             else:
                 log(f"  [재생 캡처] 받는 중 {covered} bytes, 전체 길이 아직 모름")
-        if quiet >= 8 and covered and inflight == 0 and progress.get("gap_ratio") is not None:
-            _seek_playback_gap(page, progress.get("gap_ratio"))
         try:
             page.wait_for_timeout(1000)
         except Exception:
@@ -526,9 +497,10 @@ def open_download_handoff(
     page_limit = max(0, int(max_open_download_pages))
     # 수신은 병렬로 유지하되 초기화는 직렬화한다. 같은 영상 id는 한 번만 연다.
     with _handoff_slot(max_concurrent_handoffs):
-        with _slug_lock(slug), _handoff_start() as release_start:
+        with _slug_lock(slug), _handoff_start() as release_start, ExitStack() as connection:
             try:
-                with (playwright or sync_playwright()) as p, ExitStack() as popup_cleanup:
+                p = connection.enter_context(playwright or sync_playwright())
+                with ExitStack() as popup_cleanup:
                     browser = p.chromium.connect_over_cdp(cdp_url)
                     context = browser.contexts[0] if browser.contexts else browser.new_context()
                     session = _cdp_session(browser, context)
@@ -571,7 +543,7 @@ def open_download_handoff(
                     except Exception as exc:
                         if type(exc).__name__ != "TimeoutError":
                             raise
-                        if not ENABLE_STREAMING_FALLBACK:
+                        if capture is None:
                             reason = f"{decision_ms // 1000}초 안에 download 버튼이 없어 다운로드할 수 없습니다."
                             log(f"  [분기] {reason}")
                             log_event(
@@ -588,12 +560,10 @@ def open_download_handoff(
                                 "download_page": None,
                                 "reason": reason,
                             }
-                        reason = f"{decision_ms // 1000}초 안에 download 버튼이 없어 다운로드할 수 없습니다."
                         log(f"  [분기] {decision_ms // 1000}초 안에 download 버튼이 없어 스트리밍 다운로드를 유지합니다.")
-                        if capture is not None and hasattr(capture, "media_progress"):
-                            _capture_until_full(wrapper, capture, popup_watch=popup_watch, on_started=release_start)
+                        _capture_until_full(wrapper, capture, popup_watch=popup_watch, on_started=release_start)
                         keep_capture = True
-                        playback = capture.summary() if capture else None
+                        playback = capture.summary()
                         saved = len((playback or {}).get("files") or [])
                         log(
                             f"  [재생 캡처] download 버튼 없음. "
@@ -608,7 +578,7 @@ def open_download_handoff(
                             "download 버튼이 없어 재생 패킷을 유지",
                             page_url=embed_url,
                             saved=saved,
-                            capture_dir=str(capture.out_dir) if capture else "",
+                            capture_dir=str(capture.out_dir),
                         )
                         return {
                             "ok": True,
@@ -684,9 +654,15 @@ def open_download_handoff(
                 }
             finally:
                 if capture is not None:
-                    capture.uninstall(wrapper)
-                    if not keep_capture:
-                        capture.discard()
+                    try:
+                        capture.uninstall(wrapper)
+                        if not keep_capture:
+                            capture.discard()
+                    except Exception as exc:
+                        log_event(
+                            "playback_capture", "cleanup_failed", mask_text(str(exc)),
+                            level="ERROR", slug=slug,
+                        )
                 if session is not None:
                     try:
                         session.detach()

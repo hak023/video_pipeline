@@ -1,13 +1,7 @@
-"""재생 중에 브라우저가 받은 미디어 응답을 파일로 남긴다.
+"""재생 중 브라우저가 받은 미디어 바이트를 passive CDP Network 이벤트로 저장한다.
 
-직접 URL 재요청이 403이어도, 페이지가 재생하면서 받은 본문은 그 응답에만 있을 수 있다.
-그때는 같은 URL을 다시 받지 않고 이미 도착한 응답 바이트를 저장한다.
-이 플레이어의 본편은 Range 요청의 206일 수 있으므로 200과 206을 모두 남긴다.
-요청을 가로채거나 캐시를 끄면 이 플레이어는 재생을 시작하지 않는다.
-그래서 page.route, 캐시 우회, 이벤트 안에서의 CDP 호출은 쓰지 않는다.
-교차 출처 iframe의 본문은 페이지 세션에서 읽히지 않으므로, 그 탭에만
-응답 단계 Fetch를 별도 소켓으로 붙인다. 읽은 뒤에는 반드시 요청을 푼다.
-CDP 세션은 내비게이션 이벤트가 끝난 뒤에만 붙이고, 본문도 그 밖에서 읽는다.
+요청은 가로채거나 변경하지 않는다. 응답 수신 중에는 Network.streamResourceContent로
+전달되는 데이터만 모으고, getResponseBody는 스트리밍 데이터를 얻지 못한 완료 응답에만 쓴다.
 """
 from __future__ import annotations
 
@@ -226,8 +220,12 @@ class PlaybackCapture:
         self._skipped_frame_url: dict[str, str] = {}
         self._chunk_paths: dict[tuple[int, str], Path] = {}
         self._cdp_sessions: list[Any] = []
+        self._cdp_session_by_id: dict[int, Any] = {}
         self._cdp_meta: dict[tuple[int, str], dict[str, Any]] = {}
         self._cdp_queue: list[dict[str, Any]] = []
+        self._stream_queue: list[tuple[int, str]] = []
+        self._stream_attempted: set[tuple[int, str]] = set()
+        self._pending_chunks: list[tuple[int, str, bytes]] = []
         self._response_queue: list[Any] = []
         self._pending_frames: list[Any] = []
         self._draining = False
@@ -244,6 +242,7 @@ class PlaybackCapture:
             page.on("framenavigated", self._on_frame_navigated)
             page.on("request", self._on_request)
             page.on("response", self._on_response)
+            page.on("requestfinished", self._on_request_finished)
         except Exception as exc:
             log_event(
                 "playback_capture",
@@ -400,6 +399,7 @@ class PlaybackCapture:
             page.remove_listener("framenavigated", self._on_frame_navigated)
             page.remove_listener("request", self._on_request)
             page.remove_listener("response", self._on_response)
+            page.remove_listener("requestfinished", self._on_request_finished)
         except Exception:
             pass
         for session in self._cdp_sessions:
@@ -408,6 +408,13 @@ class PlaybackCapture:
             except Exception:
                 pass
         self._cdp_sessions.clear()
+        self._cdp_session_by_id.clear()
+        self._cdp_meta.clear()
+        self._cdp_queue.clear()
+        self._stream_queue.clear()
+        self._stream_attempted.clear()
+        self._pending_chunks.clear()
+        self._response_queue.clear()
         for path in self._chunk_paths.values():
             try:
                 path.unlink(missing_ok=True)
@@ -417,19 +424,33 @@ class PlaybackCapture:
         self._page = None
 
     def drain(self) -> None:
-        """이벤트 밖에서 본문을 읽는다. 핸들러 안에서 읽으면 동기 Playwright가 재생을 멈춘다."""
+        """이벤트 밖에서 CDP 명령과 파일 쓰기를 처리한다."""
         if self._draining:
             return
         self._draining = True
         try:
+            streams = self._stream_queue
+            self._stream_queue = []
+            for sid, request_id in streams:
+                self._start_stream(sid, request_id)
+            chunks = self._pending_chunks
+            self._pending_chunks = []
+            for sid, request_id, raw in chunks:
+                self._write_chunk(sid, request_id, raw)
             queued = self._cdp_queue
             self._cdp_queue = []
             for item in queued:
                 self._read_cdp_body(item)
             responses = self._response_queue
             self._response_queue = []
-            for response in responses:
-                self._read_response_body(response)
+            for request in responses:
+                try:
+                    response = request.response()
+                except Exception as exc:
+                    self._note_skipped(request.url, 0, "", 0, f"response_error:{type(exc).__name__}")
+                    continue
+                if response is not None:
+                    self._read_response_body(response)
         finally:
             self._draining = False
 
@@ -720,6 +741,7 @@ class PlaybackCapture:
     def _wire_session(self, session) -> None:
         sid = id(session)
         self._cdp_sessions.append(session)
+        self._cdp_session_by_id[sid] = session
         self.cdp_sessions += 1
         try:
             session.send("Network.enable")
@@ -761,7 +783,7 @@ class PlaybackCapture:
         slot["resource_type"] = _cdp_resource_type(str(event.get("type") or slot.get("resource_type") or ""))
 
     def _on_cdp_data(self, sid: int, event: dict[str, Any]) -> None:
-        """이벤트 안에서는 디스크에만 이어 쓴다. CDP 호출은 재생을 멈출 수 있다."""
+        """이벤트에서는 청크만 큐에 넣고, 파일 쓰기는 drain에서 한다."""
         request_id = str(event.get("requestId") or "")
         slot = self._cdp_meta.get(self._meta_key(sid, request_id))
         if not request_id or slot is None:
@@ -784,9 +806,12 @@ class PlaybackCapture:
             return
         if not raw:
             return
+        self._pending_chunks.append((sid, request_id, raw))
+
+    def _write_chunk(self, sid: int, request_id: str, raw: bytes) -> None:
         key = self._meta_key(sid, request_id)
-        path = self._chunk_paths.get(key)
         try:
+            path = self._chunk_paths.get(key)
             if path is None:
                 self.out_dir.mkdir(parents=True, exist_ok=True)
                 safe_id = _NAME_RE.sub("_", request_id)[:40] or "request"
@@ -794,8 +819,24 @@ class PlaybackCapture:
                 self._chunk_paths[key] = path
             with path.open("ab") as handle:
                 handle.write(raw)
-        except Exception:
+        except Exception as exc:
+            self.cache_error = self.cache_error or f"chunk_write:{type(exc).__name__}"
+
+    def _start_stream(self, sid: int, request_id: str) -> None:
+        key = self._meta_key(sid, request_id)
+        if key not in self._cdp_meta or key in self._stream_attempted:
             return
+        self._stream_attempted.add(key)
+        session = self._cdp_session_by_id.get(sid)
+        if session is None:
+            return
+        try:
+            result = session.send("Network.streamResourceContent", {"requestId": request_id}) or {}
+            buffered = result.get("bufferedData") or ""
+            if buffered:
+                self._write_chunk(sid, request_id, base64.b64decode(buffered))
+        except Exception as exc:
+            self.cache_error = self.cache_error or f"stream_body:{type(exc).__name__}"
 
     def _on_cdp_response(self, sid: int, event: dict[str, Any]) -> None:
         self.cdp_responses += 1
@@ -826,9 +867,13 @@ class PlaybackCapture:
             "interesting": interesting,
             "via": "cdp",
         }, interesting=interesting)
+        if interesting and request_id and slot["status"] in (200, 206):
+            self._stream_queue.append((sid, request_id))
 
     def _on_cdp_failed(self, sid: int, event: dict[str, Any]) -> None:
-        slot = self._cdp_meta.pop(self._meta_key(sid, str(event.get("requestId") or "")), None)
+        key = self._meta_key(sid, str(event.get("requestId") or ""))
+        self._stream_attempted.discard(key)
+        slot = self._cdp_meta.pop(key, None)
         if not slot:
             return
         url = str(slot.get("url") or "")
@@ -838,11 +883,15 @@ class PlaybackCapture:
     def _on_cdp_finished(self, session, sid: int, event: dict[str, Any]) -> None:
         self.cdp_finished += 1
         request_id = str(event.get("requestId") or "")
-        slot = self._cdp_meta.pop(self._meta_key(sid, request_id), None)
+        key = self._meta_key(sid, request_id)
+        self._stream_attempted.discard(key)
+        slot = self._cdp_meta.pop(key, None)
         if not slot:
             return
         url = str(slot.get("url") or "")
         status = int(slot.get("status") or 0)
+        if status not in (200, 206):
+            return
         ctype = str(slot.get("content_type") or "")
         content_range = str(slot.get("content_range") or "")
         content_length = str(slot.get("content_length") or "")
@@ -889,7 +938,7 @@ class PlaybackCapture:
         }, interesting=interesting)
 
     def _on_response(self, response) -> None:
-        """응답 이벤트에서는 기록만 한다. body()를 여기서 읽으면 재생이 멈춘다."""
+        """응답 헤더만 기록한다. 본문은 응답 완료 뒤에만 읽는다."""
         self.response_count += 1
         try:
             request = response.request
@@ -913,14 +962,11 @@ class PlaybackCapture:
             "range": request_range,
             "interesting": interesting,
         }, interesting=interesting)
-        if any(
-            key and key in self._claimed
-            for key in (self._claim_key(url, request_range), self._claim_key(url, "", content_range))
-        ):
+    def _on_request_finished(self, request) -> None:
+        """CDP가 없는 경우에만 완료된 응답 본문을 fallback으로 읽는다."""
+        if self._cdp_sessions:
             return
-        if not interesting:
-            return
-        self._response_queue.append(response)
+        self._response_queue.append(request)
 
     def _take_chunk(self, sid: int | None, request_id: str) -> bytes:
         keys = [self._meta_key(sid, request_id)] if sid is not None else []
@@ -988,6 +1034,8 @@ class PlaybackCapture:
             content_range = _header(response.headers, "content-range")
             request_range = _header(getattr(request, "headers", None), "range")
         except Exception:
+            return
+        if status not in (200, 206) or not self._response_might_be_media(url, resource_type, ctype, content_range):
             return
         claims = [
             key for key in (self._claim_key(url, request_range), self._claim_key(url, "", content_range)) if key
@@ -1144,11 +1192,12 @@ def capture_playback(page, out_dir: Path, play, *, timeout_ms: int = 8000) -> di
     try:
         play()
         waited = 0
-        limit = min(timeout_ms, 1500)
+        limit = max(0, timeout_ms)
         while waited < limit:
-            page.wait_for_timeout(min(300, limit - waited))
+            interval = min(300, limit - waited)
+            page.wait_for_timeout(interval)
             capture.drain()
-            waited += 300
+            waited += interval
+        return capture.summary()
     finally:
         capture.uninstall(page)
-    return capture.summary()
