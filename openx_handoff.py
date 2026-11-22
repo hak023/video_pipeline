@@ -248,6 +248,28 @@ def _open_embed_frame(page, embed_url: str, page_url: str | None) -> str:
     return "wrapper"
 
 
+def _attach_player_frame(page, capture) -> None:
+    """플레이어가 미디어를 요청하기 전에 iframe의 네트워크 관찰을 붙인다.
+
+    요청이 시작된 뒤에 붙은 CDP 세션은 그 응답 본문을 받지 못한다.
+    """
+    observed = getattr(capture, "frame_observed", None)
+    if observed is None:
+        capture.attach_frames(page)
+        return
+    for _ in range(100):
+        try:
+            handle = page.query_selector("#player_frame")
+            frame = handle.content_frame() if handle is not None else None
+            capture.attach_frames(page, frames=[frame] if frame is not None else [])
+            if frame is not None and observed(frame):
+                break
+            page.wait_for_timeout(50)
+        except Exception:
+            break
+    capture.attach_frames(page)
+
+
 class _AdPopupWatch:
     """작업 탭과 그 팝업이 연 추가 탭만 닫는다. 브라우저 전체의 새 탭은 건드리지 않는다."""
 
@@ -355,6 +377,7 @@ def streaming_stop_reason(
     inflight: int,
     tap_bytes: int = 0,
     stream_bytes: int = 0,
+    recovery_failed: bool = False,
 ) -> str:
     """수신이 멈춘 이유. 빈 문자열이면 계속 기다린다.
 
@@ -365,6 +388,9 @@ def streaming_stop_reason(
         return ""
     if complete and quiet >= 3:
         return "complete"
+    # 대체 수신까지 실패했고 받은 바이트가 없으면 더 기다려도 처음 구간을 채울 수 없다.
+    if recovery_failed and quiet >= 10 and not (covered or tap_bytes or stream_bytes):
+        return "recovery_failed"
     if quiet >= 90 and (covered > 0 or tap_bytes > 0 or stream_bytes > 0 or total):
         return "stalled"
     if quiet >= 45 and media_seen <= 0 and not (covered or total or tap_bytes or stream_bytes):
@@ -399,6 +425,11 @@ def _capture_until_full(
         if popup_watch is not None:
             popup_watch.close()
         capture.attach_frames(page)
+        reload = getattr(capture, "reload_untracked_player", None)
+        if reload is not None and reload() is True:
+            # 버튼 판정이 끝난 뒤에만 다시 불러온다. 다시 불러온 플레이어도 깨워야 재생이 시작된다.
+            log("  [재생 캡처] 미디어 요청이 CDP 연결보다 먼저 시작되어 플레이어를 다시 불러옵니다.")
+            _prime_embed_player(page, popup_watch, capture)
         capture.drain(allow_browser_fallback=True)
         progress = capture.media_progress()
         covered = int(progress.get("covered") or 0)
@@ -407,6 +438,7 @@ def _capture_until_full(
         inflight = int(getattr(capture, "tap_inflight", 0) or 0)
         tap_bytes = int(getattr(capture, "tap_bytes", 0) or 0)
         stream_bytes = int(progress.get("stream_bytes") or 0)
+        expected = int(progress.get("expected_total") or 0)
         received = max(covered, tap_bytes, stream_bytes)
         MIN_STREAM_START_BYTES = 5 * 1024 * 1024
         if on_started is not None:
@@ -433,6 +465,7 @@ def _capture_until_full(
             inflight=inflight,
             tap_bytes=tap_bytes,
             stream_bytes=stream_bytes,
+            recovery_failed=bool(progress.get("recovery_failed")),
         )
         if reason == "complete":
             log(f"  [재생 캡처] 본편 전체 수신 {covered}/{total} bytes")
@@ -440,20 +473,23 @@ def _capture_until_full(
             return
         if reason:
             capture.stop_reason = reason
+            errors = " | ".join(progress.get("errors") or []) or getattr(capture, "cache_error", "") or "-"
             log(
-                f"  [재생 캡처] 중단 사유: {reason}. 받은 본문 {covered}/{total} bytes, "
-                f"스트림 수신 {stream_bytes} bytes, 미디어 응답 {media_seen}건, "
-                f"CDP 오류 {getattr(capture, 'cache_error', '') or '-'}"
+                f"  [재생 캡처] 중단 사유: {reason}. 받은 본문 {covered}/{total or expected} bytes, "
+                f"스트림 수신 {stream_bytes} bytes, 미디어 응답 {media_seen}건, 오류 {errors}"
             )
             return
         if now - last_log >= 5:
             last_log = now
             if stream_bytes > covered:
-                log(f"  [재생 캡처] 스트림 누적 수신 {stream_bytes} bytes, 완료된 본문 {covered}/{total} bytes")
+                log(f"  [재생 캡처] 스트림 누적 수신 {stream_bytes} bytes, "
+                    f"완료된 본문 {covered}/{total or expected} bytes")
             elif total:
                 log(f"  [재생 캡처] 받는 중 {covered}/{total} bytes ({covered * 100 // total}%)")
             elif tap_bytes:
                 log(f"  [재생 캡처] 미디어 응답을 파일로 받는 중 {tap_bytes} bytes")
+            elif expected:
+                log(f"  [재생 캡처] 본문 수신 대기 중 0/{expected} bytes (미디어 응답 {media_seen}건)")
             else:
                 log(f"  [재생 캡처] 받는 중 {covered} bytes, 전체 길이 아직 모름 (미디어 응답 {media_seen}건)")
         for _ in range(5):
@@ -587,10 +623,10 @@ def open_download_handoff(
                             + (f" ({tap_error})" if tap_error else "")
                         )
                     embed_host = _open_embed_frame(wrapper, embed_url, article_url)
+                    if capture is not None:
+                        _attach_player_frame(wrapper, capture)
                     if minimize_window and session is not None:
                         _minimize_chrome_window(session)
-                    if capture is not None:
-                        capture.attach_frames(wrapper)
                     _prime_embed_player(wrapper, popup_watch, capture)
                     if capture is not None:
                         log(

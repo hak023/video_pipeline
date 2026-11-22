@@ -31,6 +31,15 @@ _NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # but do not use it in the normal browser capture path.
 ENABLE_CDP_MEDIA_TAP = False
 BROWSER_FALLBACK_CHUNK_BYTES = 1024 * 1024
+# 네트워크 이벤트의 URL에는 fragment가 없다. 서비스워커가 fragment로 영상을 구분하면 그대로 돌려줘야 한다.
+_MEDIA_FRAGMENT_JS = """(url) => {
+    for (const el of document.querySelectorAll('video, audio, source')) {
+        const src = el.currentSrc || el.src || '';
+        const hash = src.indexOf('#');
+        if (hash > 0 && src.slice(0, hash) === url) return src.slice(hash);
+    }
+    return '';
+}"""
 _BROWSER_RANGE_FETCH_JS = """async ([url, start, end]) => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
@@ -291,6 +300,11 @@ class PlaybackCapture:
         self._media_frames: dict[str, Any] = {}
         self._browser_fallback_queue: list[dict[str, Any]] = []
         self._browser_fallback_urls: set[str] = set()
+        self._browser_fallback_failed = False
+        self._untracked_media: list[str] = []
+        self._player_reloaded = False
+        self.expected_total = 0
+        self.capture_errors: list[str] = []
         self._pending_frames: list[Any] = []
         self._draining = False
         self._saved_logs = 0
@@ -486,6 +500,7 @@ class PlaybackCapture:
         self._response_queue.clear()
         self._media_frames.clear()
         self._browser_fallback_queue.clear()
+        self._untracked_media.clear()
         for path in self._chunk_paths.values():
             try:
                 path.unlink(missing_ok=True)
@@ -595,9 +610,15 @@ class PlaybackCapture:
             if group["status"] != 200:
                 group["status"] = status
                 group["item"] = item
+        extra = {
+            "stream_bytes": self.stream_bytes,
+            "expected_total": self.expected_total,
+            "recovery_failed": self._browser_fallback_failed and not self._browser_fallback_queue,
+            "errors": list(self.capture_errors),
+        }
         if not groups:
             return {"complete": False, "covered": 0, "total": 0, "gap_ratio": None,
-                    "file_count": 0, "url": "", "stream_bytes": self.stream_bytes}
+                    "file_count": 0, "url": "", **extra}
         def rank(group: dict[str, Any]) -> tuple[int, int]:
             return int(group["total"] or 0), int(group["size"] or 0)
         url, group = max(groups.items(), key=lambda pair: rank(pair[1]))
@@ -614,7 +635,7 @@ class PlaybackCapture:
             "gap_ratio": gap_ratio,
             "file_count": len(files),
             "url": url,
-            "stream_bytes": self.stream_bytes,
+            **extra,
         }
 
     def assemble(self) -> dict[str, Any] | None:
@@ -700,6 +721,7 @@ class PlaybackCapture:
             "route_installed": self.route_installed,
             "route_error": self.route_error,
             "cache_error": self.cache_error,
+            "capture_errors": list(self.capture_errors),
             "capture_mode": self.capture_mode,
             "cdp_sessions": self.cdp_sessions,
             "cdp_responses": self.cdp_responses,
@@ -754,6 +776,12 @@ class PlaybackCapture:
             cdp_finished=self.cdp_finished,
         )
         return payload
+
+    def _note_error(self, detail: str) -> None:
+        """cache_error는 첫 오류만 담는다. 중단 사유를 가리지 않게 서로 다른 오류를 함께 남긴다."""
+        self.cache_error = self.cache_error or detail
+        if detail not in self.capture_errors and len(self.capture_errors) < 8:
+            self.capture_errors.append(detail)
 
     def _trace(self, event: str, **fields: Any) -> None:
         entry = sanitize({
@@ -868,7 +896,7 @@ class PlaybackCapture:
         try:
             session.send("Network.enable")
         except Exception as exc:
-            self.cache_error = self.cache_error or type(exc).__name__
+            self._note_error(f"cdp_enable:{type(exc).__name__}")
             self._trace("cdp_enable_error", session_id=sid, error=mask_text(str(exc))[:300],
                         error_type=type(exc).__name__)
         session.on("Network.requestWillBeSent", lambda event, key=sid: self._on_cdp_request(key, event))
@@ -905,12 +933,13 @@ class PlaybackCapture:
         slot["url"] = url
         slot["method"] = str(request.get("method") or "").upper()
         slot["request_range"] = _cdp_header(headers, "range")
+        slot["fragment"] = str(request.get("urlFragment") or "")
         slot["resource_type"] = _cdp_resource_type(str(event.get("type") or slot.get("resource_type") or ""))
         if (slot["method"] != "OPTIONS" and slot["resource_type"] != "preflight"
                 and looks_like_playback_request(url, slot["resource_type"], headers)):
             self._trace("cdp_request", session_id=sid, request_id=request_id, url=mask_url(url),
                         method=slot["method"], resource_type=slot["resource_type"],
-                        request_range=slot["request_range"])
+                        request_range=slot["request_range"], has_fragment=bool(slot["fragment"]))
 
     def _on_cdp_data(self, sid: int, event: dict[str, Any]) -> None:
         """이벤트에서는 청크만 큐에 넣고, 파일 쓰기는 drain에서 한다."""
@@ -956,7 +985,7 @@ class PlaybackCapture:
                 handle.write(raw)
             self.stream_bytes += len(raw)
         except Exception as exc:
-            self.cache_error = self.cache_error or f"chunk_write:{type(exc).__name__}: {mask_text(str(exc))[:200]}"
+            self._note_error(f"chunk_write:{type(exc).__name__}: {mask_text(str(exc))[:200]}")
             self._trace("chunk_write_error", session_id=sid, request_id=request_id,
                         error_type=type(exc).__name__, error=mask_text(str(exc))[:300])
 
@@ -1052,7 +1081,7 @@ class PlaybackCapture:
         except Exception as exc:
             success = False
             detail = f"direct_download:{type(exc).__name__}: {mask_text(str(exc))[:200]}"
-            self.cache_error = self.cache_error or detail
+            self._note_error(detail)
             log_event("playback_capture", "direct_download_error", detail, level="ERROR", capture_dir=str(self.out_dir))
             self._trace("direct_error", url=mask_url(url), error_type=type(exc).__name__,
                         error=mask_text(str(exc))[:300], status=getattr(exc, "code", None))
@@ -1177,12 +1206,56 @@ class PlaybackCapture:
                         buffered_bytes=len(raw) if buffered else 0)
         except Exception as exc:
             detail = f"stream_body:{type(exc).__name__}: {mask_text(str(exc))[:200]}"
-            self.cache_error = self.cache_error or detail
+            self._note_error(detail)
             log_event("playback_capture", "stream_body_error", detail, level="ERROR",
                       capture_dir=str(self.out_dir))
+            slot = self._cdp_meta.get(key) or {}
+            # 요청 시작을 보지 못한 세션은 그 본문을 받을 수 없다. 세션이 요청보다 늦게 붙은 경우다.
+            tracked = "method" in slot
             self._trace("cdp_stream_error", session_id=sid, request_id=request_id,
-                        error_type=type(exc).__name__, error=mask_text(str(exc))[:300])
-            self._queue_browser_fallback(self._cdp_meta.get(key) or {})
+                        error_type=type(exc).__name__, error=mask_text(str(exc))[:300],
+                        request_tracked=tracked)
+            self._queue_browser_fallback(slot)
+            url = str(slot.get("url") or "")
+            if not tracked and url and not self._player_reloaded and url not in self._untracked_media:
+                self._untracked_media.append(url)
+
+    def reload_untracked_player(self) -> bool:
+        """CDP 연결 전에 시작된 미디어 요청이 있으면 그 프레임을 한 번 다시 불러온다.
+
+        다시 불러온 뒤의 요청은 시작부터 관찰되므로 본문 스트림을 받을 수 있다.
+        """
+        if self._player_reloaded:
+            return False
+        for url in self._untracked_media:
+            frame = self._media_frames.get(url)
+            if frame is None:
+                continue
+            self._player_reloaded = True
+            try:
+                frame.evaluate("() => { location.reload(); }")
+            except Exception as exc:
+                detail = f"player_reload:{type(exc).__name__}: {mask_text(str(exc))[:200]}"
+                self._note_error(detail)
+                self._trace("player_reload_error", url=mask_url(url), error=detail)
+                log_event("playback_capture", "player_reload_error", detail, level="ERROR",
+                          capture_dir=str(self.out_dir))
+                return False
+            # 다시 불러오면 이전 문서의 미디어 주소는 더 쓰이지 않는다.
+            self._untracked_media.clear()
+            self._browser_fallback_queue.clear()
+            self._browser_fallback_failed = False
+            self._trace("player_reloaded", url=mask_url(url))
+            return True
+        return False
+
+    def frame_observed(self, frame) -> bool:
+        """문서를 연 프레임의 네트워크 이벤트를 받을 CDP 세션이 준비됐는지."""
+        url = str(getattr(frame, "url", "") or "")
+        if not url.startswith(("http://", "https://")):
+            return False
+        key = self._frame_key(frame)
+        return key in self._attached_ids or self._skipped_frame_url.get(key) == url
 
     def _queue_browser_fallback(self, slot: dict[str, Any]) -> None:
         url = str(slot.get("url") or "")
@@ -1193,6 +1266,8 @@ class PlaybackCapture:
         self._browser_fallback_queue.append({
             "url": url, "total": parsed[2], "offset": 0,
             "content_type": str(slot.get("content_type") or ""),
+            # 요청 시작을 본 경우에만 fragment 유무가 확정된다. 모르면 플레이어 DOM에서 찾는다.
+            "fragment": slot.get("fragment"),
         })
         self._trace("browser_stream_queued", url=mask_url(url), total=parsed[2])
 
@@ -1214,7 +1289,16 @@ class PlaybackCapture:
         start = item["offset"]
         end = min(start + BROWSER_FALLBACK_CHUNK_BYTES, item["total"]) - 1
         try:
-            response = frame.evaluate(_BROWSER_RANGE_FETCH_JS, [url, start, end])
+            if not item.get("resolved"):
+                item["resolved"] = True
+                if item["fragment"] is None:
+                    item["fragment"] = ""
+                    found = frame.evaluate(_MEDIA_FRAGMENT_JS, url)
+                    if isinstance(found, str) and found.startswith("#"):
+                        item["fragment"] = found
+                # fragment 값에는 실제 영상 위치가 들어 있을 수 있어 유무만 남긴다.
+                self._trace("browser_stream_source", url=mask_url(url), has_fragment=bool(item["fragment"]))
+            response = frame.evaluate(_BROWSER_RANGE_FETCH_JS, [url + item["fragment"], start, end])
             if not isinstance(response, dict) or response.get("status") != 206:
                 raise ValueError("invalid browser Range response")
             content_range = str(response.get("content_range") or "")
@@ -1225,8 +1309,10 @@ class PlaybackCapture:
             self._store(url, 206, item["content_type"], content_range, f"bytes={start}-{end}", body, "media")
         except Exception as exc:
             detail = f"{type(exc).__name__}: {mask_text(str(exc))[:300]}"
+            self._browser_fallback_failed = True
+            self._note_error(f"browser_stream:{detail.splitlines()[0][:200]}")
             self._trace("browser_stream_error", url=mask_url(url), request_range=f"bytes={start}-{end}",
-                        error=detail)
+                        error=detail, has_fragment=bool(item["fragment"]))
             log_event("playback_capture", "browser_stream_error", detail, level="ERROR",
                       capture_dir=str(self.out_dir), media_url=url)
             return
@@ -1256,13 +1342,17 @@ class PlaybackCapture:
         ) or looks_like_playback_request(slot["url"], slot["resource_type"], {"range": slot.get("request_range", "")})
         if interesting:
             self.media_seen += 1
+            known = parse_byte_range(slot["content_range"])
+            if known and known[2]:
+                self.expected_total = max(self.expected_total, known[2])
             self._trace("cdp_response", session_id=sid, request_id=request_id, url=mask_url(slot["url"]),
                         status=slot["status"], resource_type=slot["resource_type"],
                         content_type=slot["content_type"], content_range=slot["content_range"],
                         content_length=slot["content_length"], request_range=slot.get("request_range") or "",
                         protocol=response.get("protocol") or "",
                         from_disk_cache=bool(response.get("fromDiskCache")),
-                        from_service_worker=bool(response.get("fromServiceWorker")))
+                        from_service_worker=bool(response.get("fromServiceWorker")),
+                        request_tracked="method" in slot)
         self._sample(self.response_samples, {
             "url": slot["url"],
             "status": slot["status"],

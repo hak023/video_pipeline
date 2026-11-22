@@ -62,46 +62,98 @@ def _page(body: str) -> str:
     return f"<!doctype html><html><body>{body}</body></html>"
 
 
-@unittest.skipUnless(os.environ.get("RUN_PLAYBACK_CAPTURE") == "1" and resolve_chrome_channel(),
-                     "RUN_PLAYBACK_CAPTURE=1 및 Chrome 필요")
-class ServiceWorkerPlaybackTests(unittest.TestCase):
-    def test_browser_range_fallback_uses_player_service_worker(self):
-        import urllib.error
-        import urllib.request
+_SW_JS = r"""
+self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+let real = null;
+self.addEventListener('fetch', e => {
+    const url = new URL(e.request.url);
+    // 실제 사이트처럼 fragment가 있어야만 가상 주소의 영상을 만들어 준다.
+    if (!url.pathname.startsWith('/mediastorage/') || !url.hash) return;
+    const opts = new URLSearchParams(url.hash.slice(1));
+    e.respondWith((async () => {
+        await sleep(Number(opts.get('delay') || 0));
+        if (!real) real = new Uint8Array(await (await fetch(opts.get('real'))).arrayBuffer());
+        const m = /^bytes=(\d+)-(\d*)$/.exec(e.request.headers.get('range') || 'bytes=0-');
+        const start = Number(m[1]);
+        const end = m[2] ? Math.min(Number(m[2]), real.length - 1) : real.length - 1;
+        const data = real.slice(start, end + 1);
+        const half = Math.floor(data.length / 2);
+        const body = new ReadableStream({async start(c) {
+            c.enqueue(data.slice(0, half));
+            await sleep(Number(opts.get('hold') || 0));
+            c.enqueue(data.slice(half));
+            c.close();
+        }});
+        return new Response(body, {status: 206, headers: {
+            'Content-Type': 'video/mp4', 'Accept-Ranges': 'bytes',
+            'Content-Length': String(data.length),
+            'Content-Range': `bytes ${start}-${end}/${real.length}`,
+        }});
+    })());
+});
+"""
+_SW_PLAYER = """<!doctype html><title>player</title><body><script>
+(async () => {
+    const q = new URLSearchParams(location.search);
+    await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
+    if (!navigator.serviceWorker.controller) {
+        await new Promise(r => navigator.serviceWorker.addEventListener('controllerchange', r, {once: true}));
+    }
+    const v = document.createElement('video');
+    v.muted = true;
+    v.src = `http://127.0.0.1:%d/mediastorage/${Date.now()}/token/%d.mp4`
+        + `#real=/real.mp4&delay=${q.get('delay') || 0}&hold=${q.get('hold') || 0}`;
+    document.body.appendChild(v);
+    v.play().catch(() => {});
+})();
+</script></body>"""
 
-        import playback_capture
+
+@unittest.skipUnless(os.environ.get("RUN_PLAYBACK_CAPTURE") == "1" and resolve_chrome_channel()
+                     and shutil.which("ffmpeg"), "RUN_PLAYBACK_CAPTURE=1 및 Chrome/ffmpeg 필요")
+class ServiceWorkerPlaybackTests(unittest.TestCase):
+    """교차 출처 iframe의 서비스워커가 가상 주소(직접 요청은 403)로 영상을 만들어 주는 플레이어."""
+
+    def setUp(self):
+        import socket
+
         from media_tools import get_browser_launch_kwargs
         from playwright.sync_api import sync_playwright
 
-        hits = []
-        worker = b"""
-            self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));
-            self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
-            self.addEventListener('fetch', e => {
-                if (new URL(e.request.url).pathname !== '/media/video.mp4') return;
-                const match = /^bytes=(\\d+)-(\\d+)$/.exec(e.request.headers.get('range') || '');
-                if (!match) return;
-                const start = Number(match[1]), end = Number(match[2]);
-                const data = new TextEncoder().encode('abcdefgh').slice(start, end + 1);
-                e.respondWith(new Response(data, {status: 206, headers: {
-                    'Content-Type': 'video/mp4',
-                    'Content-Range': `bytes ${start}-${end}/8`
-                }}));
-            });
-        """
+        self.tmp = Path(tempfile.mkdtemp(prefix="vp_sw_"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        _make_video(self.tmp / "real.mp4", 3)
+        self.real = (self.tmp / "real.mp4").read_bytes()
+        self.origin_hits = []
+        test = self
 
-        class Handler(http.server.BaseHTTPRequestHandler):
+        class Origin(http.server.BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
-                if self.path == "/sw.js":
-                    status, ctype, body = 200, "application/javascript", worker
-                elif self.path == "/":
-                    status, ctype, body = 200, "text/html", b"<iframe name='player' src='/player'></iframe>"
-                elif self.path == "/player":
-                    status, ctype, body = 200, "text/html", b"<!doctype html><title>player</title>"
-                else:
-                    hits.append(self.path)
-                    status, ctype, body = 403, "text/plain", b"forbidden"
-                self.send_response(status)
+                test.origin_hits.append(self.headers.get("User-Agent", ""))
+                self.send_response(403)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        class Site(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                path = self.path.split("?")[0]
+                pages = {
+                    "/article": ("text/html", b"<!doctype html><title>article</title><body>article</body>"),
+                    "/": ("text/html", (_SW_PLAYER % (test.origin_port, len(test.real))).encode()),
+                    "/sw.js": ("application/javascript", _SW_JS.encode()),
+                    "/real.mp4": ("video/mp4", test.real),
+                }
+                if path not in pages:
+                    self.send_error(404)
+                    return
+                ctype, body = pages[path]
+                self.send_response(200)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -110,51 +162,104 @@ class ServiceWorkerPlaybackTests(unittest.TestCase):
             def log_message(self, *_args):
                 pass
 
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-        base = f"http://127.0.0.1:{server.server_address[1]}"
-        url = f"{base}/media/video.mp4"
-        with self.assertRaises(urllib.error.HTTPError) as error:
-            urllib.request.urlopen(url, timeout=5)
-        self.assertEqual(error.exception.code, 403)
+        for handler in (Origin, Site):
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            if handler is Origin:
+                self.origin_port = server.server_address[1]
+            else:
+                site_port = server.server_address[1]
+        # 글 페이지와 임베드의 사이트가 달라야 임베드가 별도 프로세스(별도 CDP 세션)가 된다.
+        self.article = f"http://localhost:{site_port}/article"
+        self.embed = f"http://127.0.0.1:{site_port}/?v=swvideo01"
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.cdp_port = probe.getsockname()[1]
+        self.playwright = sync_playwright().start()
+        self.addCleanup(self.playwright.stop)
+        launch = get_browser_launch_kwargs(headless=True)
+        launch["args"] = [*launch["args"], f"--remote-debugging-port={self.cdp_port}"]
+        self.browser = self.playwright.chromium.launch(**launch)
+        self.addCleanup(self.browser.close)
 
-        with tempfile.TemporaryDirectory() as directory, sync_playwright() as p:
-            browser = p.chromium.launch(**get_browser_launch_kwargs(headless=True))
-            try:
-                page = browser.new_page()
-                page.goto(base)
-                frame = page.frame(name="player")
-                assert frame is not None
-                frame.evaluate("async () => { await navigator.serviceWorker.register('/sw.js'); await navigator.serviceWorker.ready; }")
-                frame.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=10000)
-                capture = playback_capture.PlaybackCapture(Path(directory))
-                capture.install(page)
-                request = mock.Mock(url=url, resource_type="media", headers={"range": "bytes=0-"},
-                                    method="GET", frame=frame)
-                response = mock.Mock(url=url, status=206, request=request,
-                                     headers={"content-type": "video/mp4", "content-range": "bytes 0-7/8"})
-                session = mock.Mock()
-                session.send.side_effect = RuntimeError("Request with the provided ID does not exists")
-                capture._wire_session(session)
-                with mock.patch.object(capture, "_start_direct_media_download"), \
-                        mock.patch.object(playback_capture, "BROWSER_FALLBACK_CHUNK_BYTES", 4):
-                    capture._on_response(response)
-                    capture._on_cdp_response(id(session), {"requestId": "1", "type": "Media", "response": {
-                        "url": url, "status": 206, "mimeType": "video/mp4",
-                        "headers": {"content-range": "bytes 0-7/8"},
-                    }})
-                    capture.drain(allow_browser_fallback=True)
-                    capture.drain(allow_browser_fallback=True)
-                    result = capture.summary()
-                capture.uninstall(page)
-                self.assertTrue(result["complete"], result)
-                self.assertEqual(Path(result["output"]).read_bytes(), b"abcdefgh")
-                self.assertFalse(any(entry["event"] == "fallback_start" for entry in result["capture_trace"]))
-                self.assertEqual(hits.count("/media/video.mp4"), 1)
-            finally:
-                browser.close()
+    def _player_frame(self, page):
+        frame = page.query_selector("#player_frame").content_frame()
+        assert frame is not None
+        return frame
+
+    def _wait_complete(self, page, capture, **drain):
+        for _ in range(200):
+            capture.drain(**drain)
+            if capture.media_progress()["complete"]:
+                break
+            page.wait_for_timeout(100)
+        return capture.summary()
+
+    def test_handoff_saves_service_worker_media_from_cross_origin_player(self):
+        import contextlib
+
+        import openx_handoff
+
+        with mock.patch.object(openx_handoff, "log"):
+            outcome = openx_handoff.open_download_handoff(
+                self.embed + "&delay=300&hold=4000", page_url=self.article,
+                cdp_url=f"http://127.0.0.1:{self.cdp_port}", timeout_ms=3000,
+                playwright=contextlib.nullcontext(self.playwright), capture_dir=self.tmp / "capture",
+            )
+        playback = outcome.get("playback") or {}
+        self.assertTrue(playback.get("complete"), outcome)
+        self.assertEqual(Path(playback["output"]).read_bytes(), self.real)
+
+    def test_media_requested_before_cdp_attach_is_recovered_by_reloading_player(self):
+        import openx_handoff
+        import playback_capture
+
+        page = self.browser.new_page()
+        capture = playback_capture.PlaybackCapture(self.tmp / "capture")
+        capture.install(page)
+        self.addCleanup(capture.uninstall, page)
+        openx_handoff._open_embed_frame(page, self.embed + "&delay=1500&hold=4000", self.article)
+        # 영상 요청이 나간 뒤에야 iframe의 CDP 세션이 붙는 순서를 만든다.
+        self._player_frame(page).wait_for_selector("video", state="attached", timeout=15000)
+        with mock.patch.object(openx_handoff, "log"):
+            openx_handoff._prime_embed_player(page, None, capture)
+            self.assertFalse(capture.media_progress()["complete"])
+            openx_handoff._capture_until_full(page, capture, max_seconds=60)
+        result = capture.summary()
+        events = [entry["event"] for entry in result["capture_trace"]]
+        self.assertIn("player_reloaded", events)
+        self.assertIn("cdp_stream_started", events)
+        self.assertTrue(result["complete"], result)
+        self.assertEqual(Path(result["output"]).read_bytes(), self.real)
+
+    def test_browser_range_fallback_keeps_fragment_for_service_worker(self):
+        import playback_capture
+
+        page = self.browser.new_page()
+        page.goto(self.article)
+        page.set_content(f"<iframe id='player_frame' src='{self.embed}'></iframe>")
+        frame = self._player_frame(page)
+        frame.wait_for_selector("video", state="attached", timeout=15000)
+        url = frame.evaluate("() => document.querySelector('video').currentSrc").split("#")[0]
+        total = len(self.real)
+        headers = {"content-type": "video/mp4", "content-range": f"bytes 0-{total - 1}/{total}"}
+        capture = playback_capture.PlaybackCapture(self.tmp / "capture")
+        capture.out_dir.mkdir()
+        request = mock.Mock(url=url, resource_type="media", headers={"range": "bytes=0-"}, method="GET", frame=frame)
+        session = mock.Mock()
+        session.send.side_effect = RuntimeError("Request with the provided ID does not exists")
+        capture._wire_session(session)
+        with mock.patch.object(capture, "_start_direct_media_download"), \
+                mock.patch.object(playback_capture, "BROWSER_FALLBACK_CHUNK_BYTES", max(1024, total // 3)):
+            capture._on_response(mock.Mock(url=url, status=206, request=request, headers=headers))
+            capture._on_cdp_response(id(session), {"requestId": "1", "type": "Media", "response": {
+                "url": url, "status": 206, "mimeType": "video/mp4", "headers": headers}})
+            result = self._wait_complete(page, capture, allow_browser_fallback=True)
+        self.assertTrue(result["complete"], result)
+        self.assertEqual(Path(result["output"]).read_bytes(), self.real)
+        self.assertEqual(self.origin_hits, [])
 
 
 @unittest.skipUnless(os.environ.get("RUN_E2E") == "1" and _have_tools(), "RUN_E2E=1 및 Chrome/ffmpeg/yt-dlp 필요")

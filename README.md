@@ -36,18 +36,25 @@ python main.py --discover-only                  # 다운로드 없이 후보만 
 `ENABLE_STREAMING_FALLBACK` 기본값은 `True`입니다. 버튼이 없으면 재생 응답을 캡처하고
 발견한 미디어 URL의 직접 다운로드도 시도합니다. 직접 요청은 브라우저의 인증 정보를 사용하지 않으므로
 서버가 거부할 수 있습니다. 작업이 연 재생 탭은 Chrome 연결을 끊기 전에 닫습니다.
+재생 응답 본문은 요청 시작부터 관찰한 CDP 세션만 받을 수 있어, 플레이어 iframe이 열리는 즉시
+네트워크 관찰을 붙입니다. 그래도 미디어 요청이 먼저 시작됐다면 버튼이 없다고 판정한 뒤 플레이어 프레임을 한 번 다시 불러와
+요청을 처음부터 관찰합니다(`player_reloaded`).
 CDP 스트림 연결이 실패하고 전체 길이를 알 수 있으면, 버튼이 없는 것으로 판정한 뒤
 해당 미디어 응답을 받은 플레이어 프레임에서 1 MiB씩 추가 Range 요청을 시도합니다.
 서비스워커 또는 서버가 인증된 요청에 `206`과 정확한 `Content-Range`를 반환하고, 교차 출처에서는
 CORS가 해당 헤더를 노출해야 합니다. 이를 만족하지 않으면 복구가 실패할 수 있습니다.
+서비스워커가 주소의 `#fragment`로 영상을 구분하는 플레이어를 위해 추가 요청에는 원래 주소의 fragment를
+그대로 붙입니다. fragment 값은 기록하지 않고 유무(`has_fragment`)만 남깁니다.
+이 추가 요청까지 실패하고 받은 바이트가 없으면 10초 뒤 `recovery_failed`로 중단합니다.
 수신한 스트림 바이트는 누적량으로 별도 표시하며, 응답 완료 및 전체 범위 확인 전에는 완료로 간주하지 않습니다.
 바이트가 증가하지 않으면 미디어 응답이 없는 경우 45초, 응답만 있거나 수신이 멈춘 경우 90초 후 중단합니다.
 CDP 본문 읽기 오류와 네트워크 요청 실패의 상세 내용은 민감값을 마스킹해 진단 로그와 캡처 목록에 남깁니다.
 캡처 목록의 `capture_trace`에는 CDP 세션·요청 ID별 응답, 스트림 연결 및 실패 사유와 바이트 수,
 직접 다운로드·브라우저 대체 요청 결과가 최근 200건까지 남습니다. `events.jsonl`에는 처음 200건과
 이후 오류 이벤트가 기록됩니다. 본문과 쿠키·인증 헤더는 기록하지 않습니다.
-범위 재수신 진단은 `browser_stream_queued`, `browser_stream_waiting_for_frame`,
+범위 재수신 진단은 `browser_stream_queued`, `browser_stream_waiting_for_frame`, `browser_stream_source`,
 `browser_stream_chunk`, `browser_stream_error` 이벤트에서 확인할 수 있습니다.
+`cdp_response`와 `cdp_stream_error`의 `request_tracked=false`는 CDP 세션이 그 요청보다 늦게 붙었다는 뜻입니다.
 
 403 이후 Chrome 재생 캡처는 한 프로세스에서 **최대 5개**입니다 (`--workers 10`이어도
 재생 캡처는 5개를 넘지 않음). 재생 탭은 이 상한 안에서 병렬로 시작합니다.

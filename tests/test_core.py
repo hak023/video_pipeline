@@ -558,6 +558,10 @@ class PlaybackStreamingProgressTests(unittest.TestCase):
             with mock.patch.object(capture, "_start_direct_media_download"), \
                     mock.patch.object(playback_capture, "BROWSER_FALLBACK_CHUNK_BYTES", 4):
                 capture._on_response(response)
+                capture._on_cdp_request(sid, {"requestId": "1", "type": "Media", "request": {
+                    "url": url, "urlFragment": "#real=SECRET_SOURCE", "method": "GET",
+                    "headers": {"Range": "bytes=0-"},
+                }})
                 capture._on_cdp_response(sid, {
                     "requestId": "1", "type": "Media",
                     "response": {"url": url, "status": 206, "mimeType": "video/mp4",
@@ -565,14 +569,60 @@ class PlaybackStreamingProgressTests(unittest.TestCase):
                 })
                 capture.drain()
                 frame.evaluate.assert_not_called()
+                self.assertFalse(capture.reload_untracked_player())
                 capture.drain(allow_browser_fallback=True)
                 self.assertFalse(capture.media_progress()["complete"])
                 capture.drain(allow_browser_fallback=True)
             result = capture.summary()
             self.assertTrue(result["complete"])
             self.assertEqual(Path(result["output"]).read_bytes(), b"abcdefgh")
-            self.assertEqual(frame.evaluate.call_args_list[0].args[1], [url, 0, 3])
-            self.assertEqual(frame.evaluate.call_args_list[1].args[1], [url, 4, 7])
+            # 서비스워커가 영상을 구분하는 fragment는 요청에는 붙이고 기록에는 남기지 않는다.
+            self.assertEqual(frame.evaluate.call_args_list[0].args[1], [url + "#real=SECRET_SOURCE", 0, 3])
+            self.assertEqual(frame.evaluate.call_args_list[1].args[1], [url + "#real=SECRET_SOURCE", 4, 7])
+            self.assertNotIn("SECRET_SOURCE", (Path(directory) / "playback_capture.json").read_text(encoding="utf-8"))
+
+    def test_untracked_media_request_reloads_player_once_then_uses_dom_fragment(self):
+        import base64
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            session = mock.Mock()
+            session.send.side_effect = RuntimeError("Request with the provided ID does not exists")
+            capture._wire_session(session)
+            sid = id(session)
+            frame = mock.Mock()
+            frame.evaluate.side_effect = [
+                None,
+                "#real=SECRET_SOURCE",
+                {"status": 206, "content_range": "bytes 0-7/8", "body": base64.b64encode(b"abcdefgh").decode()},
+            ]
+
+            def untracked_response(request_id, url):
+                request = mock.Mock(url=url, resource_type="media", headers={}, method="GET", frame=frame)
+                capture._on_response(mock.Mock(url=url, status=206, request=request, headers={
+                    "content-type": "video/mp4", "content-range": "bytes 0-7/8"}))
+                capture._on_cdp_response(sid, {"requestId": request_id, "type": "Media", "response": {
+                    "url": url, "status": 206, "mimeType": "video/mp4",
+                    "headers": {"content-range": "bytes 0-7/8"},
+                }})
+                capture.drain()
+
+            with mock.patch.object(capture, "_start_direct_media_download"):
+                untracked_response("1", "https://cdn.test/first.mp4")
+                self.assertTrue(capture.reload_untracked_player())
+                self.assertIn("location.reload", frame.evaluate.call_args_list[0].args[0])
+                capture.drain(allow_browser_fallback=True)
+                self.assertEqual(frame.evaluate.call_count, 1)
+
+                untracked_response("2", "https://cdn.test/second.mp4")
+                self.assertFalse(capture.reload_untracked_player())
+                capture.drain(allow_browser_fallback=True)
+            result = capture.summary()
+            self.assertTrue(result["complete"], result)
+            self.assertEqual(frame.evaluate.call_args_list[2].args[1],
+                             ["https://cdn.test/second.mp4#real=SECRET_SOURCE", 0, 7])
+            self.assertNotIn("SECRET_SOURCE", json.dumps(result["capture_trace"]))
 
     def test_stream_recovery_rejects_mismatched_range(self):
         import base64
@@ -595,6 +645,8 @@ class PlaybackStreamingProgressTests(unittest.TestCase):
             with mock.patch.object(capture, "_start_direct_media_download"), \
                     mock.patch.object(playback_capture, "BROWSER_FALLBACK_CHUNK_BYTES", 4):
                 capture._on_response(response)
+                capture._on_cdp_request(sid, {"requestId": "1", "type": "Media", "request": {
+                    "url": url, "method": "GET", "headers": {}}})
                 capture._on_cdp_response(sid, {"requestId": "1", "type": "Media", "response": {
                     "url": url, "status": 206, "mimeType": "video/mp4",
                     "headers": {"content-range": "bytes 0-7/8"},
@@ -604,6 +656,14 @@ class PlaybackStreamingProgressTests(unittest.TestCase):
             self.assertEqual(capture.files, [])
             self.assertEqual(frame.evaluate.call_count, 1)
             self.assertTrue(any(entry["event"] == "browser_stream_error" for entry in capture.summary()["capture_trace"]))
+            # 대체 수신까지 실패하면 90초를 채우지 않고 끝낸다. 받은 바이트가 있으면 계속 기다린다.
+            import openx_handoff
+            progress = capture.media_progress()
+            state = dict(quiet=10, complete=False, covered=0, total=0, media_seen=2, inflight=0,
+                         recovery_failed=progress["recovery_failed"])
+            self.assertEqual(openx_handoff.streaming_stop_reason(**state), "recovery_failed")
+            self.assertEqual(openx_handoff.streaming_stop_reason(**state, stream_bytes=1), "")
+            self.assertIn("browser_stream:", " ".join(progress["errors"]))
 
     def test_partial_direct_failure_preserves_completed_browser_ranges(self):
         import playback_capture

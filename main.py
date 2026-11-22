@@ -307,7 +307,7 @@ def _log_playback(item_name: str, playback: dict | None, item_url: str = "") -> 
         f"service_worker_bypassed={playback.get('service_worker_bypassed')} "
         f"capture_mode={playback.get('capture_mode') or '-'} "
         f"frame_errors={','.join(playback.get('frame_errors') or []) or '-'} "
-        f"cache_error={playback.get('cache_error') or '-'}"
+        f"cache_error={' | '.join(playback.get('capture_errors') or []) or playback.get('cache_error') or '-'}"
     )
     for item in files[:12]:
         log(
