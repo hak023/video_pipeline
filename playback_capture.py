@@ -638,6 +638,9 @@ class PlaybackCapture:
             **extra,
         }
 
+    def observed_media_urls(self) -> list[str]:
+        return list(self._media_frames)
+
     def assemble(self) -> dict[str, Any] | None:
         """전체 범위가 모인 본편만 하나의 mp4로 합친다. 구멍 난 조각은 합치지 않는다."""
         progress = self.media_progress()

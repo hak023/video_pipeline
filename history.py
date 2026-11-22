@@ -158,7 +158,7 @@ class HistoryManager:
     def _verify_record(self, record: dict[str, Any] | None) -> bool:
         if not record:
             return False
-        if record.get("status") == "skipped_short":
+        if record.get("status") in ("skipped_short", "skipped_long"):
             return True  # 길이 조건으로 건너뛴 항목도 '처리 완료'로 간주
         if record.get("status") != "ok":
             return False
@@ -232,8 +232,11 @@ class HistoryManager:
         reason: str,
         post_date: str | None = None,
         duration: float | None = None,
+        status: str = "skipped_short",
     ) -> None:
         """길이 조건 등으로 의도적으로 건너뛴 항목 (재방문 시 다시 탐색하지 않음)."""
+        if status not in ("skipped_short", "skipped_long"):
+            raise ValueError(f"invalid skipped status: {status}")
         key = normalize_url(url)
         date_key = post_date.strip() if post_date else "undated"
         with self._lock:
@@ -244,7 +247,7 @@ class HistoryManager:
                 "name": name,
                 "url": url,
                 "post_date": post_date,
-                "status": "skipped_short",
+                "status": status,
                 "reason": reason,
                 "duration": duration,
                 "skipped_at": datetime.now().isoformat(),
@@ -263,7 +266,7 @@ class HistoryManager:
             attempts = 1
             for d, rk in self._loc.get(key, {}).items():
                 rec = self._load_partition(d).get(rk) or {}
-                if rec.get("status") in ("ok", "skipped_short"):
+                if rec.get("status") in ("ok", "skipped_short", "skipped_long"):
                     return  # 기존 성공/스킵 기록을 실패로 덮어쓰지 않음 (--force 재시도 실패 등)
                 attempts = max(attempts, int(rec.get("attempts", 1)) + 1)
             self._upsert(key, date_key, {

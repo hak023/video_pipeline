@@ -1101,5 +1101,140 @@ class PlaybackOutputTests(unittest.TestCase):
                     self.assertTrue(self.source.exists())
 
 
+class StreamingDurationTests(unittest.TestCase):
+    def test_config_validates_and_accepts_custom_limit(self):
+        import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            for value, expected in (("3600", 3600), ("0", 0), ("2.5", 2.5)):
+                path.write_text(f"streaming_max_duration_seconds: {value}\n", encoding="utf-8")
+                self.assertEqual(main._load_config(path), expected)
+            for value in ("-1", ".nan", "true", "'7200'", "9" * 400):
+                path.write_text(f"streaming_max_duration_seconds: {value}\n", encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    main._load_config(path)
+
+    def test_stream_continues_until_length_is_known_then_stops_at_boundary(self):
+        import openx_handoff
+
+        capture = mock.Mock(media_seen=1, tap_inflight=0, tap_bytes=0, stop_reason="", cache_error="")
+        capture.media_progress.return_value = {"covered": 0, "total": 0, "complete": False}
+        page = mock.Mock()
+        clock = [0.0]
+        page.wait_for_timeout.side_effect = lambda ms: clock.__setitem__(0, clock[0] + ms / 1000)
+        with mock.patch.object(openx_handoff, "_player_duration", side_effect=[None, 7199, 7200]), \
+                mock.patch.object(openx_handoff, "log"), \
+                mock.patch("time.monotonic", side_effect=lambda: clock[0]):
+            openx_handoff._capture_until_full(page, capture, max_seconds=10, max_duration_seconds=7200)
+        self.assertEqual(capture.stop_reason, "duration_limit")
+        self.assertEqual(capture.video_duration, 7200)
+        self.assertEqual(capture.drain.call_count, 2)
+
+    def test_streaming_skip_is_recorded_and_not_reported_as_failure(self):
+        import main
+        from history import HistoryManager
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = HistoryManager(root / "history")
+            url = "https://article.test/movie"
+            outcome = {
+                "ok": True, "no_download_button": True, "skipped_long": True,
+                "duration": 7200, "playback": {"files": []},
+            }
+            with mock.patch.object(main, "open_download_handoff", return_value=outcome) as handoff:
+                result = main._finish_with_openx_handoff(
+                    {}, {"embed_url": "https://player.test/?v=id"}, "Movie", "403",
+                    item_url=url, history=history, out_dir=root, max_duration_seconds=7200,
+                )
+            self.assertEqual(result["status"], "skipped_long")
+            self.assertTrue(history.is_downloaded(url))
+            self.assertEqual(main._summarize_report([result])[0], "OK")
+            self.assertEqual(handoff.call_args.kwargs["max_duration_seconds"], 7200)
+            self.assertEqual(list(root.glob("*.mp4")), [])
+
+    def test_completed_file_is_checked_and_unknown_or_disabled_can_continue(self):
+        import main
+
+        for limit, metadata, expected in (
+            (7200, (7200.0, 5), "skipped_long"),
+            (7200, (7199.0, 5), "ok"),
+            (7200, None, "ok"),
+            (0, (7200.0, 5), "ok"),
+        ):
+            with self.subTest(limit=limit, metadata=metadata), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                capture = root / "capture"
+                capture.mkdir()
+                source = capture / "video.mp4"
+                source.write_bytes(b"video")
+                playback = {
+                    "files": [{"path": str(source), "size": 5}], "output": str(source),
+                    "complete": True, "total": 5, "covered": 5, "bytes": 5, "capture_dir": str(capture),
+                }
+                outcome = {"ok": True, "no_download_button": True, "playback": playback}
+                history = mock.Mock()
+                main._names_claimed.clear()
+                with mock.patch.object(main, "open_download_handoff", return_value=outcome), \
+                        mock.patch.object(main, "probe_duration_size", return_value=metadata) as probe:
+                    result = main._finish_with_openx_handoff(
+                        {}, {"embed_url": "https://player.test/?v=id"}, "Movie", "403",
+                        item_url="https://article.test/movie", history=history, out_dir=root,
+                        max_duration_seconds=limit,
+                    )
+                self.assertEqual(result["status"], expected)
+                self.assertEqual((root / "Movie.mp4").exists(), expected == "ok")
+                if expected == "skipped_long":
+                    history.record_success.assert_not_called()
+                    history.record_skipped.assert_called_once()
+                    self.assertTrue(source.exists())
+                if limit == 0:
+                    probe.assert_not_called()
+
+    def test_long_limit_does_not_affect_regular_download(self):
+        import main
+
+        group = {"index": 1, "candidates": [{"url": "https://cdn.test/video.mp4", "classification": "MAIN"}]}
+        opts = main.Options(streaming_max_duration_seconds=7200)
+        with mock.patch.object(main, "probe_duration", return_value=8000), \
+                mock.patch.object(main, "_download_candidate", return_value={"status": "ok", "output": "x.mp4"}), \
+                mock.patch.object(main.blacklist, "record_main"):
+            result = main._process_item(
+                group=group, n=1, url="https://article.test/movie", name="Movie",
+                out_dir=Path("."), proxy=None, opts=opts, history=None, post_date=None,
+                force=False, board=None, slot=1,
+            )
+        self.assertEqual(result["status"], "ok")
+
+    def test_limit_reaches_streaming_handoff_after_regular_download_403(self):
+        import main
+        from history import HistoryManager
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = HistoryManager(root / "history")
+            group = {
+                "index": 1, "embed_url": "https://player.test/?v=id",
+                "candidates": [{"url": "https://cdn.test/video.mp4", "classification": "MAIN"}],
+            }
+            outcome = {
+                "ok": True, "no_download_button": True, "skipped_long": True,
+                "duration": 3600, "playback": {"files": []},
+            }
+            with mock.patch.object(main, "probe_duration", return_value=3600), \
+                    mock.patch.object(main, "_download_candidate", return_value={"status": "failed", "reason": "HTTP 403"}), \
+                    mock.patch.object(main, "open_download_handoff", return_value=outcome) as handoff:
+                result = main._process_item(
+                    group=group, n=1, url="https://article.test/movie", name="Movie",
+                    out_dir=root, proxy=None, opts=main.Options(streaming_max_duration_seconds=3600),
+                    history=history, post_date=None, force=False, board=None, slot=1,
+                )
+            self.assertEqual(result["status"], "skipped_long")
+            self.assertEqual(handoff.call_args.kwargs["max_duration_seconds"], 3600)
+            reloaded = HistoryManager(root / "history")
+            self.assertTrue(reloaded.is_downloaded("https://article.test/movie"))
+
+
 if __name__ == "__main__":
     unittest.main()

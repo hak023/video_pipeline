@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import random
 import re
 import shutil
@@ -34,13 +35,14 @@ from diagnostics import (
     sanitize,
     attach_page_diagnostics,
 )
-from media_tools import get_browser_launch_kwargs, get_context_kwargs
+from media_tools import get_browser_launch_kwargs, get_context_kwargs, probe_duration_size
 from playwright.sync_api import sync_playwright
 from history import HistoryManager, normalize_url
 from progress import ProgressBoard, log, set_board
 from verify import verify
 from ad_blacklist import blacklist
 from openx_handoff import (
+    DEFAULT_STREAMING_MAX_DURATION_SECONDS,
     MAX_CONCURRENT_HANDOFFS,
     MAX_OPEN_DOWNLOAD_PAGES,
     is_openx_access_denied,
@@ -57,7 +59,7 @@ CANCEL = threading.Event()            # Ctrl+C 시 모든 워커에 중단 신�
 BACKOFF = (5, 15, 30)                 # 재시도 대기(초). 여기에 0~3초 jitter 가산
 MAX_CONCURRENT_BROWSERS = 3           # Chromium 동시 실행 수 (메모리/차단 방지)
 MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".m4a", ".ts", ".mov"}
-DONE_STATES = {"ok", "skipped", "skipped_short", "skipped_unconfirmed"}
+DONE_STATES = {"ok", "skipped", "skipped_short", "skipped_long", "skipped_unconfirmed"}
 MAX_CANDIDATES_TRIED = 3              # 한 영상에서 후보 URL을 최대 몇 개까지 시도할지
 
 
@@ -131,6 +133,7 @@ class Options:
     stall_timeout: int = DEFAULT_STALL_TIMEOUT
     require_file: bool = False        # False(기본): history 기록만 신뢰 → 파일을 옮겨도 재다운로드 안 함
     skip_under: float = 60.0          # 이 길이(초) 이하의 영상은 다운로드하지 않음 (0 = 끄기)
+    streaming_max_duration_seconds: float = DEFAULT_STREAMING_MAX_DURATION_SECONDS
     history_dir: Path = HISTORY_DIR
     cooldown_hours: float = 0.0       # 0 = 끄기. 같은 글이 cooldown_after 회 이상 실패했으면 이 시간 동안 재탐색 보류
     cooldown_after: int = 2
@@ -207,6 +210,23 @@ def _load_targets(path: Path) -> list[dict]:
     with path.open(encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     return cfg.get("targets") or []
+
+
+def _load_config(path: Path) -> float:
+    with path.open(encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict) or "streaming_max_duration_seconds" not in cfg:
+        raise ValueError("config에 streaming_max_duration_seconds가 필요합니다")
+    value = cfg["streaming_max_duration_seconds"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("streaming_max_duration_seconds는 0 이상의 유한한 숫자여야 합니다")
+    try:
+        seconds = float(value)
+    except OverflowError as exc:
+        raise ValueError("streaming_max_duration_seconds는 0 이상의 유한한 숫자여야 합니다") from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("streaming_max_duration_seconds는 0 이상의 유한한 숫자여야 합니다")
+    return seconds
 
 
 def _meta_num(meta: Any, key: str) -> float | None:
@@ -368,6 +388,7 @@ def _finish_with_openx_handoff(
     history=None, item_url: str = "", post_date: str | None = None, out_dir: Path | None = None,
     browser_sem=None, max_open_download_pages: int = MAX_OPEN_DOWNLOAD_PAGES,
     minimize_window: bool = False, force: bool = False, prev_output: str | Path | None = None,
+    max_duration_seconds: float = DEFAULT_STREAMING_MAX_DURATION_SECONDS,
 ) -> dict:
     """403 이면 30초 안에 download 버튼을 확인한다.
 
@@ -386,9 +407,26 @@ def _finish_with_openx_handoff(
         max_concurrent_handoffs=MAX_CONCURRENT_HANDOFFS,
         minimize_window=minimize_window,
         cancel_event=CANCEL,
+        max_duration_seconds=max_duration_seconds,
     )
     playback = outcome.get("playback") or {}
     if outcome.get("ok") and outcome.get("no_download_button"):
+        def skip_long(duration: float) -> dict:
+            reason = f"스트리밍 영상 길이 {duration:.1f}초가 상한 {max_duration_seconds:.1f}초 이상입니다."
+            res.update(status="skipped_long", fatal=True, reason=reason, duration=duration,
+                       handoff=True, no_download_button=True, playback=playback)
+            if history and item_url:
+                history.record_skipped(item_url, item_name, reason, post_date=post_date,
+                                       duration=duration, status="skipped_long")
+            log(f"  [LONG SKIP] {item_name}: {reason}")
+            log_event("download", "streaming_skipped_long", reason, page_url=embed, duration=duration)
+            get_diagnostics().download(status="SKIPPED_LONG", reason=reason, duration=duration, playback=True)
+            return res
+
+        observed_duration = outcome.get("duration")
+        if outcome.get("skipped_long") and isinstance(observed_duration, (int, float)):
+            _log_playback(item_name, playback, item_url or page_url)
+            return skip_long(float(observed_duration))
         files = playback.get("files") or []
         if files and not playback.get("complete"):
             _log_playback(item_name, playback, item_url or page_url)
@@ -439,6 +477,22 @@ def _finish_with_openx_handoff(
             log_event("download", "playback_capture_partial", reason, level="ERROR", page_url=embed)
             get_diagnostics().fail("download", reason)
             return res
+        if max_duration_seconds > 0:
+            try:
+                assert source is not None
+                metadata = probe_duration_size(source)
+            except OSError as exc:
+                metadata = None
+                log_event("playback_capture", "duration_probe_failed", mask_text(str(exc)), level="WARNING")
+            duration = metadata[0] if metadata else observed_duration
+            if isinstance(duration, (int, float)) and math.isfinite(duration) and duration > 0:
+                if duration >= max_duration_seconds:
+                    _log_playback(item_name, playback, item_url or page_url)
+                    return skip_long(float(duration))
+            else:
+                log("  [재생 캡처] 영상 길이를 확인하지 못해 제한을 적용하지 못했습니다.")
+                log_event("playback_capture", "duration_unknown",
+                          "영상 길이를 확인하지 못해 제한을 적용하지 못했습니다.", level="WARNING")
         try:
             previous_in_out = (
                 prev_output if prev_output and Path(prev_output).resolve().parent == out_dir.resolve() else None
@@ -784,6 +838,7 @@ def _process_item(
                 history=history, item_url=item_url, post_date=post_date, out_dir=out_dir,
                 browser_sem=browser_sem, max_open_download_pages=opts.max_open_download_pages,
                 minimize_window=opts.background, force=force, prev_output=prev_output,
+                max_duration_seconds=opts.streaming_max_duration_seconds,
             )
 
 
@@ -815,6 +870,7 @@ def _process_item(
                 history=history, item_url=item_url, post_date=post_date, out_dir=out_dir,
                 browser_sem=browser_sem, max_open_download_pages=opts.max_open_download_pages,
                 minimize_window=opts.background, force=force, prev_output=prev_output,
+                max_duration_seconds=opts.streaming_max_duration_seconds,
             )
         if r.get("fatal"):
             res.update(status="failed", fatal=True)
@@ -1121,6 +1177,8 @@ def run_target(
                 status = "ok"
             elif all(r["status"] == "skipped_short" for r in items):
                 status = "skipped_short"
+            elif all(r["status"] == "skipped_long" for r in items):
+                status = "skipped_long"
             else:
                 status = "skipped"
             # 여러 영상 글: 전부 처리되면 글 단위 기록을 남겨 다음 실행에서 탐색 자체를 생략
@@ -1130,7 +1188,11 @@ def run_target(
                     history.record_success(url, name, first_out or "", post_date=post_date,
                                            extra={"videos": n_total})
                 else:
-                    history.record_skipped(url, name, "all videos are short", post_date=post_date)
+                    any_long = any(r["status"] == "skipped_long" for r in items)
+                    history.record_skipped(
+                        url, name, "all videos skipped by duration limits" if any_long else "all videos are short",
+                        post_date=post_date, status="skipped_long" if any_long else "skipped_short",
+                    )
         entry["status"] = status
         return entry
     finally:
@@ -1400,7 +1462,7 @@ def _summarize_report(report: list[dict] | None) -> tuple[str, str | None, str |
         return "OK", None, None
     stage_of = {"no_media_found": "media_discovery", "no_main_found": "classification", "error": "exception",
                 "failed": "download", "partial": "download"}
-    good = {"ok", "skipped", "skipped_short"}
+    good = {"ok", "skipped", "skipped_short", "skipped_long"}
     bad = [r for r in report if r.get("status") not in good]
     if not bad:
         return "OK", None, None
@@ -1421,6 +1483,8 @@ def _summarize_report(report: list[dict] | None) -> tuple[str, str | None, str |
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="비디오 자동 탐색 및 일괄 다운로드 파이프라인")
 
+    parser.add_argument("--config", type=Path, default=ROOT / "config.yaml",
+                        help="공통 설정 파일 경로 (기본값: config.yaml)")
     parser.add_argument("--targets", type=Path, default=ROOT / "targets.yaml",
                         help="targets.yaml 설정 파일 경로 (기본값: targets.yaml)")
     parser.add_argument("--only", metavar="NAME", help="특정 target name만 실행")
@@ -1931,13 +1995,19 @@ def main() -> None:
     except Exception:
         pass
 
-    args = _build_parser().parse_args()
+    parser = _build_parser()
+    args = parser.parse_args()
+    try:
+        streaming_max_duration_seconds = _load_config(args.config)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        parser.error(f"설정 파일 오류: {exc}")
     headless = not args.headful
 
     # 진단 세션은 기본 활성화: 성공/실패/예외/중단 어떤 경로로 끝나도 summary.json 이 남는다.
     diag = init_diagnostics(LOG_DIR, retain=args.log_retain, meta={
         "mode": "manual_playback" if args.manual_playback else "url" if args.url else "crawl" if args.crawl else "discover_only" if args.discover_only else "targets",
         "workers": args.workers, "attempts": args.attempts, "skip_under": args.skip_under,
+        "streaming_max_duration_seconds": streaming_max_duration_seconds,
         "max_download_pages": args.max_download_pages,
         "headless": headless, "proxy": bool(args.proxy), "force": args.force, "env": _env_info(),
     })
@@ -1959,6 +2029,7 @@ def main() -> None:
             stall_timeout=args.stall_timeout,
             require_file=args.verify_files,
             skip_under=max(0.0, args.skip_under),
+            streaming_max_duration_seconds=streaming_max_duration_seconds,
             cooldown_hours=max(0.0, args.cooldown_hours),
             cooldown_after=max(1, args.cooldown_after),
             history_dir=args.history_dir,

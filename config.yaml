@@ -1,0 +1,2 @@
+# 스트리밍 영상 재생 길이 제한(초). 0이면 제한하지 않습니다.
+streaming_max_duration_seconds: 7200

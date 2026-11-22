@@ -11,6 +11,7 @@ Turnstile 토큰은 주입하지 않는다.
 from __future__ import annotations
 
 import html
+import math
 import re
 import threading
 from contextlib import ExitStack, contextmanager
@@ -20,7 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from diagnostics import log_event, mask_text
 from playback_capture import PlaybackCapture
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Error as PlaywrightError, Page, sync_playwright
 from progress import log
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
@@ -40,6 +41,7 @@ BUTTON_DECISION_MS = 30_000
 ENABLE_STREAMING_FALLBACK = True
 # 스트리밍은 버튼 판정과 별개다. 본편 바이트가 끝날 때까지 두되, 무한 대기는 막는다.
 CAPTURE_MAX_SECONDS = 3 * 60 * 60
+DEFAULT_STREAMING_MAX_DURATION_SECONDS = 2 * 60 * 60
 _PRIME_ROUNDS = 4
 _PRIME_PLAYER_JS = """() => {
     const sels = ['#overlay', '#playback', '#player-button', '.play-button', '.vjs-big-play-button',
@@ -400,6 +402,31 @@ def streaming_stop_reason(
     return ""
 
 
+def _player_duration(page, capture) -> float | None:
+    try:
+        urls = capture.observed_media_urls()
+        if not isinstance(urls, list) or not urls:
+            return None
+        handle = page.query_selector("#player_frame")
+        frame = handle.content_frame() if handle is not None else None
+        if frame is None:
+            return None
+        value = frame.evaluate("""(urls) => {
+            const videos = document.querySelectorAll('video');
+            if (videos.length !== 1) return null;
+            const src = (videos[0].currentSrc || videos[0].src || '').split('#')[0];
+            if (!urls.includes(src)) return null;
+            const duration = videos[0].duration;
+            return Number.isFinite(duration) && duration > 0 ? duration : null;
+        }""", urls)
+    except PlaywrightError as exc:
+        log_event("playback_capture", "duration_read_failed", mask_text(str(exc)), level="WARNING")
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+        return float(value)
+    return None
+
+
 def _capture_until_full(
     page,
     capture,
@@ -407,6 +434,7 @@ def _capture_until_full(
     popup_watch: _AdPopupWatch | None = None,
     on_started: Callable[[], None] | None = None,
     cancel_event=None,
+    max_duration_seconds: float = DEFAULT_STREAMING_MAX_DURATION_SECONDS,
 ) -> None:
     """버튼이 없다고 판정한 뒤의 스트리밍 수신이다. 이후 버튼이 생겨도 download 페이지로 바꾸지 않는다."""
     import time
@@ -424,6 +452,14 @@ def _capture_until_full(
             return
         if popup_watch is not None:
             popup_watch.close()
+        if max_duration_seconds > 0:
+            duration = _player_duration(page, capture)
+            if duration is not None:
+                capture.video_duration = duration
+                if duration >= max_duration_seconds:
+                    capture.stop_reason = "duration_limit"
+                    log(f"  [재생 캡처] 영상 길이 {duration:.1f}초가 상한 {max_duration_seconds:.1f}초 이상이므로 건너뜁니다.")
+                    return
         capture.attach_frames(page)
         reload = getattr(capture, "reload_untracked_player", None)
         if reload is not None and reload() is True:
@@ -571,6 +607,7 @@ def open_download_handoff(
     max_concurrent_handoffs: int = MAX_CONCURRENT_HANDOFFS,
     minimize_window: bool = False,
     cancel_event=None,
+    max_duration_seconds: float = DEFAULT_STREAMING_MAX_DURATION_SECONDS,
 ) -> dict[str, Any]:
     """30초 안에 download 버튼이 있으면 download 페이지로 연결하고, 없으면 다운로드 불가로 처리한다.
 
@@ -660,7 +697,10 @@ def open_download_handoff(
                             }
                         log(f"  [분기] {decision_ms // 1000}초 안에 download 버튼이 없어 스트리밍 다운로드를 유지합니다.")
                         with _protect_capture(slug):
-                            _capture_until_full(wrapper, capture, popup_watch=popup_watch, on_started=release_start, cancel_event=cancel_event)
+                            _capture_until_full(
+                                wrapper, capture, popup_watch=popup_watch, on_started=release_start,
+                                cancel_event=cancel_event, max_duration_seconds=max_duration_seconds,
+                            )
                         keep_capture = True
                         playback = capture.summary()
                         saved = len((playback or {}).get("files") or [])
@@ -682,6 +722,8 @@ def open_download_handoff(
                         return {
                             "ok": True,
                             "no_download_button": True,
+                            "skipped_long": capture.stop_reason == "duration_limit",
+                            "duration": getattr(capture, "video_duration", None),
                             "reused": False,
                             "slug": slug,
                             "download_page": None,

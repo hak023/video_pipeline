@@ -104,6 +104,7 @@ _SW_PLAYER = """<!doctype html><title>player</title><body><script>
     }
     const v = document.createElement('video');
     v.muted = true;
+    if (q.has('test_duration')) Object.defineProperty(v, 'duration', {value: Number(q.get('test_duration'))});
     v.src = `http://127.0.0.1:%d/mediastorage/${Date.now()}/token/%d.mp4`
         + `#real=/real.mp4&delay=${q.get('delay') || 0}&hold=${q.get('hold') || 0}`;
     document.body.appendChild(v);
@@ -211,6 +212,21 @@ class ServiceWorkerPlaybackTests(unittest.TestCase):
         playback = outcome.get("playback") or {}
         self.assertTrue(playback.get("complete"), outcome)
         self.assertEqual(Path(playback["output"]).read_bytes(), self.real)
+
+    def test_handoff_skips_video_at_configured_duration(self):
+        import contextlib
+        import openx_handoff
+
+        with mock.patch.object(openx_handoff, "log"):
+            outcome = openx_handoff.open_download_handoff(
+                self.embed + "&delay=300&hold=4000&test_duration=7200", page_url=self.article,
+                cdp_url=f"http://127.0.0.1:{self.cdp_port}", timeout_ms=3000,
+                playwright=contextlib.nullcontext(self.playwright), capture_dir=self.tmp / "capture",
+                max_duration_seconds=7200,
+            )
+        self.assertTrue(outcome.get("skipped_long"), outcome)
+        self.assertEqual(outcome.get("duration"), 7200)
+        self.assertEqual(outcome["playback"]["stop_reason"], "duration_limit")
 
     def test_media_requested_before_cdp_attach_is_recovered_by_reloading_player(self):
         import openx_handoff
