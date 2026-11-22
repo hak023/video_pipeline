@@ -323,6 +323,8 @@ def _log_playback(item_name: str, playback: dict | None, item_url: str = "") -> 
         reasons[key] = reasons.get(key, 0) + 1
     if reasons:
         log("    건너뜀 사유: " + ", ".join(f"{key}={count}" for key, count in reasons.items()))
+    for item in (entry for entry in skipped if entry.get("detail")):
+        log(f"    오류 상세: {item.get('reason') or '?'}: {mask_text(str(item['detail']))}")
     shown = 0
     for sample in playback.get("response_samples") or []:
         if shown >= 8:

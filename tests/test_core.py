@@ -534,5 +534,264 @@ class FailClosedAndDiagnosticsTests(unittest.TestCase):
         self.assertEqual(debug["iframe_match"]["reason_detail"], "dom_no_iframes")
 
 
+class PlaybackStreamingProgressTests(unittest.TestCase):
+    def test_trace_is_bounded_and_errors_remain_in_event_log(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            with mock.patch.object(playback_capture, "log_event") as log_event:
+                for index in range(201):
+                    capture._trace("cdp_request", request_id=str(index))
+                capture._trace("cdp_stream_error", request_id="last", error="failed")
+                summary = capture.summary()
+            self.assertEqual(len(summary["capture_trace"]), 200)
+            self.assertEqual(summary["capture_trace_dropped"], 2)
+            self.assertEqual(summary["capture_trace"][0]["request_id"], "2")
+            self.assertTrue(any(call.args[:2] == ("playback_capture", "trace_cdp_stream_error")
+                                for call in log_event.call_args_list))
+
+    def test_trace_correlates_cdp_errors_and_masks_secrets_in_persisted_logs(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            diag = dg.Diagnostics(root / "logs", run_id="capture-test", retain=0)
+            capture = playback_capture.PlaybackCapture(root / "capture")
+            session = mock.Mock()
+            sid = id(session)
+            url = "https://cdn.test/video.mp4?token=SECRET_TOKEN"
+            with mock.patch.object(dg, "_current", diag):
+                capture._wire_session(session)
+                capture._on_cdp_request(sid, {
+                    "requestId": "123", "type": "Media",
+                    "request": {"url": url, "method": "GET", "headers": {"Range": "bytes=0-3"}},
+                })
+                capture._on_cdp_response(sid, {
+                    "requestId": "123", "type": "Media",
+                    "response": {"url": url, "status": 206, "mimeType": "video/mp4",
+                                 "headers": {"content-range": "bytes 0-3/4"}},
+                })
+                session.send.side_effect = RuntimeError(f"Protocol error: {url}")
+                capture.drain()
+                capture._on_cdp_data(sid, {"requestId": "123", "dataLength": 4})
+                capture._on_cdp_failed(sid, {
+                    "requestId": "123", "errorText": "net::ERR_ABORTED", "canceled": True,
+                })
+                summary = capture.summary()
+            trace = summary["capture_trace"]
+            relevant = [entry for entry in trace if entry.get("request_id") == "123"]
+            self.assertEqual([entry["event"] for entry in relevant],
+                             ["cdp_request", "cdp_response", "cdp_stream_error", "cdp_loading_failed"])
+            self.assertTrue(all(entry["session_id"] == sid for entry in relevant))
+            self.assertEqual(relevant[1]["status"], 206)
+            self.assertEqual(relevant[-1]["network_data_bytes"], 4)
+            self.assertEqual(relevant[-1]["payload_bytes"], 0)
+            self.assertEqual(relevant[-1]["error"], "net::ERR_ABORTED")
+            events = (diag.dir / "events.jsonl").read_text(encoding="utf-8")
+            manifest = (capture.out_dir / "playback_capture.json").read_text(encoding="utf-8")
+            self.assertIn("trace_cdp_stream_error", events)
+            self.assertNotIn("SECRET_TOKEN", events)
+            self.assertNotIn("SECRET_TOKEN", manifest)
+            self.assertNotIn("SECRET_TOKEN", json.dumps(trace))
+
+    def test_body_error_is_recorded_even_when_fallback_succeeds(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            session = mock.Mock()
+            session.send.side_effect = RuntimeError("response body unavailable")
+            item = {"session": session, "sid": 42, "request_id": "id", "url": "https://cdn.test/video.mp4",
+                    "status": 206, "content_type": "video/mp4", "content_range": "bytes 0-3/4",
+                    "request_range": "bytes=0-3", "resource_type": "media", "claim": ""}
+            with mock.patch.object(capture, "_fetch_media_direct", return_value=b"data"):
+                capture._read_cdp_body(item)
+            entries = capture.summary()["capture_trace"]
+            self.assertEqual([entry["event"] for entry in entries], ["cdp_body_error", "cdp_body_result"])
+            self.assertEqual(entries[0]["error"], "response body unavailable")
+            self.assertEqual(entries[1]["source"], "fallback")
+            self.assertEqual(entries[1]["bytes"], 4)
+
+    def test_browser_fallback_uses_valid_range_after_direct_failure(self):
+        import base64
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            capture._page = mock.Mock()
+            capture._page.is_closed.return_value = False
+            capture._page.evaluate.return_value = {
+                "body": base64.b64encode(b"abcd").decode(), "status": 206, "range": "bytes 0-3/8",
+            }
+            with mock.patch("urllib.request.urlopen", side_effect=OSError("connection failed")):
+                body = capture._fetch_media_direct("https://cdn.test/video.mp4", "bytes 0-3/8")
+            self.assertEqual(body, b"abcd")
+            self.assertEqual(capture._page.evaluate.call_args.args[1][1], "bytes=0-3")
+
+    def test_failed_request_without_response_does_not_start_direct_download(self):
+        import playback_capture
+
+        capture = playback_capture.PlaybackCapture(Path("unused"))
+        with mock.patch.object(capture, "_start_direct_media_download") as start:
+            capture._on_cdp_request(1, {
+                "requestId": "1", "type": "Media",
+                "request": {"url": "https://cdn.test/video.mp4", "headers": {}},
+            })
+            capture._on_cdp_failed(1, {"requestId": "1", "errorText": "net::ERR_ABORTED"})
+        start.assert_not_called()
+
+    def test_partial_direct_download_is_not_complete_when_length_unknown(self):
+        import playback_capture
+
+        capture = playback_capture.PlaybackCapture(Path("unused"))
+        capture._direct_download_url = "https://cdn.test/video.mp4"
+        capture._direct_bytes = 12
+        capture._direct_total = 0
+        self.assertFalse(capture.media_progress()["complete"])
+
+    def test_direct_download_requires_a_complete_range_from_zero(self):
+        import playback_capture
+
+        for response_range, complete in (("bytes 0-3/4", True), ("bytes 2-3/4", False)):
+            with self.subTest(response_range=response_range), tempfile.TemporaryDirectory() as directory:
+                capture = playback_capture.PlaybackCapture(Path(directory))
+                url = "https://cdn.test/video.mp4"
+                capture._direct_download_url = url
+                capture._direct_total = 4
+                capture._direct_path = Path(directory) / "media_stream.mp4"
+                response = mock.MagicMock()
+                response.status = 206
+                response.headers = {"Content-Range": response_range}
+                response.read.side_effect = [b"abcd", b""]
+                response.__enter__.return_value = response
+                with mock.patch("urllib.request.urlopen", return_value=response):
+                    capture._run_direct_download(url, "bytes 0-3/4", "video/mp4",
+                                                 capture._direct_path, "")
+                self.assertEqual(capture.media_progress()["complete"], complete)
+                self.assertEqual(bool(capture.assemble()), complete)
+
+    def test_preflight_is_not_treated_as_a_media_body(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            session = mock.Mock()
+            capture._wire_session(session)
+            session.reset_mock()
+            sid = id(session)
+            url = "https://storage.googleapis.com/bucket/video.mp4"
+            capture._on_cdp_request(sid, {
+                "requestId": "preflight", "type": "Preflight",
+                "request": {"url": url, "method": "OPTIONS", "headers": {}},
+            })
+            capture._on_cdp_response(sid, {
+                "requestId": "preflight", "type": "Preflight",
+                "response": {"url": url, "status": 200, "mimeType": "text/html", "headers": {}},
+            })
+            capture.drain()
+            capture._on_cdp_finished(session, sid, {"requestId": "preflight"})
+            capture.drain()
+            session.send.assert_not_called()
+            self.assertEqual(capture.media_seen, 0)
+            self.assertEqual(capture.skipped_count, 0)
+
+    def test_cdp_failure_details_are_recorded_and_masked(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            session = mock.Mock()
+            capture._wire_session(session)
+            sid = id(session)
+            url = "https://cdn.test/video.mp4"
+            capture._on_cdp_request(sid, {
+                "requestId": "1", "type": "Media", "request": {"url": url, "headers": {}},
+            })
+            capture._on_cdp_response(sid, {
+                "requestId": "1", "type": "Media",
+                "response": {"url": url, "status": 206, "mimeType": "video/mp4", "headers": {}},
+            })
+            session.send.side_effect = RuntimeError(
+                "Protocol error: stream unavailable https://cdn.test/file?token=SECRET_TOKEN"
+            )
+            capture.drain()
+            self.assertIn("Protocol error: stream unavailable", capture.cache_error)
+            self.assertNotIn("SECRET_TOKEN", capture.cache_error)
+            capture._on_cdp_failed(sid, {
+                "requestId": "1", "errorText": "net::ERR_ABORTED", "canceled": True,
+            })
+            self.assertEqual(capture.skipped[0]["status"], 206)
+            self.assertIn("net::ERR_ABORTED", capture.skipped[0]["detail"])
+            self.assertIn("canceled=True", capture.skipped[0]["detail"])
+
+    def test_streamed_chunks_are_counted_before_response_finishes(self):
+        import base64
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            session = mock.Mock()
+            session.send.return_value = {"bufferedData": base64.b64encode(b"video").decode()}
+            capture._wire_session(session)
+            sid = id(session)
+            capture._on_cdp_request(sid, {
+                "requestId": "1", "type": "Media",
+                "request": {"url": "https://cdn.test/video.mp4", "headers": {}},
+            })
+            capture._on_cdp_response(sid, {
+                "requestId": "1", "type": "Media",
+                "response": {"url": "https://cdn.test/video.mp4", "status": 200,
+                             "mimeType": "video/mp4", "headers": {"content-length": "8"}},
+            })
+            capture.drain()
+            self.assertEqual(capture.media_progress()["stream_bytes"], 5)
+            capture._on_cdp_data(sid, {"requestId": "1", "data": base64.b64encode(b"123").decode()})
+            capture.drain()
+            progress = capture.media_progress()
+            self.assertEqual(progress["stream_bytes"], 8)
+            self.assertFalse(progress["complete"])
+            capture._on_cdp_finished(session, sid, {"requestId": "1"})
+            capture.drain()
+            self.assertTrue(capture.media_progress()["complete"])
+            self.assertEqual(Path(capture.files[0]["path"]).read_bytes(), b"video123")
+
+    def test_stream_growth_and_repeated_headers_affect_timeout_correctly(self):
+        import openx_handoff
+
+        for growing in (True, False):
+            with self.subTest(growing=growing):
+                capture = mock.Mock(media_seen=int(growing), tap_inflight=0, tap_bytes=0,
+                                    stop_reason="", cache_error="")
+                page = mock.Mock()
+                clock = [0.0]
+                stream_bytes = [0]
+                confirmations = []
+                capture.media_progress.side_effect = lambda: {
+                    "covered": 0, "total": 0, "complete": False, "stream_bytes": stream_bytes[0],
+                }
+
+                def wait(ms):
+                    clock[0] = round(clock[0] + ms / 1000, 3)
+                    if growing and clock[0] <= 90 and clock[0] % 30 == 0:
+                        stream_bytes[0] += 6 * 1024 * 1024
+                    if not growing:
+                        capture.media_seen += 1
+
+                page.wait_for_timeout.side_effect = wait
+                with mock.patch("time.monotonic", side_effect=lambda: clock[0]), mock.patch.object(openx_handoff, "log"):
+                    openx_handoff._capture_until_full(
+                        page, capture, max_seconds=125,
+                        on_started=lambda: confirmations.append(clock[0]),
+                    )
+                if growing:
+                    self.assertEqual(confirmations, [30])
+                    self.assertEqual(capture.stop_reason, "limit")
+                else:
+                    self.assertEqual(confirmations, [])
+                    self.assertEqual(capture.stop_reason, "media_unreadable")
+                    self.assertEqual(clock[0], 90)
+
+
 if __name__ == "__main__":
     unittest.main()

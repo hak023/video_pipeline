@@ -320,6 +320,9 @@ def _wait_for_download_button(
         except Exception as exc:
             err_name = type(exc).__name__
             err_msg = str(exc).lower()
+            log_event("playback_capture", "page_wait_failed",
+                      f"{err_name}: {mask_text(str(exc))[:300]}", level="ERROR",
+                      capture_dir=str(getattr(capture, "out_dir", "")))
             if "TargetClosed" in err_name or "target closed" in err_msg:
                 if capture is not None:
                     capture.stop_reason = "target_closed"
@@ -345,6 +348,7 @@ def streaming_stop_reason(
     media_seen: int,
     inflight: int,
     tap_bytes: int = 0,
+    stream_bytes: int = 0,
 ) -> str:
     """수신이 멈춘 이유. 빈 문자열이면 계속 기다린다.
 
@@ -355,11 +359,11 @@ def streaming_stop_reason(
         return ""
     if complete and quiet >= 3:
         return "complete"
-    if quiet >= 90 and total and covered < total:
+    if quiet >= 90 and (covered > 0 or tap_bytes > 0 or stream_bytes > 0 or total):
         return "stalled"
-    if quiet >= 45 and covered <= 0 and media_seen <= 0 and tap_bytes <= 0:
+    if quiet >= 45 and media_seen <= 0 and not (covered or total or tap_bytes or stream_bytes):
         return "no_media"
-    if quiet >= 90 and covered <= 0 and (media_seen > 0 or tap_bytes > 0):
+    if quiet >= 90 and not (covered or total or tap_bytes or stream_bytes):
         return "media_unreadable"
     return ""
 
@@ -379,7 +383,6 @@ def _capture_until_full(
     last_signature = None
     quiet_since = time.monotonic()
     last_log = 0.0
-    first_received = None
     # 이 탭을 앞으로 가져오면 다른 재생 탭이 백그라운드로 내려가 요청이 멈출 수 있다.
     log("  [재생 캡처] 다른 재생 탭을 멈추지 않도록 이 탭을 앞으로 가져오지 않습니다.")
     while time.monotonic() < deadline:
@@ -389,21 +392,16 @@ def _capture_until_full(
             return
         if popup_watch is not None:
             popup_watch.close()
-        try:
-            capture.attach_frames(page)
-        except Exception:
-            pass
-        try:
-            capture.drain()
-        except Exception:
-            pass
+        capture.attach_frames(page)
+        capture.drain()
         progress = capture.media_progress()
         covered = int(progress.get("covered") or 0)
         total = int(progress.get("total") or 0)
         media_seen = int(getattr(capture, "media_seen", 0) or 0)
         inflight = int(getattr(capture, "tap_inflight", 0) or 0)
         tap_bytes = int(getattr(capture, "tap_bytes", 0) or 0)
-        received = max(covered, tap_bytes)
+        stream_bytes = int(progress.get("stream_bytes") or 0)
+        received = max(covered, tap_bytes, stream_bytes)
         MIN_STREAM_START_BYTES = 5 * 1024 * 1024
         if on_started is not None:
             if progress.get("complete") or received >= MIN_STREAM_START_BYTES:
@@ -414,7 +412,7 @@ def _capture_until_full(
                 log("  [순차 시작] 미디어 수신 완료를 확인했습니다. 다음 재생 탭의 시작을 허용합니다.")
                 on_started()
                 on_started = None
-        signature = (covered, total, progress.get("file_count"), media_seen, inflight, tap_bytes)
+        signature = (covered, tap_bytes, stream_bytes)
         now = time.monotonic()
         if signature != last_signature:
             last_signature = signature
@@ -428,6 +426,7 @@ def _capture_until_full(
             media_seen=media_seen,
             inflight=inflight,
             tap_bytes=tap_bytes,
+            stream_bytes=stream_bytes,
         )
         if reason == "complete":
             log(f"  [재생 캡처] 본편 전체 수신 {covered}/{total} bytes")
@@ -435,16 +434,22 @@ def _capture_until_full(
             return
         if reason:
             capture.stop_reason = reason
-            log(f"  [재생 캡처] 중단 사유: {reason}. 받은 본문 {covered}/{total} bytes, 미디어 응답 {media_seen}건")
+            log(
+                f"  [재생 캡처] 중단 사유: {reason}. 받은 본문 {covered}/{total} bytes, "
+                f"스트림 수신 {stream_bytes} bytes, 미디어 응답 {media_seen}건, "
+                f"CDP 오류 {getattr(capture, 'cache_error', '') or '-'}"
+            )
             return
         if now - last_log >= 5:
             last_log = now
-            if total:
+            if stream_bytes > covered:
+                log(f"  [재생 캡처] 스트림 누적 수신 {stream_bytes} bytes, 완료된 본문 {covered}/{total} bytes")
+            elif total:
                 log(f"  [재생 캡처] 받는 중 {covered}/{total} bytes ({covered * 100 // total}%)")
             elif tap_bytes:
                 log(f"  [재생 캡처] 미디어 응답을 파일로 받는 중 {tap_bytes} bytes")
             else:
-                log(f"  [재생 캡처] 받는 중 {covered} bytes, 전체 길이 아직 모름")
+                log(f"  [재생 캡처] 받는 중 {covered} bytes, 전체 길이 아직 모름 (미디어 응답 {media_seen}건)")
         for _ in range(5):
             if cancel_event is not None and cancel_event.is_set():
                 capture.stop_reason = "cancelled"
@@ -553,8 +558,6 @@ def open_download_handoff(
                     browser = p.chromium.connect_over_cdp(cdp_url)
                     context = browser.contexts[0] if browser.contexts else browser.new_context()
                     session = _cdp_session(browser, context)
-                    if session is not None:
-                        _minimize_chrome_window(session)
                     existing = _matching_download_target(session, page_url)
                     if existing:
                         return {
@@ -564,13 +567,6 @@ def open_download_handoff(
                             "download_page": page_url,
                             "target_id": existing,
                         }
-                    # 이전에 남은 고아 about:blank 탭 정리
-                    try:
-                        for orphan in list(context.pages):
-                            if str(getattr(orphan, "url", "")).strip() in ("about:blank", ""):
-                                orphan.close()
-                    except Exception:
-                        pass
                     wrapper = context.new_page()
                     popup_watch = _AdPopupWatch(wrapper)
                     popup_cleanup.callback(popup_watch.stop)
