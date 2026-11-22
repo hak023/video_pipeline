@@ -139,6 +139,7 @@ class Options:
     passive_embed: bool = False       # 진단 모드: 임베드 탐색 시 라우팅/스크립트 주입 비활성화
     max_url_age: float = 300.0        # 후보 URL 발급 시각(경로 접두사 epoch-ms)이 이 초보다 오래됐으면 재탐색 (0 = 끄기)
     max_open_download_pages: int = MAX_OPEN_DOWNLOAD_PAGES  # 사용자 Chrome에 남겨 둘 download 탭 상한
+    background: bool = False          # 스트리밍 다운로드 시 Chrome 창을 최소화하여 PC 작업 방해 방지
 
 
 # ------------------------------------------------------------------ names
@@ -349,6 +350,7 @@ def _finish_with_openx_handoff(
     res: dict, group: dict, item_name: str, prior_reason: str, page_url: str = "",
     history=None, item_url: str = "", post_date: str | None = None, out_dir: Path | None = None,
     browser_sem=None, max_open_download_pages: int = MAX_OPEN_DOWNLOAD_PAGES,
+    minimize_window: bool = False,
 ) -> dict:
     """403 이면 30초 안에 download 버튼을 확인한다.
 
@@ -364,6 +366,8 @@ def _finish_with_openx_handoff(
         embed, page_url=page_url, capture_dir=capture_dir,
         max_open_download_pages=max_open_download_pages,
         max_concurrent_handoffs=MAX_CONCURRENT_HANDOFFS,
+        minimize_window=minimize_window,
+        cancel_event=CANCEL,
     )
     playback = outcome.get("playback") or {}
     if outcome.get("ok") and outcome.get("no_download_button"):
@@ -706,6 +710,7 @@ def _process_item(
                 res, group, item_name, reason, page_url=url,
                 history=history, item_url=item_url, post_date=post_date, out_dir=out_dir,
                 browser_sem=browser_sem, max_open_download_pages=opts.max_open_download_pages,
+                minimize_window=opts.background,
             )
 
 
@@ -736,6 +741,7 @@ def _process_item(
                 res, group, item_name, str(r.get("reason") or "HTTP 403"), page_url=url,
                 history=history, item_url=item_url, post_date=post_date, out_dir=out_dir,
                 browser_sem=browser_sem, max_open_download_pages=opts.max_open_download_pages,
+                minimize_window=opts.background,
             )
         if r.get("fatal"):
             res.update(status="failed", fatal=True)
@@ -1106,8 +1112,9 @@ def _run_batch(
     ex = ThreadPoolExecutor(max_workers=max(1, opts.workers))
     futs = [ex.submit(work, i, t) for i, t in enumerate(targets)]
     try:
-        for _ in as_completed(futs):
-            pass
+        while not all(f.done() for f in futs):
+            if CANCEL.wait(0.3):
+                break
     except KeyboardInterrupt:
         CANCEL.set()
         log("\n[중단] Ctrl+C 감지 - 진행 중인 작업을 정리합니다...")
@@ -1360,6 +1367,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--proxy", metavar="PROXY_URL", help="HTTP/SOCKS5 프록시 URL")
     parser.add_argument("--headful", action="store_true", help="브라우저 창을 띄워 실행")
+    parser.add_argument("--background", action="store_true", help="스트리밍 다운로드 시 Chrome 창을 최소화하여 PC 작업을 방해하지 않도록 합니다")
     parser.add_argument("--force", action="store_true", help="중복 검사를 무시하고 강제 재다운로드")
 
     parser.add_argument("--workers", type=int, default=5, help="동시에 처리할 게시글 수 (기본값: 5, Chrome 스트리밍은 최대 5개)")
@@ -1886,6 +1894,7 @@ def main() -> None:
             passive_embed=args.passive_embed,
             max_url_age=args.max_url_age,
             max_open_download_pages=max(0, args.max_download_pages),
+            background=args.background,
         )
         report = _dispatch(args, opts, headless)
         status, f_stage, f_reason = _summarize_report(report)
