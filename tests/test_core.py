@@ -535,6 +535,114 @@ class FailClosedAndDiagnosticsTests(unittest.TestCase):
 
 
 class PlaybackStreamingProgressTests(unittest.TestCase):
+    def test_stream_error_recovers_in_player_frame_without_loading_finished(self):
+        import base64
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            session = mock.Mock()
+            session.send.side_effect = RuntimeError("Request with the provided ID does not exists")
+            capture._wire_session(session)
+            sid = id(session)
+            url = "https://cdn.test/video.mp4"
+            frame = mock.Mock()
+            frame.evaluate.side_effect = [
+                {"status": 206, "content_range": "bytes 0-3/8", "body": base64.b64encode(b"abcd").decode()},
+                {"status": 206, "content_range": "bytes 4-7/8", "body": base64.b64encode(b"efgh").decode()},
+            ]
+            request = mock.Mock(url=url, resource_type="media", headers={"range": "bytes=0-"}, method="GET",
+                                frame=frame)
+            response = mock.Mock(url=url, status=206, request=request,
+                                 headers={"content-type": "video/mp4", "content-range": "bytes 0-7/8"})
+            with mock.patch.object(capture, "_start_direct_media_download"), \
+                    mock.patch.object(playback_capture, "BROWSER_FALLBACK_CHUNK_BYTES", 4):
+                capture._on_response(response)
+                capture._on_cdp_response(sid, {
+                    "requestId": "1", "type": "Media",
+                    "response": {"url": url, "status": 206, "mimeType": "video/mp4",
+                                 "headers": {"content-range": "bytes 0-7/8"}},
+                })
+                capture.drain()
+                frame.evaluate.assert_not_called()
+                capture.drain(allow_browser_fallback=True)
+                self.assertFalse(capture.media_progress()["complete"])
+                capture.drain(allow_browser_fallback=True)
+            result = capture.summary()
+            self.assertTrue(result["complete"])
+            self.assertEqual(Path(result["output"]).read_bytes(), b"abcdefgh")
+            self.assertEqual(frame.evaluate.call_args_list[0].args[1], [url, 0, 3])
+            self.assertEqual(frame.evaluate.call_args_list[1].args[1], [url, 4, 7])
+
+    def test_stream_recovery_rejects_mismatched_range(self):
+        import base64
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            session = mock.Mock()
+            session.send.side_effect = RuntimeError("stream unavailable")
+            capture._wire_session(session)
+            sid = id(session)
+            url = "https://cdn.test/video.mp4"
+            frame = mock.Mock()
+            frame.evaluate.return_value = {
+                "status": 206, "content_range": "bytes 4-7/8", "body": base64.b64encode(b"abcd").decode(),
+            }
+            request = mock.Mock(url=url, resource_type="media", headers={}, method="GET", frame=frame)
+            response = mock.Mock(url=url, status=206, request=request,
+                                 headers={"content-type": "video/mp4", "content-range": "bytes 0-7/8"})
+            with mock.patch.object(capture, "_start_direct_media_download"), \
+                    mock.patch.object(playback_capture, "BROWSER_FALLBACK_CHUNK_BYTES", 4):
+                capture._on_response(response)
+                capture._on_cdp_response(sid, {"requestId": "1", "type": "Media", "response": {
+                    "url": url, "status": 206, "mimeType": "video/mp4",
+                    "headers": {"content-range": "bytes 0-7/8"},
+                }})
+                capture.drain(allow_browser_fallback=True)
+                capture.drain(allow_browser_fallback=True)
+            self.assertEqual(capture.files, [])
+            self.assertEqual(frame.evaluate.call_count, 1)
+            self.assertTrue(any(entry["event"] == "browser_stream_error" for entry in capture.summary()["capture_trace"]))
+
+    def test_partial_direct_failure_preserves_completed_browser_ranges(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            url = "https://cdn.test/video.mp4"
+            capture._direct_download_url = url
+            capture._direct_path = Path(directory) / "media_stream.mp4"
+            capture._direct_total = 8
+            capture._store(url, 206, "video/mp4", "bytes 0-3/8", "bytes=0-3", b"abcd", "media")
+            capture._store(url, 206, "video/mp4", "bytes 4-7/8", "bytes=4-7", b"efgh", "media")
+            response = mock.MagicMock(status=206, headers={"Content-Range": "bytes 0-7/8"})
+            response.read.side_effect = [b"ab", OSError("connection lost")]
+            with mock.patch("urllib.request.urlopen") as urlopen:
+                urlopen.return_value.__enter__.return_value = response
+                capture._run_direct_download(url, "bytes 0-7/8", "video/mp4", capture._direct_path, "")
+            result = capture.summary()
+            self.assertTrue(result["complete"], result)
+            self.assertEqual(Path(result["output"]).read_bytes(), b"abcdefgh")
+
+    def test_download_button_poll_timeouts_are_not_logged_as_errors(self):
+        import openx_handoff
+
+        page = mock.Mock()
+        locator = page.frame_locator.return_value.locator.return_value.first
+        clock = [0.0]
+
+        def wait_for(**kwargs):
+            clock[0] += kwargs["timeout"] / 1000
+            raise TimeoutError("button not present yet")
+
+        locator.wait_for.side_effect = wait_for
+        with mock.patch("time.monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(openx_handoff, "log_event") as log_event:
+            with self.assertRaises(TimeoutError):
+                openx_handoff._wait_for_download_button(page, 1200)
+        self.assertFalse(any(call.args[1] == "page_wait_failed" for call in log_event.call_args_list))
+
     def test_trace_is_bounded_and_errors_remain_in_event_log(self):
         import playback_capture
 

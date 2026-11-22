@@ -1,7 +1,7 @@
-"""재생 중 브라우저가 받은 미디어 바이트를 passive CDP Network 이벤트로 저장한다.
+"""재생 중 브라우저가 받은 미디어 바이트를 CDP Network 이벤트로 저장한다.
 
-요청은 가로채거나 변경하지 않는다. 응답 수신 중에는 Network.streamResourceContent로
-전달되는 데이터만 모으고, getResponseBody는 스트리밍 데이터를 얻지 못한 완료 응답에만 쓴다.
+기존 요청은 가로채거나 변경하지 않는다. CDP 스트림 연결이 실패하면 플레이어 프레임에서
+별도의 범위 요청을 시도한다.
 """
 from __future__ import annotations
 
@@ -30,6 +30,44 @@ _NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # Fetch interception pauses media responses. Keep the tap implementation available,
 # but do not use it in the normal browser capture path.
 ENABLE_CDP_MEDIA_TAP = False
+BROWSER_FALLBACK_CHUNK_BYTES = 1024 * 1024
+_BROWSER_RANGE_FETCH_JS = """async ([url, start, end]) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+        const response = await fetch(url, {
+            headers: {Range: `bytes=${start}-${end}`},
+            credentials: 'include',
+            signal: controller.signal,
+        });
+        if (response.status !== 206) throw new Error(`Range response HTTP ${response.status}`);
+        const contentRange = response.headers.get('content-range');
+        if (!contentRange) throw new Error('Content-Range is not exposed');
+        if (!response.body) throw new Error('Response body is unavailable');
+        const reader = response.body.getReader();
+        const chunks = [];
+        let length = 0;
+        while (true) {
+            const part = await reader.read();
+            if (part.done) break;
+            length += part.value.length;
+            if (length > end - start + 1) {
+                controller.abort();
+                throw new Error('Range response is larger than requested');
+            }
+            chunks.push(part.value);
+        }
+        let binary = '';
+        for (const chunk of chunks) {
+            for (let i = 0; i < chunk.length; i += 8192) {
+                binary += String.fromCharCode(...chunk.subarray(i, i + 8192));
+            }
+        }
+        return {status: response.status, content_range: contentRange, body: btoa(binary)};
+    } finally {
+        clearTimeout(timer);
+    }
+}"""
 
 
 def is_media_target(url: str, content_type: str = "") -> bool:
@@ -250,6 +288,9 @@ class PlaybackCapture:
         self._stream_attempted: set[tuple[int, str]] = set()
         self._pending_chunks: list[tuple[int, str, bytes]] = []
         self._response_queue: list[Any] = []
+        self._media_frames: dict[str, Any] = {}
+        self._browser_fallback_queue: list[dict[str, Any]] = []
+        self._browser_fallback_urls: set[str] = set()
         self._pending_frames: list[Any] = []
         self._draining = False
         self._saved_logs = 0
@@ -443,6 +484,8 @@ class PlaybackCapture:
         self._stream_attempted.clear()
         self._pending_chunks.clear()
         self._response_queue.clear()
+        self._media_frames.clear()
+        self._browser_fallback_queue.clear()
         for path in self._chunk_paths.values():
             try:
                 path.unlink(missing_ok=True)
@@ -451,7 +494,7 @@ class PlaybackCapture:
         self._chunk_paths.clear()
         self._page = None
 
-    def drain(self) -> None:
+    def drain(self, *, allow_browser_fallback: bool = False) -> None:
         """이벤트 밖에서 CDP 명령과 파일 쓰기를 처리한다."""
         if self._draining:
             return
@@ -479,6 +522,8 @@ class PlaybackCapture:
                     continue
                 if response is not None:
                     self._read_response_body(response)
+            if allow_browser_fallback:
+                self._drain_browser_fallback()
         finally:
             self._draining = False
 
@@ -515,6 +560,7 @@ class PlaybackCapture:
                 d_complete = self._direct_complete
             groups[d_url] = {
                 "spans": [(0, d_bytes)],
+                "file_spans": [],
                 "total": d_total,
                 "status": 200 if d_complete else 206,
                 "size": d_bytes,
@@ -523,13 +569,14 @@ class PlaybackCapture:
             }
         for item in files:
             url = str(item.get("url") or "")
-            group = groups.setdefault(url, {"spans": [], "total": None, "status": 0, "size": 0, "item": item})
+            group = groups.setdefault(url, {"spans": [], "file_spans": [], "total": None, "status": 0, "size": 0, "item": item})
             group["size"] += int(item.get("size") or 0)
             status = int(item.get("status") or 0)
             if status == 200:
                 group["status"] = 200
                 group["total"] = int(item.get("size") or 0)
                 group["spans"] = [(0, group["total"])]
+                group["file_spans"] = [(0, group["total"])]
                 group["item"] = item
                 continue
             parsed = parse_byte_range(str(item.get("content_range") or ""))
@@ -542,6 +589,7 @@ class PlaybackCapture:
             if end <= start:
                 continue
             group["spans"].append((start, end))
+            group["file_spans"].append((start, end))
             if total is not None:
                 group["total"] = max(int(group["total"] or 0), total)
             if group["status"] != 200:
@@ -555,7 +603,10 @@ class PlaybackCapture:
         url, group = max(groups.items(), key=lambda pair: rank(pair[1]))
         total = int(group["total"] or 0)
         covered, gap_ratio = range_coverage(group["spans"], total or None)
-        complete = bool(total and gap_ratio is None and covered >= total and not group.get("pending"))
+        file_covered, file_gap = range_coverage(group["file_spans"], total or None)
+        complete = bool(total and gap_ratio is None and covered >= total and (
+            not group.get("pending") or (file_gap is None and file_covered >= total)
+        ))
         return {
             "complete": complete,
             "covered": covered,
@@ -1027,7 +1078,8 @@ class PlaybackCapture:
                     "truncated": not self._direct_complete,
                     "via": "direct_stream",
                 }
-                self.files = [f for f in self.files if f.get("url") != url]
+                if self._direct_complete:
+                    self.files = [f for f in self.files if f.get("url") != url]
                 self.files.append(item)
 
     def _fetch_media_direct(self, url: str, content_range: str = "", referer: str = "") -> bytes:
@@ -1130,6 +1182,58 @@ class PlaybackCapture:
                       capture_dir=str(self.out_dir))
             self._trace("cdp_stream_error", session_id=sid, request_id=request_id,
                         error_type=type(exc).__name__, error=mask_text(str(exc))[:300])
+            self._queue_browser_fallback(self._cdp_meta.get(key) or {})
+
+    def _queue_browser_fallback(self, slot: dict[str, Any]) -> None:
+        url = str(slot.get("url") or "")
+        parsed = parse_byte_range(str(slot.get("content_range") or ""))
+        if not url or url in self._browser_fallback_urls or parsed is None or not parsed[2]:
+            return
+        self._browser_fallback_urls.add(url)
+        self._browser_fallback_queue.append({
+            "url": url, "total": parsed[2], "offset": 0,
+            "content_type": str(slot.get("content_type") or ""),
+        })
+        self._trace("browser_stream_queued", url=mask_url(url), total=parsed[2])
+
+    def _drain_browser_fallback(self) -> None:
+        if not self._browser_fallback_queue:
+            return
+        item = self._browser_fallback_queue.pop(0)
+        url = item["url"]
+        progress = self.media_progress()
+        if progress["complete"] and progress["url"] == url:
+            return
+        frame = self._media_frames.get(url)
+        if frame is None:
+            if not item.get("waiting_for_frame"):
+                item["waiting_for_frame"] = True
+                self._trace("browser_stream_waiting_for_frame", url=mask_url(url))
+            self._browser_fallback_queue.append(item)
+            return
+        start = item["offset"]
+        end = min(start + BROWSER_FALLBACK_CHUNK_BYTES, item["total"]) - 1
+        try:
+            response = frame.evaluate(_BROWSER_RANGE_FETCH_JS, [url, start, end])
+            if not isinstance(response, dict) or response.get("status") != 206:
+                raise ValueError("invalid browser Range response")
+            content_range = str(response.get("content_range") or "")
+            parsed = parse_byte_range(content_range)
+            body = base64.b64decode(response.get("body") or "", validate=True)
+            if parsed != (start, end + 1, item["total"]) or len(body) != end - start + 1:
+                raise ValueError("browser Range response does not match the requested bytes")
+            self._store(url, 206, item["content_type"], content_range, f"bytes={start}-{end}", body, "media")
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {mask_text(str(exc))[:300]}"
+            self._trace("browser_stream_error", url=mask_url(url), request_range=f"bytes={start}-{end}",
+                        error=detail)
+            log_event("playback_capture", "browser_stream_error", detail, level="ERROR",
+                      capture_dir=str(self.out_dir), media_url=url)
+            return
+        self._trace("browser_stream_chunk", url=mask_url(url), content_range=content_range, bytes=len(body))
+        item["offset"] = end + 1
+        if item["offset"] < item["total"]:
+            self._browser_fallback_queue.append(item)
 
     def _on_cdp_response(self, sid: int, event: dict[str, Any]) -> None:
         self.cdp_responses += 1
@@ -1300,6 +1404,11 @@ class PlaybackCapture:
         )
         if interesting:
             self.media_seen += 1
+            try:
+                self._media_frames[url] = request.frame
+            except Exception as exc:
+                self._trace("media_frame_error", url=mask_url(url), error_type=type(exc).__name__,
+                            error=mask_text(str(exc))[:300])
         self._sample(self.response_samples, {
             "url": url,
             "status": status,

@@ -320,20 +320,26 @@ def _wait_for_download_button(
         except Exception as exc:
             err_name = type(exc).__name__
             err_msg = str(exc).lower()
-            log_event("playback_capture", "page_wait_failed",
-                      f"{err_name}: {mask_text(str(exc))[:300]}", level="ERROR",
-                      capture_dir=str(getattr(capture, "out_dir", "")))
             if "TargetClosed" in err_name or "target closed" in err_msg:
+                log_event("playback_capture", "page_wait_failed",
+                          f"{err_name}: {mask_text(str(exc))[:300]}", level="ERROR",
+                          capture_dir=str(getattr(capture, "out_dir", "")))
                 if capture is not None:
                     capture.stop_reason = "target_closed"
                 raise
             if err_name != "TimeoutError":
+                log_event("playback_capture", "page_wait_failed",
+                          f"{err_name}: {mask_text(str(exc))[:300]}", level="ERROR",
+                          capture_dir=str(getattr(capture, "out_dir", "")))
                 raise
             if time.monotonic() - started < 0.05 and remaining_ms > 500:
                 raise
             if popup_watch is not None:
                 popup_watch.close()
         if capture is not None:
+            attach = getattr(capture, "attach_frames", None)
+            if attach is not None:
+                attach(page)
             drain = getattr(capture, "drain", None)
             if drain is not None:
                 drain()
@@ -393,7 +399,7 @@ def _capture_until_full(
         if popup_watch is not None:
             popup_watch.close()
         capture.attach_frames(page)
-        capture.drain()
+        capture.drain(allow_browser_fallback=True)
         progress = capture.media_progress()
         covered = int(progress.get("covered") or 0)
         total = int(progress.get("total") or 0)

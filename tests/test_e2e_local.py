@@ -62,6 +62,101 @@ def _page(body: str) -> str:
     return f"<!doctype html><html><body>{body}</body></html>"
 
 
+@unittest.skipUnless(os.environ.get("RUN_PLAYBACK_CAPTURE") == "1" and resolve_chrome_channel(),
+                     "RUN_PLAYBACK_CAPTURE=1 및 Chrome 필요")
+class ServiceWorkerPlaybackTests(unittest.TestCase):
+    def test_browser_range_fallback_uses_player_service_worker(self):
+        import urllib.error
+        import urllib.request
+
+        import playback_capture
+        from media_tools import get_browser_launch_kwargs
+        from playwright.sync_api import sync_playwright
+
+        hits = []
+        worker = b"""
+            self.addEventListener('install', e => e.waitUntil(self.skipWaiting()));
+            self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+            self.addEventListener('fetch', e => {
+                if (new URL(e.request.url).pathname !== '/media/video.mp4') return;
+                const match = /^bytes=(\\d+)-(\\d+)$/.exec(e.request.headers.get('range') || '');
+                if (!match) return;
+                const start = Number(match[1]), end = Number(match[2]);
+                const data = new TextEncoder().encode('abcdefgh').slice(start, end + 1);
+                e.respondWith(new Response(data, {status: 206, headers: {
+                    'Content-Type': 'video/mp4',
+                    'Content-Range': `bytes ${start}-${end}/8`
+                }}));
+            });
+        """
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                if self.path == "/sw.js":
+                    status, ctype, body = 200, "application/javascript", worker
+                elif self.path == "/":
+                    status, ctype, body = 200, "text/html", b"<iframe name='player' src='/player'></iframe>"
+                elif self.path == "/player":
+                    status, ctype, body = 200, "text/html", b"<!doctype html><title>player</title>"
+                else:
+                    hits.append(self.path)
+                    status, ctype, body = 403, "text/plain", b"forbidden"
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        url = f"{base}/media/video.mp4"
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(url, timeout=5)
+        self.assertEqual(error.exception.code, 403)
+
+        with tempfile.TemporaryDirectory() as directory, sync_playwright() as p:
+            browser = p.chromium.launch(**get_browser_launch_kwargs(headless=True))
+            try:
+                page = browser.new_page()
+                page.goto(base)
+                frame = page.frame(name="player")
+                assert frame is not None
+                frame.evaluate("async () => { await navigator.serviceWorker.register('/sw.js'); await navigator.serviceWorker.ready; }")
+                frame.wait_for_function("() => !!navigator.serviceWorker.controller", timeout=10000)
+                capture = playback_capture.PlaybackCapture(Path(directory))
+                capture.install(page)
+                request = mock.Mock(url=url, resource_type="media", headers={"range": "bytes=0-"},
+                                    method="GET", frame=frame)
+                response = mock.Mock(url=url, status=206, request=request,
+                                     headers={"content-type": "video/mp4", "content-range": "bytes 0-7/8"})
+                session = mock.Mock()
+                session.send.side_effect = RuntimeError("Request with the provided ID does not exists")
+                capture._wire_session(session)
+                with mock.patch.object(capture, "_start_direct_media_download"), \
+                        mock.patch.object(playback_capture, "BROWSER_FALLBACK_CHUNK_BYTES", 4):
+                    capture._on_response(response)
+                    capture._on_cdp_response(id(session), {"requestId": "1", "type": "Media", "response": {
+                        "url": url, "status": 206, "mimeType": "video/mp4",
+                        "headers": {"content-range": "bytes 0-7/8"},
+                    }})
+                    capture.drain(allow_browser_fallback=True)
+                    capture.drain(allow_browser_fallback=True)
+                    result = capture.summary()
+                capture.uninstall(page)
+                self.assertTrue(result["complete"], result)
+                self.assertEqual(Path(result["output"]).read_bytes(), b"abcdefgh")
+                self.assertFalse(any(entry["event"] == "fallback_start" for entry in result["capture_trace"]))
+                self.assertEqual(hits.count("/media/video.mp4"), 1)
+            finally:
+                browser.close()
+
+
 @unittest.skipUnless(os.environ.get("RUN_E2E") == "1" and _have_tools(), "RUN_E2E=1 및 Chrome/ffmpeg/yt-dlp 필요")
 class LocalE2ETests(unittest.TestCase):
     @classmethod
