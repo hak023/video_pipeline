@@ -702,6 +702,10 @@ class PlaybackCapture:
         self.drain()
         assembled = self.assemble()
         progress = self.media_progress()
+        output_url = (assembled or {}).get("url") or ""
+        output_content_type = next(
+            (item.get("content_type") or "" for item in self.files if item.get("url") == output_url), ""
+        )
         with self._trace_lock:
             capture_trace = list(self._capture_trace)
             trace_count = self._trace_count
@@ -745,6 +749,8 @@ class PlaybackCapture:
             "total": progress["total"],
             "complete": bool(assembled),
             "output": (assembled or {}).get("path") or "",
+            "output_content_type": output_content_type,
+            "output_extension": Path(urlsplit(output_url).path).suffix.lower(),
             "capture_dir": str(self.out_dir),
             "capture_trace": capture_trace,
             "capture_trace_dropped": max(0, trace_count - len(capture_trace)),

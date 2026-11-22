@@ -173,7 +173,10 @@ def _reserve_name(name: str, url: str, out_dir: Path, force: bool, prev_output: 
     head = sanitize_filename(name[: m.start()] if m else name, max_len=max(10, limit - len(suffix)))
     base = head + suffix
     key = normalize_url(url)
-    prev_stem = Path(prev_output).stem.lower() if prev_output else None
+    prev_stem = (
+        Path(prev_output).stem.lower()
+        if prev_output and Path(prev_output).resolve().parent == out_dir.resolve() else None
+    )
     existing = {f.stem.lower() for f in out_dir.iterdir() if f.is_file()} if out_dir.is_dir() else set()
 
     def free(cand: str) -> bool:
@@ -181,7 +184,7 @@ def _reserve_name(name: str, url: str, out_dir: Path, force: bool, prev_output: 
         owner = _names_claimed.get(low)
         if owner is not None and owner != key:
             return False
-        if low in existing and owner != key and not (force and prev_stem == low):
+        if low in existing and not (force and prev_stem == low):
             return False
         return True
 
@@ -291,6 +294,18 @@ def _playback_capture_dir(out_dir: Path, item_name: str, item_url: str) -> Path:
     return Path(out_dir) / f"{safe}_{digest}_playback"
 
 
+def _playback_extension(playback: dict) -> str:
+    content_type = str(playback.get("output_content_type") or "").split(";", 1)[0].strip().lower()
+    extensions = {
+        "video/mp4": ".mp4", "audio/mp4": ".m4a",
+        "video/webm": ".webm", "audio/webm": ".webm",
+        "video/mp2t": ".ts", "application/mp2t": ".ts",
+        "video/quicktime": ".mov", "video/x-matroska": ".mkv",
+    }
+    extension = str(playback.get("output_extension") or "")
+    return extensions.get(content_type) or (extension if extension in MEDIA_EXTS else ".mp4")
+
+
 def _log_playback(item_name: str, playback: dict | None, item_url: str = "") -> None:
     """재생 패킷 결과를 콘솔과 실행 진단 JSON에 남긴다. 서명 URL은 진단 쪽에서 마스킹된다."""
     playback = playback or {}
@@ -352,7 +367,7 @@ def _finish_with_openx_handoff(
     res: dict, group: dict, item_name: str, prior_reason: str, page_url: str = "",
     history=None, item_url: str = "", post_date: str | None = None, out_dir: Path | None = None,
     browser_sem=None, max_open_download_pages: int = MAX_OPEN_DOWNLOAD_PAGES,
-    minimize_window: bool = False,
+    minimize_window: bool = False, force: bool = False, prev_output: str | Path | None = None,
 ) -> dict:
     """403 이면 30초 안에 download 버튼을 확인한다.
 
@@ -360,7 +375,8 @@ def _finish_with_openx_handoff(
     스트리밍 fallback이 비활성화되어 있으면 버튼이 없을 때 다운로드 불가로 처리한다.
     """
     embed = group.get("embed_url") or ""
-    capture_dir = _playback_capture_dir(out_dir or OUT_DIR, item_name, item_url or page_url or embed)
+    out_dir = Path(out_dir or OUT_DIR)
+    capture_dir = _playback_capture_dir(out_dir, item_name, item_url or page_url or embed)
     log(f"  [403 인수] {item_name}: download 버튼은 30초만 확인합니다")
     # 탐색 슬롯(최대 3)을 스트리밍 동안 잡으면 재생 탭이 3개를 넘지 못한다.
     # browser_sem 은 탐색에만 쓰고, 스트리밍 동시 수는 Chrome 슬롯이 정한다.
@@ -373,9 +389,9 @@ def _finish_with_openx_handoff(
     )
     playback = outcome.get("playback") or {}
     if outcome.get("ok") and outcome.get("no_download_button"):
-        _log_playback(item_name, playback, item_url or page_url)
         files = playback.get("files") or []
         if files and not playback.get("complete"):
+            _log_playback(item_name, playback, item_url or page_url)
             reason = (
                 "403 이후 download 버튼이 없고, 재생으로 받은 본편이 아직 전체가 아닙니다. "
                 f"{playback.get('covered') or 0}/{playback.get('total') or 0} bytes, 조각 {len(files)}개. "
@@ -387,6 +403,7 @@ def _finish_with_openx_handoff(
             get_diagnostics().fail("download", reason)
             return res
         if not files:
+            _log_playback(item_name, playback, item_url or page_url)
             reason = (
                 "403 이후 임베드에 download 버튼이 없고, 재생 패킷도 저장되지 않았습니다. "
                 f"route {playback.get('seen_count', 0)}건, request {playback.get('request_count', 0)}건, "
@@ -398,13 +415,23 @@ def _finish_with_openx_handoff(
             log_event("download", "playback_capture_empty", reason, level="ERROR", page_url=embed)
             get_diagnostics().fail("download", reason)
             return res
-        largest = max(files, key=lambda item: item.get("size") or 0)
-        output = playback.get("output") or largest.get("path") or ""
-        output_size = Path(output).stat().st_size if output and Path(output).is_file() else 0
+        output = playback.get("output") or ""
+        source = Path(output) if output else None
+        try:
+            output_size = source.stat().st_size if source and source.is_file() else 0
+        except OSError as exc:
+            _log_playback(item_name, playback, item_url or page_url)
+            reason = f"완료된 재생 파일을 확인하지 못했습니다: {mask_text(str(exc))}"
+            res.update(status="failed", fatal=True, reason=reason, handoff=True, no_download_button=True, playback=playback)
+            log(f"  [403 인수 실패] {item_name}: {reason}")
+            log_event("download", "playback_save_failed", reason, level="ERROR", page_url=embed)
+            get_diagnostics().fail("download", reason)
+            return res
         total = int(playback.get("total") or 0)
-        if total and output_size < total:
+        if not output_size or (total and output_size < total):
+            _log_playback(item_name, playback, item_url or page_url)
             reason = (
-                "403 이후 download 버튼이 없고, 저장된 mp4가 Content-Range 전체보다 짧습니다. "
+                "403 이후 download 버튼이 없고, 저장된 파일이 없거나 Content-Range 전체보다 짧습니다. "
                 f"파일 {output_size}/{total} bytes. 헤더만으로 완료 처리하지 않습니다. {output}"
             )
             res.update(status="failed", fatal=True, reason=reason, handoff=True, no_download_button=True, playback=playback)
@@ -412,8 +439,52 @@ def _finish_with_openx_handoff(
             log_event("download", "playback_capture_partial", reason, level="ERROR", page_url=embed)
             get_diagnostics().fail("download", reason)
             return res
+        try:
+            previous_in_out = (
+                prev_output if prev_output and Path(prev_output).resolve().parent == out_dir.resolve() else None
+            )
+            safe_name = _reserve_name(item_name, item_url or page_url or embed, out_dir, force, previous_in_out)
+            destination = out_dir / f"{safe_name}{_playback_extension(playback)}"
+            replace_previous = bool(
+                force and previous_in_out and Path(previous_in_out).resolve() == destination.resolve()
+                and destination.is_file()
+            )
+            if destination.exists() and not replace_previous:
+                safe_name = _reserve_name(item_name, item_url or page_url or embed, out_dir, False)
+                destination = out_dir / f"{safe_name}{_playback_extension(playback)}"
+            if not replace_previous:
+                with destination.open("xb"):
+                    pass
+            try:
+                assert source is not None
+                source.replace(destination)
+            except OSError:
+                if not replace_previous:
+                    destination.unlink(missing_ok=True)
+                raise
+        except OSError as exc:
+            _log_playback(item_name, playback, item_url or page_url)
+            reason = f"완료된 재생 파일을 out 폴더에 저장하지 못했습니다: {mask_text(str(exc))}"
+            res.update(status="failed", fatal=True, reason=reason, handoff=True, no_download_button=True, playback=playback)
+            log(f"  [403 인수 실패] {item_name}: {reason}")
+            log_event("download", "playback_save_failed", reason, level="ERROR", page_url=embed)
+            get_diagnostics().fail("download", reason)
+            return res
+        for item in files:
+            if item.get("path") == output:
+                item["path"] = str(destination)
+        output = str(destination)
+        playback["output"] = output
+        try:
+            (capture_dir / "playback_capture.json").write_text(
+                json.dumps(sanitize(playback), ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            log_event("playback_capture", "manifest_update_failed", mask_text(str(exc)),
+                      level="WARNING", capture_dir=str(capture_dir))
+        _log_playback(item_name, playback, item_url or page_url)
         reason = (
-            f"403 이후 download 버튼이 없어 본편 mp4 전체를 저장했습니다. "
+            f"403 이후 download 버튼이 없어 본편 전체를 저장했습니다. "
             f"{playback.get('covered') or playback.get('bytes') or 0} bytes. {output}"
         )
         res.update(
@@ -440,9 +511,9 @@ def _finish_with_openx_handoff(
                 },
             )
         log(f"  [403 인수 완료] {item_name}: {reason}")
-        log_event("download", "playback_capture_saved", reason, page_url=embed, output=largest.get("path") or "")
+        log_event("download", "playback_capture_saved", reason, page_url=embed, output=output)
         get_diagnostics().download(
-            status="SUCCESS", reason=reason, output=largest.get("path") or "", handoff=True, playback=True,
+            status="SUCCESS", reason=reason, output=output, handoff=True, playback=True,
         )
         return res
     if outcome.get("ok"):
@@ -712,7 +783,7 @@ def _process_item(
                 res, group, item_name, reason, page_url=url,
                 history=history, item_url=item_url, post_date=post_date, out_dir=out_dir,
                 browser_sem=browser_sem, max_open_download_pages=opts.max_open_download_pages,
-                minimize_window=opts.background,
+                minimize_window=opts.background, force=force, prev_output=prev_output,
             )
 
 
@@ -743,7 +814,7 @@ def _process_item(
                 res, group, item_name, str(r.get("reason") or "HTTP 403"), page_url=url,
                 history=history, item_url=item_url, post_date=post_date, out_dir=out_dir,
                 browser_sem=browser_sem, max_open_download_pages=opts.max_open_download_pages,
-                minimize_window=opts.background,
+                minimize_window=opts.background, force=force, prev_output=prev_output,
             )
         if r.get("fatal"):
             res.update(status="failed", fatal=True)

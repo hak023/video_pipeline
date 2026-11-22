@@ -9,7 +9,9 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -959,6 +961,144 @@ class PlaybackStreamingProgressTests(unittest.TestCase):
                     self.assertEqual(confirmations, [])
                     self.assertEqual(capture.stop_reason, "media_unreadable")
                     self.assertEqual(clock[0], 90)
+
+
+class PlaybackOutputTests(unittest.TestCase):
+    def setUp(self):
+        import main
+
+        self.main = main
+        main._names_claimed.clear()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.out = Path(temp.name) / "out"
+        self.out.mkdir()
+        self.history = mock.Mock()
+        self.source = self.out / "media_stream.mp4"
+
+    def finish(self, name="Movie", url="https://article.test/movie", *, force=False, prev=None,
+              complete=True, total=5, missing=False):
+        def fake_handoff(embed, **kwargs):
+            capture_dir = Path(kwargs["capture_dir"])
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            self.source = capture_dir / "media_stream.mp4"
+            if not missing:
+                self.source.write_bytes(b"video")
+            else:
+                self.source.unlink(missing_ok=True)
+            return {
+                "ok": True, "no_download_button": True,
+                "playback": {
+                    "files": [{"path": str(self.source), "size": 5}],
+                    "output": str(self.source), "complete": complete,
+                    "total": total, "covered": 5, "bytes": 5, "capture_dir": str(capture_dir),
+                },
+            }
+
+        with mock.patch.object(self.main, "open_download_handoff", side_effect=fake_handoff):
+            return self.main._finish_with_openx_handoff(
+                {}, {"embed_url": "https://player.test/?v=id"}, name, "HTTP 403",
+                page_url=url, item_url=url, history=self.history, out_dir=self.out,
+                force=force, prev_output=prev,
+            )
+
+    def test_completed_file_uses_safe_indexed_title_and_updates_records(self):
+        result = self.finish("한글: 제목 (02)", "https://article.test/movie#v02")
+        dest = self.out / "한글_ 제목 (02).mp4"
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(dest.read_bytes(), b"video")
+        self.assertFalse(self.source.exists())
+        self.assertEqual(result["output"], str(dest))
+        self.assertEqual(result["playback"]["files"][0]["path"], str(dest))
+        self.assertEqual(self.history.record_success.call_args.args[2], str(dest))
+        manifest = json.loads((self.source.parent / "playback_capture.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["output"], str(dest))
+        self.assertEqual(manifest["files"][0]["path"], str(dest))
+
+    def test_existing_file_is_not_overwritten_and_force_replaces_only_previous_file(self):
+        other = self.out / "Movie.mp4"
+        other.write_bytes(b"other")
+        result = self.finish(force=True)
+        dest = Path(result["output"])
+        self.assertRegex(dest.name, r"^Movie \[[0-9a-f]{6}\]\.mp4$")
+        self.assertEqual(other.read_bytes(), b"other")
+        self.main._names_claimed.clear()
+        result = self.finish(force=True, prev=dest)
+        self.assertEqual(result["output"], str(dest))
+        self.assertEqual(dest.read_bytes(), b"video")
+        self.assertEqual(other.read_bytes(), b"other")
+
+    def test_previous_file_in_capture_directory_cannot_authorize_overwrite(self):
+        other = self.out / "Movie.mp4"
+        other.write_bytes(b"other")
+        old_dir = self.out / "old_capture"
+        old_dir.mkdir()
+        previous = old_dir / "Movie.mp4"
+        previous.write_bytes(b"old")
+        result = self.finish(force=True, prev=previous)
+        self.assertEqual(result["status"], "ok")
+        self.assertNotEqual(result["output"], str(other))
+        self.assertEqual(other.read_bytes(), b"other")
+        self.assertEqual(previous.read_bytes(), b"old")
+
+    def test_force_with_different_previous_extension_preserves_other_file(self):
+        previous = self.out / "Movie.webm"
+        previous.write_bytes(b"old")
+        other = self.out / "Movie.mp4"
+        other.write_bytes(b"other")
+        result = self.finish(force=True, prev=previous)
+        self.assertEqual(result["status"], "ok")
+        self.assertNotEqual(result["output"], str(other))
+        self.assertEqual(previous.read_bytes(), b"old")
+        self.assertEqual(other.read_bytes(), b"other")
+
+    def test_assembled_ranges_use_the_detected_container_extension(self):
+        import playback_capture
+
+        def fake_handoff(embed, **kwargs):
+            capture_dir = Path(kwargs["capture_dir"])
+            capture_dir.mkdir(parents=True)
+            capture = playback_capture.PlaybackCapture(capture_dir)
+            url = "https://cdn.test/videoplayback"
+            capture._store(url, 206, "video/webm", "bytes 0-2/5", "bytes=0-2", b"vid", "media")
+            capture._store(url, 206, "video/webm", "bytes 3-4/5", "bytes=3-4", b"eo", "media")
+            return {"ok": True, "no_download_button": True, "playback": capture.summary()}
+
+        with mock.patch.object(self.main, "open_download_handoff", side_effect=fake_handoff):
+            result = self.main._finish_with_openx_handoff(
+                {}, {"embed_url": "https://player.test/?v=id"}, "Movie", "HTTP 403",
+                item_url="https://article.test/movie", history=self.history, out_dir=self.out,
+            )
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["output"], str(self.out / "Movie.webm"))
+        self.assertEqual((self.out / "Movie.webm").read_bytes(), b"video")
+        self.assertTrue(all(Path(item["path"]).is_file() for item in result["playback"]["files"]))
+        self.assertEqual(self.history.record_success.call_args.args[2], result["output"])
+
+    def test_failed_force_move_preserves_previous_file(self):
+        previous = self.out / "Movie.mp4"
+        previous.write_bytes(b"old")
+        with mock.patch.object(Path, "replace", side_effect=PermissionError("blocked")):
+            result = self.finish(force=True, prev=previous)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(previous.read_bytes(), b"old")
+        self.assertTrue(self.source.exists())
+        self.history.record_success.assert_not_called()
+
+    def test_partial_missing_and_move_failure_do_not_record_success(self):
+        for kwargs in ({"complete": False}, {"total": 10}, {"missing": True}, {"move_error": True}):
+            with self.subTest(kwargs=kwargs):
+                self.main._names_claimed.clear()
+                self.history.reset_mock()
+                params: dict[str, Any] = dict(kwargs)
+                move_error = params.pop("move_error", False)
+                with mock.patch.object(Path, "replace", side_effect=PermissionError("blocked")) if move_error else nullcontext():
+                    result = self.finish(**params)
+                self.assertEqual(result["status"], "failed")
+                self.history.record_success.assert_not_called()
+                self.assertFalse((self.out / "Movie.mp4").exists())
+                if not params.get("missing"):
+                    self.assertTrue(self.source.exists())
 
 
 if __name__ == "__main__":
