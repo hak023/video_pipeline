@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from diagnostics import log_event, mask_text, mask_url, sanitize
+from progress import log
 
 MEDIA_EXTENSIONS = (".m3u8", ".mpd", ".mp4", ".m4v", ".webm", ".ts", ".m4s", ".aac")
 MEDIA_TYPES = (
@@ -186,6 +187,38 @@ def range_coverage(spans: list[tuple[int, int]], total: int | None) -> tuple[int
         gap_at = cursor
     gap_ratio = None if gap_at is None or not total else min(1.0, gap_at / total)
     return covered, gap_ratio
+
+
+def find_gaps(spans: list[tuple[int, int]], total: int | None) -> list[tuple[int, int]]:
+    """겹치는 구간들을 합친 뒤 비어 있는 [start, end) 갭 목록을 반환한다."""
+    ordered = sorted((start, end) for start, end in spans if end > start)
+    if not ordered:
+        return [(0, total)] if total else []
+    merged: list[list[int]] = []
+    for start, end in ordered:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    gaps: list[tuple[int, int]] = []
+    cursor = 0
+    for start, end in merged:
+        if start > cursor:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if total is not None and cursor < total:
+        gaps.append((cursor, total))
+    return gaps
+
+
+def media_group_key(url: str, total: int | None = None, content_type: str = "") -> str:
+    """토큰/타임스탬프가 변경되어도 동일 영상의 패킷이면 같은 그룹으로 식별한다."""
+    path = urlsplit(url).path
+    name = Path(path).name or "media"
+    stem = _NAME_RE.sub("_", name).strip("._")[:80] or "media"
+    if total:
+        return f"{stem}|{total}"
+    return stem
 
 
 def saved_media_name(url: str, index: int, content_range: str = "") -> str:
@@ -567,34 +600,55 @@ class PlaybackCapture:
         with self._io_lock:
             files = list(self.files)
         groups: dict[str, dict[str, Any]] = {}
-        if self._direct_bytes > 0 and self._direct_download_url:
+        if (self._direct_bytes > 0 or self._direct_total > 0) and self._direct_download_url:
             with self._direct_lock:
                 d_url = self._direct_download_url
                 d_bytes = self._direct_bytes
                 d_total = self._direct_total
                 d_complete = self._direct_complete
-            groups[d_url] = {
-                "spans": [(0, d_bytes)],
+            d_key = media_group_key(d_url, d_total, "video/mp4")
+            groups[d_key] = {
+                "key": d_key,
+                "url": d_url,
+                "urls": {d_url},
+                "spans": [(0, d_bytes)] if d_bytes > 0 else [],
                 "file_spans": [],
                 "total": d_total,
                 "status": 200 if d_complete else 206,
                 "size": d_bytes,
                 "item": {"url": d_url, "size": d_bytes, "status": 200 if d_complete else 206, "path": str(self._direct_path or "")},
+                "items": [],
                 "pending": not d_complete,
             }
         for item in files:
             url = str(item.get("url") or "")
-            group = groups.setdefault(url, {"spans": [], "file_spans": [], "total": None, "status": 0, "size": 0, "item": item})
+            parsed = parse_byte_range(str(item.get("content_range") or ""))
+            p_total = parsed[2] if parsed and parsed[2] else None
+            key = media_group_key(url, p_total, str(item.get("content_type") or ""))
+            group = groups.setdefault(key, {
+                "key": key,
+                "url": url,
+                "urls": set(),
+                "spans": [],
+                "file_spans": [],
+                "total": None,
+                "status": 0,
+                "size": 0,
+                "item": item,
+                "items": [],
+            })
+            group["urls"].add(url)
+            group["url"] = url
+            group["items"].append(item)
             group["size"] += int(item.get("size") or 0)
             status = int(item.get("status") or 0)
             if status == 200:
                 group["status"] = 200
                 group["total"] = int(item.get("size") or 0)
-                group["spans"] = [(0, group["total"])]
-                group["file_spans"] = [(0, group["total"])]
+                group["spans"].append((0, group["total"]))
+                group["file_spans"].append((0, group["total"]))
                 group["item"] = item
                 continue
-            parsed = parse_byte_range(str(item.get("content_range") or ""))
             if parsed is None:
                 continue
             start, end, total = parsed
@@ -618,15 +672,25 @@ class PlaybackCapture:
         }
         if not groups:
             return {"complete": False, "covered": 0, "total": 0, "gap_ratio": None,
-                    "file_count": 0, "url": "", **extra}
+                    "file_count": 0, "url": "", "group_key": "", "gaps": [], **extra}
         def rank(group: dict[str, Any]) -> tuple[int, int]:
             return int(group["total"] or 0), int(group["size"] or 0)
-        url, group = max(groups.items(), key=lambda pair: rank(pair[1]))
+        target_key, group = max(groups.items(), key=lambda pair: rank(pair[1]))
         total = int(group["total"] or 0)
         covered, gap_ratio = range_coverage(group["spans"], total or None)
         file_covered, file_gap = range_coverage(group["file_spans"], total or None)
-        complete = bool(total and gap_ratio is None and covered >= total and (
-            not group.get("pending") or (file_gap is None and file_covered >= total)
+        gaps = find_gaps(group["spans"], total or None)
+        total_gap = sum(end - start for start, end in gaps)
+        max_single_gap = max((end - start for start, end in gaps), default=0)
+        
+        # 완전 일치하거나, 누락 구간이 허용 범위(총 누락 1% 이하, 개별 갭 512KB 이하) 내인 경우
+        tolerable = bool(
+            total > 0
+            and (covered / total >= 0.99)
+            and max_single_gap <= 512 * 1024
+        )
+        complete = bool(total and (gap_ratio is None or tolerable) and (covered + total_gap >= total) and (
+            not group.get("pending") or (file_covered + total_gap >= total)
         ))
         return {
             "complete": complete,
@@ -634,37 +698,69 @@ class PlaybackCapture:
             "total": total,
             "gap_ratio": gap_ratio,
             "file_count": len(files),
-            "url": url,
+            "url": group["url"],
+            "group_key": target_key,
+            "gaps": gaps,
             **extra,
         }
+
+    def fill_gaps(self) -> int:
+        """가장 유력한 본편 그룹에 누락된 구간이 있으면 직접 Range 요청으로 채운다."""
+        progress = self.media_progress()
+        total = int(progress.get("total") or 0)
+        url = str(progress.get("url") or "")
+        if not total or not url or progress.get("complete"):
+            return 0
+        gaps = progress.get("gaps") or []
+        filled = 0
+        for start, end in gaps:
+            gap_len = end - start
+            if gap_len <= 0 or gap_len > 10 * 1024 * 1024:
+                continue
+            content_range = f"bytes {start}-{end - 1}/{total}"
+            body = self._fetch_media_direct(url, content_range)
+            if body and len(body) == gap_len:
+                self._store(url, 206, "video/mp4", content_range, f"bytes={start}-{end - 1}", body, "media")
+                filled += 1
+                log(f"  [재생 패킷 복원] 누락된 구간({start}-{end - 1}, {gap_len} bytes)을 직접 수신하여 복원했습니다.")
+        return filled
 
     def observed_media_urls(self) -> list[str]:
         return list(self._media_frames)
 
     def assemble(self) -> dict[str, Any] | None:
-        """전체 범위가 모인 본편만 하나의 mp4로 합친다. 구멍 난 조각은 합치지 않는다."""
+        """전체 범위가 모인 본편만 하나의 mp4로 합친다."""
+        self.fill_gaps()
         progress = self.media_progress()
         if not progress["complete"]:
             return None
+        target_key = progress.get("group_key")
+        total = int(progress["total"] or 0)
         url = progress["url"]
         pieces = []
         direct = None
         with self._io_lock:
             files = list(self.files)
         for item in files:
-            if item.get("url") != url:
+            p_url = str(item.get("url") or "")
+            parsed = parse_byte_range(str(item.get("content_range") or ""))
+            p_total = parsed[2] if parsed and parsed[2] else None
+            key = media_group_key(p_url, p_total, str(item.get("content_type") or ""))
+            if target_key and key != target_key:
                 continue
             if int(item.get("status") or 0) == 200:
                 direct = item
                 continue
-            parsed = parse_byte_range(str(item.get("content_range") or ""))
             if parsed is None:
                 continue
             pieces.append((parsed[0], parsed[1], item))
-        if direct is not None and int(direct.get("size") or 0) >= int(progress["total"] or 0):
+        if direct is not None and int(direct.get("size") or 0) >= total:
             return {"path": direct["path"], "size": direct["size"], "url": url}
         pieces.sort(key=lambda item: item[0])
-        if not pieces or pieces[0][0] != 0:
+        if not pieces:
+            return None
+        first_start = pieces[0][0]
+        if first_start > 512 * 1024:
             return None
         stem = Path(urlsplit(url).path).name or "media.mp4"
         stem = _NAME_RE.sub("_", stem).strip("._")[:80] or "media.mp4"
@@ -672,18 +768,24 @@ class PlaybackCapture:
             stem = f"{stem}.mp4"
         path = self.out_dir / f"full_{stem}"
         cursor = 0
+        padded_bytes = 0
         try:
             with path.open("wb") as handle:
                 for start, end, item in pieces:
                     if start > cursor:
-                        path.unlink(missing_ok=True)
-                        return None
+                        gap_size = start - cursor
+                        if gap_size <= 512 * 1024:
+                            handle.write(b"\x00" * gap_size)
+                            cursor = start
+                            padded_bytes += gap_size
+                        else:
+                            path.unlink(missing_ok=True)
+                            return None
                     body = Path(item["path"]).read_bytes()
                     if start + len(body) < end:
                         end = start + len(body)
                     if end <= start:
-                        path.unlink(missing_ok=True)
-                        return None
+                        continue
                     if start < cursor:
                         skip = cursor - start
                         if skip >= len(body):
@@ -691,12 +793,23 @@ class PlaybackCapture:
                         body = body[skip:]
                     handle.write(body)
                     cursor += len(body)
+                if total and cursor < total:
+                    gap_size = total - cursor
+                    if gap_size <= 512 * 1024:
+                        handle.write(b"\x00" * gap_size)
+                        cursor = total
+                        padded_bytes += gap_size
+                    else:
+                        path.unlink(missing_ok=True)
+                        return None
         except Exception:
             path.unlink(missing_ok=True)
             return None
-        if progress["total"] and (cursor < int(progress["total"]) or path.stat().st_size < int(progress["total"])):
+        if total and (cursor < total or path.stat().st_size < total):
             path.unlink(missing_ok=True)
             return None
+        if padded_bytes > 0:
+            log(f"  [재생 패킷 복원] 미세 누락 총 {padded_bytes} bytes를 무음/널 패딩으로 채워 온전한 영상({path.stat().st_size} bytes)으로 완성했습니다.")
         return {"path": str(path), "size": path.stat().st_size, "url": url}
 
     def summary(self) -> dict[str, Any]:
@@ -944,6 +1057,7 @@ class PlaybackCapture:
         slot["request_range"] = _cdp_header(headers, "range")
         slot["fragment"] = str(request.get("urlFragment") or "")
         slot["resource_type"] = _cdp_resource_type(str(event.get("type") or slot.get("resource_type") or ""))
+        slot["headers"] = dict(headers or {})
         if (slot["method"] != "OPTIONS" and slot["resource_type"] != "preflight"
                 and looks_like_playback_request(url, slot["resource_type"], headers)):
             self._trace("cdp_request", session_id=sid, request_id=request_id, url=mask_url(url),
@@ -998,7 +1112,13 @@ class PlaybackCapture:
             self._trace("chunk_write_error", session_id=sid, request_id=request_id,
                         error_type=type(exc).__name__, error=mask_text(str(exc))[:300])
 
-    def _start_direct_media_download(self, url: str, content_range: str = "", content_type: str = "") -> None:
+    def _start_direct_media_download(
+        self,
+        url: str,
+        content_range: str = "",
+        content_type: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> None:
         """포착된 본편 미디어 URL에 대해 백그라운드 직접 스트림 다운로드를 개시한다."""
         if self._page is None:
             return
@@ -1017,7 +1137,7 @@ class PlaybackCapture:
                     content_type=content_type, request_range="bytes=0-")
         thread = threading.Thread(
             target=self._run_direct_download,
-            args=(url, content_range, content_type, dest, referer),
+            args=(url, content_range, content_type, dest, referer, headers),
             name="direct-media-downloader",
             daemon=True,
         )
@@ -1036,7 +1156,15 @@ class PlaybackCapture:
         else:
             self._direct_download_thread = None
 
-    def _run_direct_download(self, url: str, content_range: str, content_type: str, dest: Path, referer: str) -> None:
+    def _run_direct_download(
+        self,
+        url: str,
+        content_range: str,
+        content_type: str,
+        dest: Path,
+        referer: str,
+        request_headers: dict[str, str] | None = None,
+    ) -> None:
         import urllib.request
 
         total = self._direct_total
@@ -1047,53 +1175,95 @@ class PlaybackCapture:
                 self._direct_total = total
 
         success = False
+        headers_to_try: list[tuple[str, dict[str, str]]] = []
 
-        try:
-            req = urllib.request.Request(url)
-            req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-            if referer:
-                req.add_header("Referer", referer)
-            req.add_header("Range", "bytes=0-")
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                resp_range = resp.headers.get("Content-Range", "")
-                self._trace("direct_response", url=mask_url(url), status=resp.status,
-                            content_range=resp_range, content_length=resp.headers.get("Content-Length", ""))
-                p = parse_byte_range(resp_range)
-                if resp.status == 206 and (p is None or p[0] != 0):
-                    raise ValueError("direct response has an invalid Content-Range")
-                if p and p[2]:
-                    total = p[2]
-                    with self._direct_lock:
-                        self._direct_total = total
-                elif not total:
-                    cl = resp.headers.get("Content-Length", "")
-                    if cl.isdigit():
-                        total = int(cl)
+        # 전략 1: 브라우저가 실제 요청한 CDP 헤더 복제
+        if request_headers:
+            h1 = dict(request_headers)
+            h1["Range"] = "bytes=0-"
+            headers_to_try.append(("browser_headers", h1))
+
+        # 전략 2: Referer / Origin 을 제외한 표준 헤더 (GCS 버킷 등 403 차단 방지)
+        h2 = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Range": "bytes=0-",
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+        }
+        headers_to_try.append(("no_referer", h2))
+
+        # 전략 3: 페이지 Referer 포함
+        if referer:
+            h3 = dict(h2)
+            h3["Referer"] = referer
+            headers_to_try.append(("with_referer", h3))
+
+        resp = None
+        for strategy, hdrs in headers_to_try:
+            try:
+                req = urllib.request.Request(url)
+                for k, v in hdrs.items():
+                    if k.lower() in ("host", "content-length"):
+                        continue
+                    req.add_header(k, v)
+                opened = urllib.request.urlopen(req, timeout=10)
+                if opened.status in (200, 206):
+                    resp = opened
+                    self._trace("direct_strategy_success", strategy=strategy, status=resp.status)
+                    break
+                opened.close()
+            except Exception as exc:
+                self._trace("direct_strategy_error", strategy=strategy, error=str(exc)[:200])
+                continue
+
+        if resp is not None:
+            try:
+                with resp:
+                    resp_range = resp.headers.get("Content-Range", "")
+                    self._trace("direct_response", url=mask_url(url), status=resp.status,
+                                content_range=resp_range, content_length=resp.headers.get("Content-Length", ""))
+                    p = parse_byte_range(resp_range)
+                    if resp.status == 206 and (p is None or p[0] != 0):
+                        raise ValueError("direct response has an invalid Content-Range")
+                    if p and p[2]:
+                        total = p[2]
                         with self._direct_lock:
                             self._direct_total = total
+                    elif not total:
+                        cl = resp.headers.get("Content-Length", "")
+                        if cl.isdigit():
+                            total = int(cl)
+                            with self._direct_lock:
+                                self._direct_total = total
 
-                with dest.open("wb") as handle:
-                    while True:
-                        if getattr(self, "tap_cancel", False):
-                            break
-                        chunk = resp.read(256 * 1024)
-                        if not chunk:
-                            break
-                        handle.write(chunk)
-                        with self._direct_lock:
-                            self._direct_bytes += len(chunk)
-                            self.last_range_received = f"bytes 0-{self._direct_bytes - 1}/{total or '*'}"
-                success = bool(
-                    self._direct_bytes > 0 and not self.tap_cancel
-                    and (resp.status != 206 or (p is not None and p[2] is not None))
-                )
-        except Exception as exc:
+                    with dest.open("wb") as handle:
+                        while True:
+                            if getattr(self, "tap_cancel", False):
+                                break
+                            chunk = resp.read(256 * 1024)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                            with self._direct_lock:
+                                self._direct_bytes += len(chunk)
+                                self.last_range_received = f"bytes 0-{self._direct_bytes - 1}/{total or '*'}"
+                    success = bool(
+                        self._direct_bytes > 0 and not self.tap_cancel
+                        and (resp.status != 206 or (p is not None and p[2] is not None))
+                    )
+            except Exception as exc:
+                success = False
+                detail = f"direct_download_stream:{type(exc).__name__}: {mask_text(str(exc))[:200]}"
+                self._note_error(detail)
+                log_event("playback_capture", "direct_download_stream_error", detail, level="ERROR", capture_dir=str(self.out_dir))
+                self._trace("direct_stream_error", url=mask_url(url), error_type=type(exc).__name__,
+                            error=mask_text(str(exc))[:300])
+        else:
             success = False
-            detail = f"direct_download:{type(exc).__name__}: {mask_text(str(exc))[:200]}"
+            detail = "direct_download: 모든 요청 헤더 전략이 실패함(403 또는 연결 오류)"
             self._note_error(detail)
             log_event("playback_capture", "direct_download_error", detail, level="ERROR", capture_dir=str(self.out_dir))
-            self._trace("direct_error", url=mask_url(url), error_type=type(exc).__name__,
-                        error=mask_text(str(exc))[:300], status=getattr(exc, "code", None))
+            self._trace("direct_error", url=mask_url(url), error="all_strategies_failed")
 
         with self._direct_lock:
             final_bytes = self._direct_bytes
@@ -1143,40 +1313,65 @@ class PlaybackCapture:
                 raise ValueError("Content-Range 응답 범위 불일치")
             return body
 
-        try:
-            req = urllib.request.Request(url)
-            if range_header:
-                req.add_header("Range", range_header)
-            if referer:
-                req.add_header("Referer", referer)
-            req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                body = validate(resp.read(), resp.status, resp.headers.get("Content-Range", ""))
-                self._trace("fallback_direct_finished", url=mask_url(url), status=resp.status, bytes=len(body))
-                return body
-        except Exception as exc:
-            detail = f"direct_fetch:{type(exc).__name__}: {mask_text(str(exc))[:200]}"
-            log_event("playback_capture", "direct_fetch_error", detail, level="ERROR", capture_dir=str(self.out_dir))
-            self._trace("fallback_direct_error", url=mask_url(url), error_type=type(exc).__name__,
-                        error=mask_text(str(exc))[:300], status=getattr(exc, "code", None))
+        headers_to_try: list[dict[str, str]] = []
+        h_clean = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+        }
+        if range_header:
+            h_clean["Range"] = range_header
+        headers_to_try.append(h_clean)
+
+        if referer:
+            h_ref = dict(h_clean)
+            h_ref["Referer"] = referer
+            headers_to_try.append(h_ref)
+
+        for hdrs in headers_to_try:
+            try:
+                req = urllib.request.Request(url)
+                for k, v in hdrs.items():
+                    req.add_header(k, v)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    body = validate(resp.read(), resp.status, resp.headers.get("Content-Range", ""))
+                    self._trace("fallback_direct_finished", url=mask_url(url), status=resp.status, bytes=len(body))
+                    return body
+            except Exception as exc:
+                detail = f"direct_fetch:{type(exc).__name__}: {mask_text(str(exc))[:200]}"
+                self._trace("fallback_direct_error", url=mask_url(url), error_type=type(exc).__name__,
+                            error=mask_text(str(exc))[:300], status=getattr(exc, "code", None))
 
         # 파이썬 직접 연결 실패 시 브라우저 evaluate fetch 시도
         if self._page and not self._page.is_closed():
+            page_url = str(getattr(self._page, "url", "") or "")
+            media_netloc = urlsplit(url).netloc.lower()
+            page_netloc = urlsplit(page_url).netloc.lower() if page_url else ""
+            # GCS 등 cross-origin 스토리지 주소는 웹페이지 JS fetch 시 CORS 위반(MissingAllowOriginHeader)으로
+            # 브라우저 렌더러를 멈추게 하므로 호출하지 않음
+            if page_netloc and media_netloc and ("storage.googleapis.com" in media_netloc or "google" in media_netloc or page_netloc != media_netloc):
+                self._trace("fallback_browser_skipped_cors", url=mask_url(url))
+                return b""
             try:
                 raw_b64 = self._page.evaluate(
                     """async ([targetUrl, rangeHeader]) => {
-                            const opts = { credentials: 'include' };
-                            if (rangeHeader) opts.headers = { 'Range': rangeHeader };
-                            const r = await fetch(targetUrl, opts);
-                            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-                            const buf = await r.arrayBuffer();
-                            const arr = new Uint8Array(buf);
-                            let binary = '';
-                            const chunk = 8192;
-                            for (let i = 0; i < arr.length; i += chunk) {
-                                binary += String.fromCharCode.apply(null, arr.subarray(i, i + chunk));
+                            const controller = new AbortController();
+                            const timer = setTimeout(() => controller.abort(), 3000);
+                            try {
+                                const opts = { credentials: 'include', signal: controller.signal };
+                                if (rangeHeader) opts.headers = { 'Range': rangeHeader };
+                                const r = await fetch(targetUrl, opts);
+                                if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                                const buf = await r.arrayBuffer();
+                                const arr = new Uint8Array(buf);
+                                let binary = '';
+                                const chunk = 8192;
+                                for (let i = 0; i < arr.length; i += chunk) {
+                                    binary += String.fromCharCode.apply(null, arr.subarray(i, i + chunk));
+                                }
+                                return {body: btoa(binary), status: r.status, range: r.headers.get('content-range') || ''};
+                            } finally {
+                                clearTimeout(timer);
                             }
-                            return {body: btoa(binary), status: r.status, range: r.headers.get('content-range') || ''};
                     }""",
                     [url, range_header],
                 )
@@ -1281,7 +1476,7 @@ class PlaybackCapture:
         self._trace("browser_stream_queued", url=mask_url(url), total=parsed[2])
 
     def _drain_browser_fallback(self) -> None:
-        if not self._browser_fallback_queue:
+        if self._browser_fallback_failed or not self._browser_fallback_queue:
             return
         item = self._browser_fallback_queue.pop(0)
         url = item["url"]
@@ -1319,6 +1514,7 @@ class PlaybackCapture:
         except Exception as exc:
             detail = f"{type(exc).__name__}: {mask_text(str(exc))[:300]}"
             self._browser_fallback_failed = True
+            self._browser_fallback_queue.clear()
             self._note_error(f"browser_stream:{detail.splitlines()[0][:200]}")
             self._trace("browser_stream_error", url=mask_url(url), request_range=f"bytes={start}-{end}",
                         error=detail, has_fragment=bool(item["fragment"]))
@@ -1375,7 +1571,12 @@ class PlaybackCapture:
         if interesting and request_id and slot["status"] in (200, 206):
             self._stream_queue.append((sid, request_id))
             if looks_like_playback_request(slot["url"], slot["resource_type"], {"range": slot.get("request_range", "")}):
-                self._start_direct_media_download(slot["url"], slot.get("content_range") or "", slot.get("content_type") or "")
+                self._start_direct_media_download(
+                    slot["url"],
+                    slot.get("content_range") or "",
+                    slot.get("content_type") or "",
+                    headers=slot.get("headers"),
+                )
 
     def _on_cdp_failed(self, sid: int, event: dict[str, Any]) -> None:
         request_id = str(event.get("requestId") or "")
@@ -1400,7 +1601,12 @@ class PlaybackCapture:
                         network_data_bytes=slot.get("network_data_bytes", 0),
                         payload_bytes=slot.get("payload_bytes", 0))
         if status in (200, 206) and looks_like_playback_request(url, resource_type, {"range": request_range}):
-            self._start_direct_media_download(url, content_range, ctype)
+            self._start_direct_media_download(
+                url,
+                content_range,
+                ctype,
+                headers=slot.get("headers"),
+            )
         chunk = self._take_chunk(sid, request_id)
         if chunk and should_save_media(url, status or 206, ctype, chunk, resource_type):
             self._store(url, status or 206, ctype, content_range, request_range, chunk, resource_type)

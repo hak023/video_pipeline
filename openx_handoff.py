@@ -14,6 +14,7 @@ import html
 import math
 import re
 import threading
+import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Callable
@@ -33,7 +34,9 @@ MAX_OPEN_DOWNLOAD_PAGES = 3
 _HANDOFF_GUARD = threading.Lock()
 _HANDOFF_ACTIVE = 0
 _HANDOFF_COND = threading.Condition(_HANDOFF_GUARD)
-_HANDOFF_START_LOCK = threading.Lock()
+_HANDOFF_INIT_LOCK = threading.Lock()
+_WINDOW_MINIMIZED = False
+_WINDOW_MINIMIZED_LOCK = threading.Lock()
 DOWNLOAD_BUTTON_SELECTOR = '[aria-label="Download video"], [button="download"]'
 # 이 시간 안에 버튼이 없으면 다운로드 불가로 처리한다.
 BUTTON_DECISION_MS = 30_000
@@ -142,19 +145,24 @@ def _protect_capture(slug: str):
 
 
 def _minimize_chrome_window(session) -> None:
-    """CDP로 Chrome 창을 최소화해 사용자 화면을 가리지 않는다."""
-    if session is None:
+    """CDP로 Chrome 창을 최소화해 사용자 화면을 가리지 않는다 (단일 실행 보장)."""
+    global _WINDOW_MINIMIZED
+    if session is None or _WINDOW_MINIMIZED:
         return
-    try:
-        windows = session.send("Browser.getWindowForTarget")
-        window_id = (windows or {}).get("windowId")
-        if window_id:
-            session.send("Browser.setWindowBounds", {
-                "windowId": window_id,
-                "bounds": {"windowState": "minimized"},
-            })
-    except Exception:
-        pass
+    with _WINDOW_MINIMIZED_LOCK:
+        if _WINDOW_MINIMIZED:
+            return
+        try:
+            windows = session.send("Browser.getWindowForTarget")
+            window_id = (windows or {}).get("windowId")
+            if window_id:
+                session.send("Browser.setWindowBounds", {
+                    "windowId": window_id,
+                    "bounds": {"windowState": "minimized"},
+                })
+                _WINDOW_MINIMIZED = True
+        except Exception:
+            pass
 
 
 @contextmanager
@@ -393,6 +401,9 @@ def streaming_stop_reason(
     # 대체 수신까지 실패했고 받은 바이트가 없으면 더 기다려도 처음 구간을 채울 수 없다.
     if recovery_failed and quiet >= 10 and not (covered or tap_bytes or stream_bytes):
         return "recovery_failed"
+    # 99% 이상 수신된 상태에서 10초 이상 추가 패킷이 없으면(재생 완료 상태) 조립 완료로 판정
+    if total and (covered / total >= 0.99) and quiet >= 10:
+        return "complete"
     if quiet >= 90 and (covered > 0 or tap_bytes > 0 or stream_bytes > 0 or total):
         return "stalled"
     if quiet >= 45 and media_seen <= 0 and not (covered or total or tap_bytes or stream_bytes):
@@ -404,6 +415,8 @@ def streaming_stop_reason(
 
 def _player_duration(page, capture) -> float | None:
     try:
+        if page.is_closed():
+            return None
         urls = capture.observed_media_urls()
         if not isinstance(urls, list) or not urls:
             return None
@@ -412,19 +425,48 @@ def _player_duration(page, capture) -> float | None:
         if frame is None:
             return None
         value = frame.evaluate("""(urls) => {
-            const videos = document.querySelectorAll('video');
-            if (videos.length !== 1) return null;
-            const src = (videos[0].currentSrc || videos[0].src || '').split('#')[0];
-            if (!urls.includes(src)) return null;
-            const duration = videos[0].duration;
-            return Number.isFinite(duration) && duration > 0 ? duration : null;
+            try {
+                const videos = document.querySelectorAll('video');
+                if (videos.length !== 1) return null;
+                const src = (videos[0].currentSrc || videos[0].src || '').split('#')[0];
+                if (!urls.includes(src)) return null;
+                const duration = videos[0].duration;
+                return Number.isFinite(duration) && duration > 0 ? duration : null;
+            } catch (e) {
+                return null;
+            }
         }""", urls)
     except PlaywrightError as exc:
         log_event("playback_capture", "duration_read_failed", mask_text(str(exc)), level="WARNING")
         return None
+    except Exception:
+        return None
     if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
         return float(value)
     return None
+
+
+def _player_playback_ended(page) -> bool:
+    try:
+        if page.is_closed():
+            return False
+        handle = page.query_selector("#player_frame")
+        frame = handle.content_frame() if handle is not None else None
+        if frame is None:
+            return False
+        return bool(frame.evaluate("""() => {
+            try {
+                const videos = document.querySelectorAll('video');
+                if (!videos.length) return false;
+                for (const v of videos) {
+                    if (v.ended) return true;
+                    if (v.duration > 0 && v.currentTime > 0 && v.currentTime >= v.duration - 1.5) return true;
+                }
+            } catch (e) {}
+            return false;
+        }"""))
+    except Exception:
+        return False
 
 
 def _capture_until_full(
@@ -443,9 +485,12 @@ def _capture_until_full(
     last_signature = None
     quiet_since = time.monotonic()
     last_log = 0.0
+    last_duration_check = 0.0
+    last_ended_check = 0.0
     # 이 탭을 앞으로 가져오면 다른 재생 탭이 백그라운드로 내려가 요청이 멈출 수 있다.
     log("  [재생 캡처] 다른 재생 탭을 멈추지 않도록 이 탭을 앞으로 가져오지 않습니다.")
     while time.monotonic() < deadline:
+        now = time.monotonic()
         if cancel_event is not None and cancel_event.is_set():
             capture.stop_reason = "cancelled"
             log("  [재생 캡처] 사용자 중단(Ctrl+C)으로 캡처를 중단합니다.")
@@ -467,6 +512,7 @@ def _capture_until_full(
             log("  [재생 캡처] 미디어 요청이 CDP 연결보다 먼저 시작되어 플레이어를 다시 불러옵니다.")
             _prime_embed_player(page, popup_watch, capture)
         capture.drain(allow_browser_fallback=True)
+
         progress = capture.media_progress()
         covered = int(progress.get("covered") or 0)
         total = int(progress.get("total") or 0)
@@ -476,22 +522,28 @@ def _capture_until_full(
         stream_bytes = int(progress.get("stream_bytes") or 0)
         expected = int(progress.get("expected_total") or 0)
         received = max(covered, tap_bytes, stream_bytes)
-        MIN_STREAM_START_BYTES = 5 * 1024 * 1024
-        if on_started is not None:
-            if progress.get("complete") or received >= MIN_STREAM_START_BYTES:
-                log(f"  [순차 시작] 안정적인 미디어 수신({received // (1024 * 1024)}MB)을 확인했습니다. 다음 재생 탭의 시작을 허용합니다.")
-                on_started()
-                on_started = None
-            elif total and total < MIN_STREAM_START_BYTES and received >= total:
-                log("  [순차 시작] 미디어 수신 완료를 확인했습니다. 다음 재생 탭의 시작을 허용합니다.")
-                on_started()
-                on_started = None
+        if on_started is not None and (covered > 0 or tap_bytes > 0 or stream_bytes > 0):
+            on_started()
+            on_started = None
         signature = (covered, tap_bytes, stream_bytes)
-        now = time.monotonic()
         if signature != last_signature:
             last_signature = signature
             quiet_since = now
         quiet = now - quiet_since
+
+        # 플레이어 종료 여부는 패킷 수신이 멈추었거나(quiet >= 3초) 15초 이상 경과 시에만 스로틀링하여 확인한다
+        if total > 0 and (quiet >= 3.0 or now - last_ended_check >= 15.0):
+            last_ended_check = now
+            if _player_playback_ended(page):
+                if hasattr(capture, "fill_gaps"):
+                    capture.fill_gaps()
+                progress = capture.media_progress()
+                c_covered = int(progress.get("covered") or 0)
+                c_total = int(progress.get("total") or 0)
+                if progress.get("complete") or (c_total and c_covered / c_total >= 0.99):
+                    log(f"  [재생 캡처] 브라우저 재생 종료 감지: 본편 수신 완료({c_covered}/{c_total} bytes)")
+                    capture.stop_reason = "complete"
+                    return
         reason = streaming_stop_reason(
             quiet=quiet,
             complete=bool(progress.get("complete")),
@@ -628,49 +680,51 @@ def open_download_handoff(
     capture: PlaybackCapture | None = None
     keep_capture = False
     page_limit = max(0, int(max_open_download_pages))
-    # 수신은 병렬로 유지하되 초기화는 직렬화한다. 같은 영상 id는 한 번만 연다.
+    # 수신은 병렬로 유지하되 탭 생성 및 플레이어 초기화는 시차 락(_HANDOFF_INIT_LOCK)으로 직렬화한다.
     with _handoff_slot(max_concurrent_handoffs):
         with _slug_lock(slug), _handoff_start() as release_start, ExitStack() as connection:
             try:
                 p = connection.enter_context(playwright or sync_playwright())
                 with ExitStack() as popup_cleanup:
-                    browser = p.chromium.connect_over_cdp(cdp_url)
-                    context = browser.contexts[0] if browser.contexts else browser.new_context()
-                    session = _cdp_session(browser, context)
-                    existing = _matching_download_target(session, page_url)
-                    if existing:
-                        return {
-                            "ok": True,
-                            "reused": True,
-                            "slug": slug,
-                            "download_page": page_url,
-                            "target_id": existing,
-                        }
-                    wrapper = context.new_page()
-                    popup_watch = _AdPopupWatch(wrapper)
-                    popup_cleanup.callback(popup_watch.stop)
-                    if capture_dir and ENABLE_STREAMING_FALLBACK:
-                        capture = PlaybackCapture(Path(capture_dir))
-                        capture.install(wrapper, cdp_url=cdp_url)
-                        log(f"  [재생 캡처] 버튼 확인 전에 패킷 기록을 시작합니다: {capture.out_dir}")
-                        tap_status = getattr(capture, "tap_status", "")
-                        tap_error = getattr(capture, "tap_error", "")
-                        log(
-                            f"  [재생 캡처] 이 탭의 미디어 응답 저장 연결: {tap_status}"
-                            + (f" ({tap_error})" if tap_error else "")
-                        )
-                    embed_host = _open_embed_frame(wrapper, embed_url, article_url)
-                    if capture is not None:
-                        _attach_player_frame(wrapper, capture)
-                    if minimize_window and session is not None:
-                        _minimize_chrome_window(session)
-                    _prime_embed_player(wrapper, popup_watch, capture)
-                    if capture is not None:
-                        log(
-                            f"  [재생 캡처] CDP 세션 {getattr(capture, 'cdp_sessions', 0)}개 "
-                            f"(iframe 별도 세션이 없으면 1개), "
-                            f"같은 세션 프레임 {getattr(capture, 'frame_attach_skipped', 0)}개"
-                        )
+                    with _HANDOFF_INIT_LOCK:
+                        browser = p.chromium.connect_over_cdp(cdp_url)
+                        context = browser.contexts[0] if browser.contexts else browser.new_context()
+                        session = _cdp_session(browser, context)
+                        existing = _matching_download_target(session, page_url)
+                        if existing:
+                            return {
+                                "ok": True,
+                                "reused": True,
+                                "slug": slug,
+                                "download_page": page_url,
+                                "target_id": existing,
+                            }
+                        wrapper = context.new_page()
+                        popup_watch = _AdPopupWatch(wrapper)
+                        popup_cleanup.callback(popup_watch.stop)
+                        if capture_dir and ENABLE_STREAMING_FALLBACK:
+                            capture = PlaybackCapture(Path(capture_dir))
+                            capture.install(wrapper, cdp_url=cdp_url)
+                            log(f"  [재생 캡처] 버튼 확인 전에 패킷 기록을 시작합니다: {capture.out_dir}")
+                            tap_status = getattr(capture, "tap_status", "")
+                            tap_error = getattr(capture, "tap_error", "")
+                            log(
+                                f"  [재생 캡처] 이 탭의 미디어 응답 저장 연결: {tap_status}"
+                                + (f" ({tap_error})" if tap_error else "")
+                            )
+                        embed_host = _open_embed_frame(wrapper, embed_url, article_url)
+                        if capture is not None:
+                            _attach_player_frame(wrapper, capture)
+                        if minimize_window and session is not None:
+                            _minimize_chrome_window(session)
+                        _prime_embed_player(wrapper, popup_watch, capture)
+                        if capture is not None:
+                            log(
+                                f"  [재생 캡처] CDP 세션 {getattr(capture, 'cdp_sessions', 0)}개 "
+                                f"(iframe 별도 세션이 없으면 1개), "
+                                f"같은 세션 프레임 {getattr(capture, 'frame_attach_skipped', 0)}개"
+                            )
+                        time.sleep(2.0)
                     decision_ms = max(0, int(timeout_ms))
                     log(f"  [분기] download 버튼은 {decision_ms // 1000}초만 확인합니다.")
                     try:
