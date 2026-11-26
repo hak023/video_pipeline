@@ -9,6 +9,7 @@ import base64
 import json
 import re
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,13 @@ _NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 # but do not use it in the normal browser capture path.
 ENABLE_CDP_MEDIA_TAP = False
 BROWSER_FALLBACK_CHUNK_BYTES = 1024 * 1024
+# 큰 응답의 getResponseBody 는 Chrome 이 본문 전체를 base64 JSON 한 덩어리로 만들어 브라우저와 CDP 를 오래 막는다.
+CDP_BODY_MAX_BYTES = 16 * 1024 * 1024
+# 직접 다운로드가 읽기 오류로 끊기면 받은 위치부터 이어 받는다.
+DIRECT_RESUME_ATTEMPTS = 3
+# 직접 다운로드가 아직 접속 중일 때 CDP 스트림을 미루는 한도.
+# Chrome 은 응답이 커지면 스트림 시작 전 버퍼를 버리므로(실측 15MB 까지 유지, 30MB 에서 폐기) 그 전에 시작한다.
+DEFER_PENDING_MAX_BYTES = 8 * 1024 * 1024
 # 네트워크 이벤트의 URL에는 fragment가 없다. 서비스워커가 fragment로 영상을 구분하면 그대로 돌려줘야 한다.
 _MEDIA_FRAGMENT_JS = """(url) => {
     for (const el of document.querySelectorAll('video, audio, source')) {
@@ -152,6 +160,24 @@ def clamp_byte_range(content_range: str, body_len: int) -> tuple[str, bool]:
         return content_range, False
     total_text = "*" if total is None else str(total)
     return f"bytes {start}-{start + body_len - 1}/{total_text}", True
+
+
+def shift_byte_range(content_range: str, offset: int, content_length: str = "") -> str:
+    """본문의 앞 offset 바이트를 받지 못했을 때, 받은 부분이 실제로 시작하는 위치의 Content-Range를 만든다.
+
+    위치를 정할 수 없으면 빈 문자열을 돌려준다. 그 조각은 저장하면 안 된다.
+    """
+    parsed = parse_byte_range(content_range)
+    if parsed is None:
+        if not str(content_length).isdigit():
+            return ""
+        start, end, total = 0, int(content_length), int(content_length)
+    else:
+        start, end, total = parsed
+    start += max(int(offset), 0)
+    if start >= end:
+        return ""
+    return f"bytes {start}-{end - 1}/{'*' if total is None else total}"
 
 
 def range_coverage(spans: list[tuple[int, int]], total: int | None) -> tuple[int, float | None]:
@@ -307,6 +333,8 @@ class PlaybackCapture:
         self._direct_bytes = 0
         self._direct_total = 0
         self._direct_complete = False
+        # "", pending, streaming, complete, failed
+        self._direct_state = ""
         self._direct_lock = threading.Lock()
         self._direct_path = None
         self._io_lock = threading.Lock()
@@ -328,6 +356,12 @@ class PlaybackCapture:
         self._cdp_queue: list[dict[str, Any]] = []
         self._stream_queue: list[tuple[int, str]] = []
         self._stream_attempted: set[tuple[int, str]] = set()
+        # 직접 다운로드가 받는 동안 미룬 CDP 스트림. 직접 다운로드가 실패하면 그때 시작한다.
+        self._stream_deferred: list[tuple[int, str]] = []
+        # 브라우저는 받았지만 캡처하지 못한 구간 (url, start, end). 아무도 채우지 못하면 플레이어를 다시 불러온다.
+        self._uncaptured: list[tuple[str, int, int]] = []
+        # CDP 연결이 늦어 이미 한 번 다시 불러온 탭에서도, 놓친 구간을 위한 재로드는 따로 한 번 허용한다.
+        self._uncaptured_reloaded = False
         self._pending_chunks: list[tuple[int, str, bytes]] = []
         self._response_queue: list[Any] = []
         self._media_frames: dict[str, Any] = {}
@@ -528,6 +562,8 @@ class PlaybackCapture:
         self._cdp_meta.clear()
         self._cdp_queue.clear()
         self._stream_queue.clear()
+        self._stream_deferred.clear()
+        self._uncaptured.clear()
         self._stream_attempted.clear()
         self._pending_chunks.clear()
         self._response_queue.clear()
@@ -548,10 +584,12 @@ class PlaybackCapture:
             return
         self._draining = True
         try:
-            streams = self._stream_queue
+            streams = self._stream_deferred + self._stream_queue
+            self._stream_deferred = []
             self._stream_queue = []
             for sid, request_id in streams:
                 self._start_stream(sid, request_id)
+            self._queue_reload_for_uncaptured()
             chunks = self._pending_chunks
             self._pending_chunks = []
             for sid, request_id, raw in chunks:
@@ -728,6 +766,9 @@ class PlaybackCapture:
     def observed_media_urls(self) -> list[str]:
         return list(self._media_frames)
 
+    def media_frame(self, url: str):
+        return self._media_frames.get(url)
+
     def assemble(self) -> dict[str, Any] | None:
         """전체 범위가 모인 본편만 하나의 mp4로 합친다."""
         self.fill_gaps()
@@ -814,6 +855,8 @@ class PlaybackCapture:
 
     def summary(self) -> dict[str, Any]:
         self._stop_direct_download()
+        # 수신이 끝났다. 미뤄 둔 스트림을 이제 와서 시작하지 않는다.
+        self._stream_deferred.clear()
         self._finish_tap()
         self.drain()
         assembled = self.assemble()
@@ -1084,7 +1127,11 @@ class PlaybackCapture:
         slot["data_events"] = int(slot.get("data_events") or 0) + 1
         slot["network_data_bytes"] = int(slot.get("network_data_bytes") or 0) + int(event.get("dataLength") or 0)
         encoded = event.get("data")
-        if not encoded or not request_id:
+        if not encoded:
+            # 스트림을 켜기 전에 지나간 바이트다. 켠 뒤의 이벤트에는 항상 data 가 실린다.
+            slot["unstreamed_bytes"] = int(slot.get("unstreamed_bytes") or 0) + int(event.get("dataLength") or 0)
+            return
+        if not request_id:
             return
         try:
             raw = base64.b64decode(encoded) if event.get("base64Encoded", True) else str(encoded).encode("utf-8", "replace")
@@ -1127,6 +1174,7 @@ class PlaybackCapture:
             if self._direct_download_url:
                 return
             self._direct_download_url = url
+            self._direct_state = "pending"
             parsed = parse_byte_range(content_range)
             if parsed and parsed[2]:
                 self._direct_total = parsed[2]
@@ -1143,6 +1191,32 @@ class PlaybackCapture:
         )
         self._direct_download_thread = thread
         thread.start()
+
+    def direct_state(self) -> str:
+        with self._direct_lock:
+            return self._direct_state
+
+    def direct_url(self) -> str:
+        with self._direct_lock:
+            return self._direct_download_url
+
+    def _direct_covers(self, url: str) -> bool:
+        """직접 다운로드가 이 URL을 정상 수신 중이거나 다 받았으면 브라우저 쪽 본문은 필요 없다."""
+        with self._direct_lock:
+            return bool(url) and url == self._direct_download_url and self._direct_state in ("streaming", "complete")
+
+    def _defers_stream(self, url: str, received: int) -> bool:
+        """이 URL의 CDP 스트림을 지금 시작하지 않아도 되는지."""
+        if not url:
+            return False
+        with self._direct_lock:
+            if url != self._direct_download_url:
+                return False
+            state = self._direct_state
+        if state in ("streaming", "complete"):
+            return True
+        # 접속 중에는 결과를 모른다. 실패해도 응답 처음부터 받을 수 있는 동안만 기다린다.
+        return state == "pending" and received < DEFER_PENDING_MAX_BYTES
 
     def _stop_direct_download(self) -> None:
         thread = self._direct_download_thread
@@ -1165,8 +1239,6 @@ class PlaybackCapture:
         referer: str,
         request_headers: dict[str, str] | None = None,
     ) -> None:
-        import urllib.request
-
         total = self._direct_total
         parsed = parse_byte_range(content_range)
         if parsed and parsed[2]:
@@ -1199,16 +1271,15 @@ class PlaybackCapture:
             headers_to_try.append(("with_referer", h3))
 
         resp = None
+        used_headers: dict[str, str] = {}
         for strategy, hdrs in headers_to_try:
+            if self.tap_cancel:
+                break
             try:
-                req = urllib.request.Request(url)
-                for k, v in hdrs.items():
-                    if k.lower() in ("host", "content-length"):
-                        continue
-                    req.add_header(k, v)
-                opened = urllib.request.urlopen(req, timeout=10)
+                opened = self._open_direct(url, hdrs)
                 if opened.status in (200, 206):
                     resp = opened
+                    used_headers = hdrs
                     self._trace("direct_strategy_success", strategy=strategy, status=resp.status)
                     break
                 opened.close()
@@ -1217,47 +1288,77 @@ class PlaybackCapture:
                 continue
 
         if resp is not None:
-            try:
-                with resp:
-                    resp_range = resp.headers.get("Content-Range", "")
-                    self._trace("direct_response", url=mask_url(url), status=resp.status,
-                                content_range=resp_range, content_length=resp.headers.get("Content-Length", ""))
-                    p = parse_byte_range(resp_range)
-                    if resp.status == 206 and (p is None or p[0] != 0):
-                        raise ValueError("direct response has an invalid Content-Range")
-                    if p and p[2]:
-                        total = p[2]
-                        with self._direct_lock:
-                            self._direct_total = total
-                    elif not total:
-                        cl = resp.headers.get("Content-Length", "")
-                        if cl.isdigit():
-                            total = int(cl)
+            resumes = 0
+            with dest.open("wb") as handle:
+                while resp is not None:
+                    start = self._direct_bytes
+                    try:
+                        with resp:
+                            resp_range = resp.headers.get("Content-Range", "")
+                            self._trace("direct_response", url=mask_url(url), status=resp.status,
+                                        content_range=resp_range, content_length=resp.headers.get("Content-Length", ""),
+                                        resume_from=start)
+                            p = parse_byte_range(resp_range)
+                            if start == 0:
+                                if resp.status == 206 and (p is None or p[0] != 0):
+                                    raise ValueError("direct response has an invalid Content-Range")
+                            elif resp.status != 206 or p is None or p[0] != start:
+                                raise ValueError("direct resume response has an invalid Content-Range")
+                            if p and p[2]:
+                                total = p[2]
+                                with self._direct_lock:
+                                    self._direct_total = total
+                            elif not total:
+                                cl = resp.headers.get("Content-Length", "")
+                                if cl.isdigit():
+                                    total = int(cl)
+                                    with self._direct_lock:
+                                        self._direct_total = total
                             with self._direct_lock:
-                                self._direct_total = total
+                                self._direct_state = "streaming"
 
-                    with dest.open("wb") as handle:
-                        while True:
-                            if getattr(self, "tap_cancel", False):
-                                break
-                            chunk = resp.read(256 * 1024)
-                            if not chunk:
-                                break
-                            handle.write(chunk)
-                            with self._direct_lock:
-                                self._direct_bytes += len(chunk)
-                                self.last_range_received = f"bytes 0-{self._direct_bytes - 1}/{total or '*'}"
-                    success = bool(
-                        self._direct_bytes > 0 and not self.tap_cancel
-                        and (resp.status != 206 or (p is not None and p[2] is not None))
-                    )
-            except Exception as exc:
-                success = False
-                detail = f"direct_download_stream:{type(exc).__name__}: {mask_text(str(exc))[:200]}"
-                self._note_error(detail)
-                log_event("playback_capture", "direct_download_stream_error", detail, level="ERROR", capture_dir=str(self.out_dir))
-                self._trace("direct_stream_error", url=mask_url(url), error_type=type(exc).__name__,
-                            error=mask_text(str(exc))[:300])
+                            while True:
+                                if self.tap_cancel:
+                                    break
+                                chunk = resp.read(256 * 1024)
+                                if not chunk:
+                                    break
+                                handle.write(chunk)
+                                with self._direct_lock:
+                                    self._direct_bytes += len(chunk)
+                                    self.last_range_received = f"bytes 0-{self._direct_bytes - 1}/{total or '*'}"
+                            success = bool(
+                                self._direct_bytes > 0 and not self.tap_cancel
+                                and (resp.status != 206 or (p is not None and p[2] is not None))
+                            )
+                    except Exception as exc:
+                        success = False
+                        detail = f"direct_download_stream:{type(exc).__name__}: {mask_text(str(exc))[:200]}"
+                        self._note_error(detail)
+                        log_event("playback_capture", "direct_download_stream_error", detail, level="ERROR", capture_dir=str(self.out_dir))
+                        self._trace("direct_stream_error", url=mask_url(url), error_type=type(exc).__name__,
+                                    error=mask_text(str(exc))[:300])
+                    resp = None
+                    received = self._direct_bytes
+                    if (self.tap_cancel or not total or received <= 0 or received >= total
+                            or received <= start or resumes >= DIRECT_RESUME_ATTEMPTS):
+                        break
+                    # 끊긴 위치부터 이어 받는다. 그동안 브라우저 쪽 스트림은 계속 미뤄 둔다.
+                    resumes += 1
+                    handle.flush()
+                    resume_headers = dict(used_headers)
+                    resume_headers.pop("range", None)
+                    resume_headers["Range"] = f"bytes={received}-"
+                    try:
+                        opened = self._open_direct(url, resume_headers)
+                        if opened.status == 206:
+                            resp = opened
+                        else:
+                            opened.close()
+                            self._trace("direct_resume_error", url=mask_url(url), status=opened.status, attempt=resumes)
+                    except Exception as exc:
+                        self._trace("direct_resume_error", url=mask_url(url), error=mask_text(str(exc))[:200],
+                                    attempt=resumes)
         else:
             success = False
             detail = "direct_download: 모든 요청 헤더 전략이 실패함(403 또는 연결 오류)"
@@ -1270,6 +1371,7 @@ class PlaybackCapture:
             final_total = self._direct_total or (final_bytes if success else 0)
             self._direct_total = final_total
             self._direct_complete = bool(success and final_total and final_bytes == final_total)
+            self._direct_state = "complete" if self._direct_complete else "failed"
         self._trace("direct_finished", url=mask_url(url), bytes=final_bytes, total=final_total,
                     complete=self._direct_complete, cancelled=self.tap_cancel)
 
@@ -1289,6 +1391,17 @@ class PlaybackCapture:
                 if self._direct_complete:
                     self.files = [f for f in self.files if f.get("url") != url]
                 self.files.append(item)
+
+    @staticmethod
+    def _open_direct(url: str, headers: dict[str, str]):
+        import urllib.request
+
+        req = urllib.request.Request(url)
+        for k, v in headers.items():
+            if k.lower() in ("host", "content-length"):
+                continue
+            req.add_header(k, v)
+        return urllib.request.urlopen(req, timeout=10)
 
     def _fetch_media_direct(self, url: str, content_range: str = "", referer: str = "") -> bytes:
         """포착된 미디어 URL에 대해 브라우저 세션/헤더 기반으로 직접 본문을 수신한다."""
@@ -1396,6 +1509,15 @@ class PlaybackCapture:
         key = self._meta_key(sid, request_id)
         if key not in self._cdp_meta or key in self._stream_attempted:
             return
+        slot = self._cdp_meta[key]
+        url = str(slot.get("url") or "")
+        if self._defers_stream(url, int(slot.get("network_data_bytes") or 0)):
+            # 같은 바이트가 CDP 이벤트(base64)로 Chrome 브라우저 프로세스를 한 번 더 지나가지 않게 한다.
+            # 요청이 끝나기 전에 직접 다운로드가 실패하면 다음 drain 에서 시작한다.
+            slot["deferred"] = True
+            self._stream_deferred.append((sid, request_id))
+            return
+        slot.pop("deferred", None)
         self._stream_attempted.add(key)
         session = self._cdp_session_by_id.get(sid)
         if session is None:
@@ -1403,11 +1525,22 @@ class PlaybackCapture:
         try:
             result = session.send("Network.streamResourceContent", {"requestId": request_id}) or {}
             buffered = result.get("bufferedData") or ""
-            if buffered:
-                raw = base64.b64decode(buffered)
+            raw = base64.b64decode(buffered) if buffered else b""
+            # 스트림을 켜기 전에 지나간 바이트(data 없는 dataReceived 의 합)보다 버퍼가 짧으면 Chrome 이 앞부분을 버린 것이다.
+            # 이후 청크는 이미 받은 위치에서 이어지므로, 응답 처음에 놓으면 파일이 어긋난다.
+            received = int(slot.get("unstreamed_bytes") or 0)
+            if len(raw) < received:
+                slot["stream_offset"] = received
+                parsed = parse_byte_range(str(slot.get("content_range") or ""))
+                start = parsed[0] if parsed else 0
+                self._uncaptured.append((url, start, start + received))
+                self._trace("cdp_stream_late", session_id=sid, request_id=request_id, url=mask_url(url),
+                            received_before_stream=received, buffered_bytes=len(raw))
+                raw = b""
+            if raw:
                 self._write_chunk(sid, request_id, raw)
             self._trace("cdp_stream_started", session_id=sid, request_id=request_id,
-                        buffered_bytes=len(raw) if buffered else 0)
+                        buffered_bytes=len(raw), stream_offset=int(slot.get("stream_offset") or 0))
         except Exception as exc:
             detail = f"stream_body:{type(exc).__name__}: {mask_text(str(exc))[:200]}"
             self._note_error(detail)
@@ -1424,9 +1557,34 @@ class PlaybackCapture:
             if not tracked and url and not self._player_reloaded and url not in self._untracked_media:
                 self._untracked_media.append(url)
 
-    def reload_untracked_player(self) -> bool:
-        """CDP 연결 전에 시작된 미디어 요청이 있으면 그 프레임을 한 번 다시 불러온다.
+    def _queue_reload_for_uncaptured(self) -> None:
+        """브라우저가 이미 지나간 구간이 비어 있고 직접 다운로드도 채우지 못하면 플레이어 재로드를 예약한다."""
+        if self._uncaptured_reloaded or not self._uncaptured:
+            return
+        if self.direct_state() in ("pending", "streaming"):
+            return
+        progress = self.media_progress()
+        if progress.get("complete"):
+            self._uncaptured.clear()
+            return
+        main_url = str(progress.get("url") or "")
+        gaps = progress.get("gaps") or []
+        for url, start, end in self._uncaptured:
+            if url != main_url:
+                continue
+            if any(max(gap_start, start) < min(gap_end, end) for gap_start, gap_end in gaps):
+                self._uncaptured_reloaded = True
+                self._player_reloaded = False
+                if url not in self._untracked_media:
+                    self._untracked_media.append(url)
+                self._trace("uncaptured_range_reload", url=mask_url(url), start=start, end=end,
+                            direct_state=self.direct_state())
+                break
 
+    def reload_untracked_player(self) -> bool:
+        """캡처하지 못한 미디어 구간이 있으면 그 프레임을 한 번 다시 불러온다.
+
+        CDP 연결 전에 시작된 요청이거나, 스트림을 늦게 시작해 앞부분을 놓친 요청이다.
         다시 불러온 뒤의 요청은 시작부터 관찰되므로 본문 스트림을 받을 수 있다.
         """
         if self._player_reloaded:
@@ -1447,6 +1605,8 @@ class PlaybackCapture:
                 return False
             # 다시 불러오면 이전 문서의 미디어 주소는 더 쓰이지 않는다.
             self._untracked_media.clear()
+            self._uncaptured.clear()
+            self._stream_deferred.clear()
             self._browser_fallback_queue.clear()
             self._browser_fallback_failed = False
             self._trace("player_reloaded", url=mask_url(url))
@@ -1608,10 +1768,27 @@ class PlaybackCapture:
                 headers=slot.get("headers"),
             )
         chunk = self._take_chunk(sid, request_id)
+        offset = int(slot.get("stream_offset") or 0)
+        if chunk and offset:
+            content_range = shift_byte_range(content_range, offset, str(slot.get("content_length") or ""))
+            if content_range:
+                status = 206
+            else:
+                chunk = b""
         if chunk and should_save_media(url, status or 206, ctype, chunk, resource_type):
             self._store(url, status or 206, ctype, content_range, request_range, chunk, resource_type)
             self._cdp_meta.pop(key, None)
             return
+        if slot.get("deferred"):
+            # 스트림을 미뤄 둔 채 끝난 요청이다. 브라우저가 받은 만큼은 캡처하지 못했다고 적어 둔다.
+            received = int(slot.get("network_data_bytes") or 0)
+            if received:
+                parsed = parse_byte_range(str(slot.get("content_range") or ""))
+                start = parsed[0] if parsed else 0
+                self._uncaptured.append((url, start, start + received))
+            if self._direct_covers(url):
+                self._cdp_meta.pop(key, None)
+                return
         if looks_like_playback_request(url, resource_type, {"range": request_range}):
             detail = ", ".join(
                 f"{key}={event[key]}" for key in ("errorText", "canceled", "blockedReason", "corsErrorStatus")
@@ -1665,6 +1842,8 @@ class PlaybackCapture:
             "resource_type": resource_type,
             "claim": claim,
             "sid": sid,
+            "stream_offset": int(slot.get("stream_offset") or 0),
+            "deferred": bool(slot.get("deferred")),
         })
 
     def _on_request(self, request) -> None:
@@ -1773,7 +1952,32 @@ class PlaybackCapture:
             expected_length = int(content_length)
         error_name = ""
         error_detail = ""
-        if not body or (expected_length is not None and len(body) < expected_length):
+        direct_covers = self._direct_covers(url)
+        # 스트림을 늦게 시작해 본문 앞 offset 바이트가 없는 조각이다.
+        offset = int(item.get("stream_offset") or 0)
+        if body and offset and expected_length is not None and offset + len(body) > expected_length:
+            self._trace("cdp_stream_misaligned", session_id=item.get("sid"), request_id=request_id,
+                        url=mask_url(url), stream_offset=offset, streamed_bytes=len(body),
+                        expected_bytes=expected_length)
+            body = b""
+            source = ""
+        if not body or (expected_length is not None and offset + len(body) < expected_length):
+            skip_reason = ""
+            if direct_covers:
+                skip_reason = "direct_stream"
+            elif offset:
+                # Chrome 이 이미 버린 본문이다. 다시 요청해도 받을 수 없다.
+                skip_reason = "evicted"
+            elif expected_length is not None and expected_length > CDP_BODY_MAX_BYTES:
+                skip_reason = "too_large"
+            if skip_reason:
+                self._trace("cdp_body_skipped", session_id=item.get("sid"), request_id=request_id,
+                            url=mask_url(url), reason=skip_reason, streamed_bytes=len(body),
+                            expected_bytes=expected_length)
+        else:
+            skip_reason = "complete"
+        if not skip_reason:
+            started = time.monotonic()
             try:
                 payload = session.send("Network.getResponseBody", {"requestId": request_id})
                 raw = (payload or {}).get("body") or ""
@@ -1786,10 +1990,16 @@ class PlaybackCapture:
                 error_detail = str(exc)
                 self._trace("cdp_body_error", session_id=item.get("sid"), request_id=request_id,
                             url=mask_url(url), error_type=error_name, error=mask_text(error_detail)[:300],
-                            streamed_bytes=len(body), expected_bytes=expected_length)
+                            streamed_bytes=len(body), expected_bytes=expected_length,
+                            elapsed_ms=int((time.monotonic() - started) * 1000))
                 if "TargetClosed" in error_name or "target closed" in str(exc).lower():
                     self.stop_reason = self.stop_reason or "target_closed"
-        if not body and looks_like_playback_request(url, resource_type, {"range": request_range}):
+            elapsed = time.monotonic() - started
+            if elapsed >= 2.0:
+                log_event("playback_capture", "cdp_body_slow",
+                          f"Network.getResponseBody {elapsed:.1f}s", level="WARNING",
+                          capture_dir=str(self.out_dir), bytes=len(body), expected_bytes=expected_length)
+        if not body and not direct_covers and looks_like_playback_request(url, resource_type, {"range": request_range}):
             body = self._fetch_media_direct(url, content_range or request_range, referer=str(getattr(self._page, "url", "") or ""))
             if body:
                 source = "fallback"
@@ -1797,8 +2007,20 @@ class PlaybackCapture:
                     status=status, source=source or "none", bytes=len(body), expected_bytes=expected_length)
         if not body:
             self._claimed.discard(claim)
+            if (direct_covers or item.get("deferred")) and expected_length:
+                start = parsed_range[0] if parsed_range else 0
+                self._uncaptured.append((url, start, start + expected_length))
+            if direct_covers:
+                return
             self._note_skipped(url, status, ctype, 0, f"cdp_body_error:{error_name or 'empty'}", error_detail)
             return
+        if offset and source == "stream":
+            content_range = shift_byte_range(content_range, offset, content_length)
+            if not content_range:
+                self._claimed.discard(claim)
+                self._note_skipped(url, status, ctype, len(body), "stream_misaligned")
+                return
+            status = 206
         if resource_type != "media" and looks_like_playback_request(url, resource_type, {"range": request_range}):
             resource_type = "media" if not is_media_target(url, ctype) else resource_type
         self._store(url, status, ctype, content_range, request_range, body, resource_type)

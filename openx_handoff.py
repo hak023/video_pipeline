@@ -46,6 +46,22 @@ ENABLE_STREAMING_FALLBACK = True
 CAPTURE_MAX_SECONDS = 3 * 60 * 60
 DEFAULT_STREAMING_MAX_DURATION_SECONDS = 2 * 60 * 60
 _PRIME_ROUNDS = 4
+# 매초 확인하면 바쁜 렌더러에 evaluate 왕복이 쌓인다. 영상 길이는 몇 초 늦게 알아도 된다.
+DURATION_CHECK_SECONDS = 5.0
+# 직접 다운로드가 본편을 받는 동안에는 브라우저 재생이 필요 없다. 디코딩과 중복 수신을 멈춘다.
+PAUSE_PLAYER_DURING_DIRECT = True
+DIRECT_PAUSE_CHECK_SECONDS = 10.0
+# 한 바퀴가 이보다 오래 걸리면 Chrome/CDP 가 밀린 것이다. 원인 측정을 위해 기록한다.
+LOOP_STALL_WARN_SECONDS = 10.0
+_PAUSE_DIRECT_JS = """(url) => {
+    let n = 0;
+    document.querySelectorAll('video').forEach(v => {
+        const src = (v.currentSrc || v.src || '').split('#')[0];
+        if (src !== url) return;
+        try { v.pause(); n++; } catch (e) {}
+    });
+    return n;
+}"""
 _PRIME_PLAYER_JS = """() => {
     const sels = ['#overlay', '#playback', '#player-button', '.play-button', '.vjs-big-play-button',
                   'button.play', '.jw-icon-display', '.jw-display-icon-container',
@@ -469,6 +485,35 @@ def _player_playback_ended(page) -> bool:
         return False
 
 
+def _pause_player_for_direct(page, capture, url: str) -> int:
+    """직접 다운로드가 같은 파일을 받는 동안 브라우저 재생을 멈춘다.
+
+    재생을 멈추면 디코딩과 렌더링, 그리고 같은 바이트를 CDP 로 한 번 더 넘기는 일이 함께 줄어든다.
+    광고 영상처럼 주소가 다른 video 는 건드리지 않는다.
+    """
+    frames = []
+    getter = getattr(capture, "media_frame", None)
+    frame = getter(url) if callable(getter) else None
+    if frame is not None:
+        frames.append(frame)
+    try:
+        handle = page.query_selector("#player_frame")
+        player = handle.content_frame() if handle is not None else None
+        if player is not None and player not in frames:
+            frames.append(player)
+    except Exception:
+        pass
+    paused = 0
+    for fr in frames:
+        try:
+            value = fr.evaluate(_PAUSE_DIRECT_JS, url)
+        except Exception:
+            continue
+        if isinstance(value, int) and not isinstance(value, bool):
+            paused += value
+    return paused
+
+
 def _capture_until_full(
     page,
     capture,
@@ -485,8 +530,10 @@ def _capture_until_full(
     last_signature = None
     quiet_since = time.monotonic()
     last_log = 0.0
-    last_duration_check = 0.0
+    last_duration_check = float("-inf")
     last_ended_check = 0.0
+    last_pause_check = float("-inf")
+    paused_for_direct = False
     # 이 탭을 앞으로 가져오면 다른 재생 탭이 백그라운드로 내려가 요청이 멈출 수 있다.
     log("  [재생 캡처] 다른 재생 탭을 멈추지 않도록 이 탭을 앞으로 가져오지 않습니다.")
     while time.monotonic() < deadline:
@@ -497,7 +544,8 @@ def _capture_until_full(
             return
         if popup_watch is not None:
             popup_watch.close()
-        if max_duration_seconds > 0:
+        if max_duration_seconds > 0 and now - last_duration_check >= DURATION_CHECK_SECONDS:
+            last_duration_check = now
             duration = _player_duration(page, capture)
             if duration is not None:
                 capture.video_duration = duration
@@ -506,12 +554,33 @@ def _capture_until_full(
                     log(f"  [재생 캡처] 영상 길이 {duration:.1f}초가 상한 {max_duration_seconds:.1f}초 이상이므로 건너뜁니다.")
                     return
         capture.attach_frames(page)
+        primed = False
         reload = getattr(capture, "reload_untracked_player", None)
         if reload is not None and reload() is True:
             # 버튼 판정이 끝난 뒤에만 다시 불러온다. 다시 불러온 플레이어도 깨워야 재생이 시작된다.
-            log("  [재생 캡처] 미디어 요청이 CDP 연결보다 먼저 시작되어 플레이어를 다시 불러옵니다.")
+            log("  [재생 캡처] 캡처하지 못한 미디어 구간이 있어 플레이어를 다시 불러옵니다.")
             _prime_embed_player(page, popup_watch, capture)
+            primed = True
+        drain_started = time.monotonic()
         capture.drain(allow_browser_fallback=True)
+        drain_seconds = time.monotonic() - drain_started
+
+        state_getter = getattr(capture, "direct_state", None)
+        direct_state = state_getter() if callable(state_getter) else ""
+        if (PAUSE_PLAYER_DURING_DIRECT and direct_state == "streaming"
+                and now - last_pause_check >= DIRECT_PAUSE_CHECK_SECONDS):
+            last_pause_check = now
+            direct_url = capture.direct_url()
+            if isinstance(direct_url, str) and direct_url and _pause_player_for_direct(page, capture, direct_url):
+                if not paused_for_direct:
+                    log("  [재생 캡처] 직접 다운로드가 본편을 받고 있어 브라우저 재생을 일시정지합니다(Chrome 부하 감소).")
+                paused_for_direct = True
+        elif paused_for_direct and direct_state != "streaming":
+            paused_for_direct = False
+            if not capture.media_progress().get("complete"):
+                log(f"  [재생 캡처] 직접 다운로드가 끝나지 못해({direct_state}) 브라우저 재생으로 다시 받습니다.")
+                _prime_embed_player(page, popup_watch, capture)
+                primed = True
 
         progress = capture.media_progress()
         covered = int(progress.get("covered") or 0)
@@ -596,6 +665,16 @@ def _capture_until_full(
                 return
         if popup_watch is not None:
             popup_watch.close()
+        iteration = time.monotonic() - now
+        # 플레이어를 다시 깨운 바퀴는 원래 몇 초 걸린다.
+        if iteration >= LOOP_STALL_WARN_SECONDS and not primed:
+            log_event(
+                "playback_capture", "loop_stall",
+                f"재생 캡처 루프 한 바퀴 {iteration:.1f}s (drain {drain_seconds:.1f}s)",
+                level="WARNING", capture_dir=str(getattr(capture, "out_dir", "")),
+                iteration_seconds=round(iteration, 1), drain_seconds=round(drain_seconds, 1),
+                direct_state=direct_state if isinstance(direct_state, str) else "",
+            )
     capture.stop_reason = getattr(capture, "stop_reason", "") or "limit"
     log("  [재생 캡처] 최대 대기 시간에 도달해 중단")
 

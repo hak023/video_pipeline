@@ -841,6 +841,137 @@ class PlaybackStreamingProgressTests(unittest.TestCase):
                 self.assertEqual(capture.media_progress()["complete"], complete)
                 self.assertEqual(bool(capture.assemble()), complete)
 
+    def test_direct_download_resumes_from_received_offset_after_read_error(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            url = "https://cdn.test/video.mp4"
+            capture._direct_download_url = url
+            capture._direct_path = Path(directory) / "media_stream.mp4"
+
+            def response(content_range, chunks):
+                resp = mock.MagicMock(status=206, headers={"Content-Range": content_range})
+                resp.read.side_effect = chunks
+                resp.__enter__.return_value = resp
+                return resp
+
+            first = response("bytes 0-7/8", [b"abcd", OSError("read timed out")])
+            second = response("bytes 4-7/8", [b"efgh", b""])
+            with mock.patch("urllib.request.urlopen", side_effect=[first, second]) as urlopen:
+                capture._run_direct_download(url, "bytes 0-7/8", "video/mp4", capture._direct_path, "")
+            self.assertEqual(urlopen.call_args.args[0].get_header("Range"), "bytes=4-")
+            self.assertEqual(capture.direct_state(), "complete")
+            self.assertEqual(capture._direct_path.read_bytes(), b"abcdefgh")
+            self.assertTrue(capture.media_progress()["complete"])
+
+    def test_cdp_stream_waits_while_direct_download_owns_the_url(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            session = mock.Mock()
+            session.send.return_value = {}
+            capture._wire_session(session)
+            sid = id(session)
+            url = "https://cdn.test/video.mp4"
+            capture._direct_download_url = url
+            capture._direct_state = "streaming"
+            for request_id in ("1", "2"):
+                capture._on_cdp_request(sid, {"requestId": request_id, "type": "Media",
+                                              "request": {"url": url, "headers": {"Range": "bytes=0-"}}})
+                capture._on_cdp_response(sid, {"requestId": request_id, "type": "Media", "response": {
+                    "url": url, "status": 206, "mimeType": "video/mp4",
+                    "headers": {"content-range": "bytes 0-7/8"}}})
+            session.send.reset_mock()
+            capture._on_cdp_finished(session, sid, {"requestId": "1"})
+            with mock.patch.object(capture, "_fetch_media_direct") as fetch:
+                capture.drain()
+            fetch.assert_not_called()
+            sent = [call.args[0] for call in session.send.call_args_list]
+            self.assertNotIn("Network.streamResourceContent", sent)
+            self.assertNotIn("Network.getResponseBody", sent)
+            self.assertEqual(capture.skipped_count, 0)
+
+            capture._direct_state = "failed"
+            capture.drain()
+            streamed = [call.args[1]["requestId"] for call in session.send.call_args_list
+                        if call.args[0] == "Network.streamResourceContent"]
+            self.assertEqual(streamed, ["2"])
+
+    def test_late_stream_is_stored_at_its_real_offset_and_queues_one_reload(self):
+        import base64
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            session = mock.Mock()
+            # Chrome 은 응답이 커지면 스트림 시작 전 버퍼를 버리고 빈 bufferedData 를 돌려준다.
+            session.send.return_value = {"bufferedData": ""}
+            capture._wire_session(session)
+            sid = id(session)
+            url = "https://cdn.test/video.mp4"
+            frame = mock.Mock()
+            capture._media_frames[url] = frame
+            with mock.patch.object(capture, "_start_direct_media_download"):
+                capture._on_cdp_request(sid, {"requestId": "1", "type": "Media",
+                                              "request": {"url": url, "headers": {"Range": "bytes=0-"}}})
+                capture._on_cdp_response(sid, {"requestId": "1", "type": "Media", "response": {
+                    "url": url, "status": 206, "mimeType": "video/mp4",
+                    "headers": {"content-range": "bytes 0-9/10"}}})
+                capture._on_cdp_data(sid, {"requestId": "1", "dataLength": 6})
+                capture.drain()
+                capture._on_cdp_data(sid, {"requestId": "1", "dataLength": 4,
+                                           "data": base64.b64encode(b"ghij").decode()})
+                capture._on_cdp_finished(session, sid, {"requestId": "1"})
+                capture.drain()
+            self.assertNotIn("Network.getResponseBody", [call.args[0] for call in session.send.call_args_list])
+            self.assertEqual([(item["content_range"], item["status"]) for item in capture.files],
+                             [("bytes 6-9/10", 206)])
+            self.assertEqual(Path(capture.files[0]["path"]).read_bytes(), b"ghij")
+            self.assertFalse(capture.media_progress()["complete"])
+            self.assertFalse(capture.reload_untracked_player())
+            capture.drain()
+            self.assertTrue(capture.reload_untracked_player())
+            frame.evaluate.assert_called_once()
+            self.assertFalse(capture.reload_untracked_player())
+
+    def test_large_cdp_body_is_not_requested_with_get_response_body(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            session = mock.Mock()
+            size = playback_capture.CDP_BODY_MAX_BYTES + 1
+            item = {"session": session, "sid": 42, "request_id": "id", "url": "https://cdn.test/video.mp4",
+                    "status": 206, "content_type": "video/mp4", "content_range": f"bytes 0-{size - 1}/{size}",
+                    "request_range": "bytes=0-", "resource_type": "media", "claim": ""}
+            with mock.patch.object(capture, "_fetch_media_direct", return_value=b"") as fetch:
+                capture._read_cdp_body(item)
+            session.send.assert_not_called()
+            fetch.assert_called_once()
+            events = [entry["event"] for entry in capture.summary()["capture_trace"]]
+            self.assertIn("cdp_body_skipped", events)
+
+    def test_player_pauses_during_direct_download_and_resumes_when_it_fails(self):
+        import openx_handoff
+
+        capture = mock.Mock(media_seen=1, tap_inflight=0, tap_bytes=0, stop_reason="", cache_error="")
+        capture.media_progress.return_value = {"covered": 0, "total": 0, "complete": False}
+        capture.direct_url.return_value = "https://cdn.test/video.mp4"
+        states = iter(["streaming"] * 3 + ["failed"] * 100)
+        capture.direct_state.side_effect = lambda: next(states)
+        page = mock.Mock()
+        clock = [0.0]
+        page.wait_for_timeout.side_effect = lambda ms: clock.__setitem__(0, clock[0] + ms / 1000)
+        with mock.patch.object(openx_handoff, "_pause_player_for_direct", return_value=1) as pause, \
+                mock.patch.object(openx_handoff, "_prime_embed_player") as prime, \
+                mock.patch.object(openx_handoff, "log"), \
+                mock.patch("time.monotonic", side_effect=lambda: clock[0]):
+            openx_handoff._capture_until_full(page, capture, max_seconds=8, max_duration_seconds=0)
+        pause.assert_called_once()
+        prime.assert_called_once()
+
     def test_preflight_is_not_treated_as_a_media_body(self):
         import playback_capture
 
@@ -1123,13 +1254,14 @@ class StreamingDurationTests(unittest.TestCase):
         page = mock.Mock()
         clock = [0.0]
         page.wait_for_timeout.side_effect = lambda ms: clock.__setitem__(0, clock[0] + ms / 1000)
-        with mock.patch.object(openx_handoff, "_player_duration", side_effect=[None, 7199, 7200]), \
+        with mock.patch.object(openx_handoff, "_player_duration", side_effect=[None, 7199, 7200]) as duration, \
                 mock.patch.object(openx_handoff, "log"), \
                 mock.patch("time.monotonic", side_effect=lambda: clock[0]):
-            openx_handoff._capture_until_full(page, capture, max_seconds=10, max_duration_seconds=7200)
+            openx_handoff._capture_until_full(page, capture, max_seconds=30, max_duration_seconds=7200)
         self.assertEqual(capture.stop_reason, "duration_limit")
         self.assertEqual(capture.video_duration, 7200)
-        self.assertEqual(capture.drain.call_count, 2)
+        # 길이 확인은 매 바퀴가 아니라 DURATION_CHECK_SECONDS 마다 한다.
+        self.assertEqual(duration.call_count, 3)
 
     def test_streaming_skip_is_recorded_and_not_reported_as_failure(self):
         import main

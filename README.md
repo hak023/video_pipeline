@@ -64,6 +64,15 @@ CDP 본문 읽기 오류와 네트워크 요청 실패의 상세 내용은 민�
 `browser_stream_chunk`, `browser_stream_error` 이벤트에서 확인할 수 있습니다.
 `cdp_response`와 `cdp_stream_error`의 `request_tracked=false`는 CDP 세션이 그 요청보다 늦게 붙었다는 뜻입니다.
 
+직접 다운로드가 본편을 받는 동안에는 같은 바이트를 Chrome에서 한 번 더 받지 않습니다. 그 URL의 CDP 스트림 연결을
+미루고 플레이어의 해당 영상을 일시정지합니다(`openx_handoff.py`의 `PAUSE_PLAYER_DURING_DIRECT`로 끌 수 있음).
+직접 다운로드는 읽기 오류로 끊기면 받은 위치부터 최대 3번 이어 받고, 그래도 끝내지 못하면 재생을 다시 시작해
+CDP 스트림으로 받습니다. 스트림을 늦게 연결해 Chrome이 앞부분을 이미 버렸다면(`cdp_stream_late`) 받은 조각을
+실제 위치에 저장하고, 빈 구간이 남으면 플레이어 프레임을 한 번 다시 불러옵니다(`uncaptured_range_reload`).
+직접 다운로드가 처음부터 거부되는 서버에서는 이 절감이 적용되지 않고 이전과 같이 CDP 스트림으로만 받습니다.
+`Network.getResponseBody`는 16 MiB를 넘는 응답에는 호출하지 않으며(`cdp_body_skipped`), 2초 이상 걸리면
+`cdp_body_slow`를 남깁니다. 재생 캡처 루프 한 바퀴가 10초 이상 걸리면 `loop_stall`에 drain 소요 시간과 함께 기록합니다.
+
 403 이후 Chrome 재생 캡처는 한 프로세스에서 **최대 5개**입니다 (`--workers 10`이어도
 재생 캡처는 5개를 넘지 않음). 재생 탭은 이 상한 안에서 병렬로 시작합니다.
 기존 사용자 탭, 탐색용 브라우저, 별도 상한의 download 탭은
