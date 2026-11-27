@@ -596,9 +596,11 @@ def _is_media_response(url: str, ctype: str) -> bool:
     return bool(_MEDIA_URL_RE.search(url)) or any(t in ctype for t in ("mpegurl", "dash+xml", "video/", "audio/"))
 
 
-def attach_page_diagnostics(page: Any, label: str = "") -> None:
+def attach_page_diagnostics(page: Any, label: str = "",
+                            console_filter: Callable[[Any], bool] | None = None) -> None:
     """Playwright Page 에 console/pageerror/requestfailed/response/frame 수집기를 연결.
-    핸들러 내부 예외는 모두 삼켜서 탐색 흐름을 방해하지 않는다."""
+    핸들러 내부 예외는 모두 삼켜서 탐색 흐름을 방해하지 않는다.
+    console_filter 가 False 를 돌려준 console 메시지는 기록하지 않는다."""
     diag = get_diagnostics()
     if not diag.enabled:
         return
@@ -612,6 +614,8 @@ def attach_page_diagnostics(page: Any, label: str = "") -> None:
         return wrapper
 
     def on_console(msg: Any) -> None:
+        if console_filter is not None and not console_filter(msg):
+            return
         loc = msg.location or {}
         u = loc.get("url", "")
         line = loc.get("lineNumber")

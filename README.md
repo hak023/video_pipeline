@@ -73,6 +73,19 @@ CDP 스트림으로 받습니다. 스트림을 늦게 연결해 Chrome이 앞부
 `Network.getResponseBody`는 16 MiB를 넘는 응답에는 호출하지 않으며(`cdp_body_skipped`), 2초 이상 걸리면
 `cdp_body_slow`를 남깁니다. 재생 캡처 루프 한 바퀴가 10초 이상 걸리면 `loop_stall`에 drain 소요 시간과 함께 기록합니다.
 
+재생 시도 뒤 `PLAYER_INIT_WAIT_SECONDS`(12초) 안에 플레이어가 만들어지지 않고 로더만 보이면(`player_init_stuck`),
+사용자 Chrome 프로필에 남은 그 임베드의 서비스워커·IndexedDB 상태가 초기화를 막은 것으로 보고
+플레이어 프레임의 저장소만 지운 뒤 프레임을 한 번 다시 불러옵니다(`player_storage_reset`).
+지우는 대상은 임베드 origin과 글 페이지 site 조합의 서비스워커·IndexedDB·Cache Storage·localStorage이며,
+쿠키와 다른 사이트 데이터는 건드리지 않습니다. CDP로 지우지 못하면 프레임 안에서 직접 지웁니다.
+복구되면 `player_init_recovered`, 그래도 멈춰 있으면 `player_init_still_stuck`(ERROR)을 남기고 기존 판정대로 진행합니다.
+각 이벤트의 `player`에는 로더·JW 상태·video 상태·안내 창 문구·localStorage 접근 결과가,
+`storage`에는 서비스워커 등록(`sw_registrations`)과 IndexedDB 버전·열기 결과(`idb_open`, `timeout`이면 다른 연결 뒤에서 대기 중)가 들어갑니다.
+캡처가 멈추거나 버튼 없음으로 끝날 때도 같은 내용을 `player_state_at_stop`으로 남깁니다.
+재생 탭의 console 오류와 실패한 요청은 `browser/` 로그에 `handoff:<영상 id>` 라벨로 기록합니다
+(플레이어의 DevTools 탐지가 반복하는 console.clear/table 출력은 제외). 임베드를 글 페이지에 올리지 못해
+wrapper로 열었다면 `embed_article_fallback`이 남습니다.
+
 403 이후 Chrome 재생 캡처는 한 프로세스에서 **최대 5개**입니다 (`--workers 10`이어도
 재생 캡처는 5개를 넘지 않음). 재생 탭은 이 상한 안에서 병렬로 시작합니다.
 기존 사용자 탭, 탐색용 브라우저, 별도 상한의 download 탭은

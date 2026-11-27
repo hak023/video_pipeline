@@ -448,6 +448,11 @@ def _finish_with_openx_handoff(
                 f"response {playback.get('response_count', 0)}건. "
                 "완료로 기록하지 않습니다. playback_capture.json 의 response_samples 를 확인한 뒤 다시 실행하세요."
             )
+            if (outcome.get("player_init") or {}).get("status") == "stuck":
+                reason += (
+                    " 플레이어가 로더에서 멈춰 만들어지지 않았고, 저장소 초기화 후에도 같았습니다. "
+                    "events.jsonl 의 player_init_still_stuck 을 확인하세요."
+                )
             res.update(status="failed", fatal=True, reason=reason, handoff=True, no_download_button=True, playback=playback)
             log(f"  [403 인수 실패] {item_name}: {reason}")
             log_event("download", "playback_capture_empty", reason, level="ERROR", page_url=embed)

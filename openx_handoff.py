@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
-from diagnostics import log_event, mask_text
+from diagnostics import attach_page_diagnostics, log_event, mask_text
 from playback_capture import PlaybackCapture
 from playwright.sync_api import Error as PlaywrightError, Page, sync_playwright
 from progress import log
@@ -53,6 +53,153 @@ PAUSE_PLAYER_DURING_DIRECT = True
 DIRECT_PAUSE_CHECK_SECONDS = 10.0
 # 한 바퀴가 이보다 오래 걸리면 Chrome/CDP 가 밀린 것이다. 원인 측정을 위해 기록한다.
 LOOP_STALL_WARN_SECONDS = 10.0
+# 재생 시도 뒤 이 시간 안에 플레이어가 만들어지지 않으면 로더에서 멈춘 것으로 본다.
+PLAYER_INIT_WAIT_SECONDS = 12.0
+# 멈춘 플레이어를 되살릴 때 지우는 저장소. 쿠키는 지우지 않는다.
+PLAYER_RESET_STORAGE_TYPES = "service_workers,indexeddb,cache_storage,local_storage"
+# 플레이어 프레임의 초기화 상태. 값을 읽다 난 오류는 'ERR:이름' 으로 남겨 저장소 차단 여부를 알 수 있게 한다.
+_PLAYER_STATE_JS = r"""() => {
+    const out = {};
+    const safe = (key, fn) => {
+        try { out[key] = fn(); } catch (e) { out[key] = 'ERR:' + String((e && e.name) || e).slice(0, 60); }
+    };
+    safe('ready_state', () => document.readyState);
+    safe('visibility', () => document.visibilityState);
+    safe('loader', () => !!document.querySelector('#player .loader'));
+    safe('overlay', () => !!document.getElementById('overlay'));
+    safe('jw_dom', () => !!document.querySelector('.jwplayer'));
+    safe('jw_lib', () => typeof jwplayer === 'function');
+    safe('sotrym', () => typeof window.SoTrym === 'function');
+    safe('jw', () => {
+        if (typeof jwplayer !== 'function') return null;
+        const player = jwplayer();
+        if (!player || typeof player.getState !== 'function') return null;
+        const list = typeof player.getPlaylist === 'function' ? player.getPlaylist() : null;
+        return {
+            state: String(player.getState() || ''),
+            playlist: list ? list.length : 0,
+            position: typeof player.getPosition === 'function' ? Math.round(player.getPosition() || 0) : null,
+        };
+    });
+    safe('videos', () => Array.from(document.querySelectorAll('video')).slice(0, 4).map(v => ({
+        ready: v.readyState, network: v.networkState, paused: v.paused,
+        time: Math.round(v.currentTime || 0), error: v.error ? v.error.code : 0,
+        has_src: !!(v.currentSrc || v.src),
+    })));
+    safe('notice', () => {
+        const box = document.querySelector('iframe.notify');
+        if (!box) return '';
+        let text = '';
+        try { text = (box.contentDocument && box.contentDocument.body && box.contentDocument.body.innerText) || ''; } catch (e) {}
+        return (text || 'notify').replace(/\s+/g, ' ').slice(0, 300);
+    });
+    safe('body_text', () => ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 200));
+    safe('devtool_flag', () => sessionStorage.getItem('devtool') || '');
+    safe('local_storage', () => {
+        localStorage.setItem('__vp_probe', '1');
+        localStorage.removeItem('__vp_probe');
+        return 'ok';
+    });
+    safe('sw_controller', () => {
+        if (!('serviceWorker' in navigator)) return 'unsupported';
+        const worker = navigator.serviceWorker.controller;
+        return worker ? worker.scriptURL.split('/').pop() + ':' + worker.state : 'none';
+    });
+    return out;
+}"""
+# 서비스워커 등록과 IndexedDB 상태. 응답이 없는 호출은 2초 뒤 'timeout' 으로 남긴다.
+# IndexedDB 는 이미 있는 DB 만 버전 없이 열어 보고 바로 닫는다. 'timeout' 이면 다른 열기 요청 뒤에서 대기 중이다.
+_PLAYER_STORAGE_JS = r"""async () => {
+    const out = {};
+    const LATE = '__timeout__';
+    const timed = (promise, ms) => Promise.race([promise, new Promise(done => setTimeout(() => done(LATE), ms))]);
+    const fail = (e) => 'ERR:' + String((e && e.name) || e).slice(0, 60) + ': ' + String((e && e.message) || '').slice(0, 120);
+    const worker = (w) => w ? w.scriptURL.split('/').pop() + ':' + w.state : '';
+    try {
+        if (!('serviceWorker' in navigator)) out.sw_registrations = 'unsupported';
+        else {
+            const regs = await timed(navigator.serviceWorker.getRegistrations(), 2000);
+            out.sw_registrations = regs === LATE ? 'timeout' : regs.map(r => ({
+                scope: r.scope, active: worker(r.active), waiting: worker(r.waiting), installing: worker(r.installing),
+            }));
+        }
+    } catch (e) { out.sw_registrations = fail(e); }
+    const openProbe = (name) => new Promise(done => {
+        let req;
+        try { req = indexedDB.open(name); } catch (e) { return done(fail(e)); }
+        req.onupgradeneeded = () => { try { req.transaction.abort(); } catch (e) {} done('missing'); };
+        req.onsuccess = () => {
+            const db = req.result;
+            const info = 'ok v' + db.version + ' stores=' + Array.from(db.objectStoreNames).join(',');
+            db.close();
+            done(info);
+        };
+        req.onerror = () => done('ERR:' + String((req.error && req.error.name) || 'error'));
+        req.onblocked = () => done('blocked');
+    });
+    try {
+        if (!('indexedDB' in window)) out.idb = 'unsupported';
+        else if (typeof indexedDB.databases !== 'function') out.idb = 'no_databases_api';
+        else {
+            const dbs = await timed(indexedDB.databases(), 2000);
+            if (dbs === LATE) out.idb = 'timeout';
+            else {
+                out.idb = dbs.map(d => ({ name: d.name, version: d.version }));
+                out.idb_open = {};
+                for (const d of dbs.slice(0, 3)) {
+                    const opened = await timed(openProbe(d.name), 2000);
+                    out.idb_open[d.name] = opened === LATE ? 'timeout' : opened;
+                }
+            }
+        }
+    } catch (e) { out.idb = fail(e); }
+    try {
+        if (window.caches) {
+            const keys = await timed(caches.keys(), 2000);
+            out.caches = keys === LATE ? 'timeout' : keys.length;
+        }
+    } catch (e) { out.caches = fail(e); }
+    return out;
+}"""
+# CDP 로 지우지 못했을 때만 쓴다. 열려 있는 연결 때문에 삭제가 밀리면 프레임을 다시 불러온 뒤 진행된다.
+_CLEAR_PLAYER_STORAGE_JS = r"""async () => {
+    const out = { sw: 0, idb: [], caches: 0, local: false, errors: [] };
+    const LATE = '__timeout__';
+    const timed = (promise, ms) => Promise.race([promise, new Promise(done => setTimeout(() => done(LATE), ms))]);
+    const note = (step, e) => out.errors.push(step + ':' + String((e && e.name) || e).slice(0, 60));
+    try {
+        const regs = await timed(navigator.serviceWorker.getRegistrations(), 2000);
+        if (Array.isArray(regs)) {
+            for (const reg of regs) {
+                if (await timed(reg.unregister(), 2000) === true) out.sw++;
+            }
+        }
+    } catch (e) { note('sw', e); }
+    try {
+        const dbs = await timed(indexedDB.databases(), 2000);
+        if (Array.isArray(dbs)) {
+            for (const d of dbs) {
+                const result = await timed(new Promise(done => {
+                    const req = indexedDB.deleteDatabase(d.name);
+                    req.onsuccess = () => done('deleted');
+                    req.onerror = () => done('error');
+                    req.onblocked = () => done('blocked');
+                }), 2000);
+                out.idb.push(d.name + ':' + (result === LATE ? 'timeout' : result));
+            }
+        }
+    } catch (e) { note('idb', e); }
+    try {
+        const keys = await timed(caches.keys(), 2000);
+        if (Array.isArray(keys)) {
+            for (const key of keys) {
+                if (await caches.delete(key)) out.caches++;
+            }
+        }
+    } catch (e) { note('caches', e); }
+    try { localStorage.clear(); out.local = true; } catch (e) { note('local', e); }
+    return out;
+}"""
 _PAUSE_DIRECT_JS = """(url) => {
     let n = 0;
     document.querySelectorAll('video').forEach(v => {
@@ -268,8 +415,11 @@ def _open_embed_frame(page, embed_url: str, page_url: str | None) -> str:
                 embed_url,
             )
             return "article"
-        except Exception:
-            pass
+        except Exception as exc:
+            # wrapper 에서는 플레이어 저장소가 막혀 로더에서 멈출 수 있으므로 폴백한 이유를 남긴다.
+            log_event("playback_capture", "embed_article_fallback",
+                      f"글 페이지에 임베드를 올리지 못해 wrapper 로 엽니다: {type(exc).__name__}: {mask_text(str(exc))[:200]}",
+                      level="WARNING", page_url=article)
     page.set_content(_wrapper_html(embed_url), wait_until="domcontentloaded")
     return "wrapper"
 
@@ -517,7 +667,7 @@ def _pause_player_for_direct(page, capture, url: str) -> int:
 def _capture_until_full(
     page,
     capture,
-    max_seconds: int = CAPTURE_MAX_SECONDS,
+    max_seconds: int | None = None,
     popup_watch: _AdPopupWatch | None = None,
     on_started: Callable[[], None] | None = None,
     cancel_event=None,
@@ -526,6 +676,8 @@ def _capture_until_full(
     """버튼이 없다고 판정한 뒤의 스트리밍 수신이다. 이후 버튼이 생겨도 download 페이지로 바꾸지 않는다."""
     import time
 
+    if max_seconds is None:
+        max_seconds = CAPTURE_MAX_SECONDS
     deadline = time.monotonic() + max(int(max_seconds), 1)
     last_signature = None
     quiet_since = time.monotonic()
@@ -635,6 +787,10 @@ def _capture_until_full(
                 f"  [재생 캡처] 중단 사유: {reason}. 받은 본문 {covered}/{total or expected} bytes, "
                 f"스트림 수신 {stream_bytes} bytes, 미디어 응답 {media_seen}건, 오류 {errors}"
             )
+            stopped = _log_player_state(page, "player_state_at_stop", f"중단 시점 플레이어 상태: {reason}",
+                                        level="WARNING", storage=True, reason=reason)
+            if stopped is not None:
+                log(f"  [플레이어] 중단 시점 상태: {_state_brief(stopped)}")
             return
         if now - last_log >= 5:
             last_log = now
@@ -717,6 +873,323 @@ def _prime_embed_player(page, popup_watch: _AdPopupWatch | None = None, capture=
             popup_watch.close()
 
 
+def _keep_console_message(msg) -> bool:
+    """플레이어의 DevTools 탐지가 0.5초마다 찍는 clear/table/객체 덤프는 console 기록 한도를 채우므로 남기지 않는다."""
+    kind = str(getattr(msg, "type", "") or "")
+    if kind in ("clear", "table"):
+        return False
+    text = str(getattr(msg, "text", "") or "")
+    return not (kind == "log" and (text == "{}" or text.startswith("[Object")))
+
+
+def _player_frame(page):
+    try:
+        handle = page.query_selector("#player_frame")
+        return handle.content_frame() if handle is not None else None
+    except Exception:
+        return None
+
+
+def _player_state(page) -> dict[str, Any] | None:
+    """플레이어 프레임의 초기화 상태. 읽지 못하면 None."""
+    frame = _player_frame(page)
+    if frame is None:
+        return None
+    try:
+        state = frame.evaluate(_PLAYER_STATE_JS)
+    except Exception:
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _player_storage_state(page) -> dict[str, Any] | None:
+    frame = _player_frame(page)
+    if frame is None:
+        return None
+    try:
+        state = frame.evaluate(_PLAYER_STORAGE_JS)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {mask_text(str(exc))[:200]}"}
+    return state if isinstance(state, dict) else None
+
+
+def _player_phase(state: dict[str, Any]) -> str:
+    """ready: 플레이어가 만들어짐. error: 플레이어가 안내 창을 띄움. loading: 아직 로더. unknown: 알 수 없는 페이지."""
+    if state.get("notice"):
+        return "error"
+    if isinstance(state.get("jw"), dict) or state.get("jw_dom") is True or state.get("videos"):
+        return "ready"
+    if state.get("loader") is True or state.get("sotrym") is True or state.get("jw_lib") is True:
+        return "loading"
+    return "unknown"
+
+
+def _state_brief(state: dict[str, Any]) -> str:
+    jw = state.get("jw")
+    videos = state.get("videos")
+    parts = [
+        f"loader={state.get('loader')}",
+        f"jw={jw.get('state') or '?'}/{jw.get('playlist')}" if isinstance(jw, dict) else "jw=-",
+        f"video={len(videos) if isinstance(videos, list) else '-'}",
+        f"sw={state.get('sw_controller') or '-'}",
+        f"visible={state.get('visibility') or '-'}",
+    ]
+    if state.get("notice"):
+        parts.append(f"notice={str(state['notice'])[:80]}")
+    return " ".join(parts)
+
+
+def _log_player_state(page, event: str, message: str = "", level: str = "INFO",
+                      storage: bool = False, **fields) -> dict[str, Any] | None:
+    """플레이어 상태를 진단 이벤트로 남긴다. 상태를 읽지 못하면 남기지 않는다."""
+    state = _player_state(page)
+    if state is None:
+        return None
+    details: dict[str, Any] = dict(fields, player=state)
+    if storage:
+        details["storage"] = _player_storage_state(page)
+    brief = _state_brief(state)
+    log_event("playback_capture", event, f"{message} ({brief})" if message else brief, level=level, **details)
+    return state
+
+
+def _media_seen(capture) -> int:
+    seen = getattr(capture, "media_seen", 0)
+    return seen if isinstance(seen, int) and not isinstance(seen, bool) else 0
+
+
+def _wait_player_init(page, capture=None, popup_watch: _AdPopupWatch | None = None, cancel_event=None,
+                      reloading: bool = False) -> tuple[str, dict[str, Any] | None, float]:
+    """플레이어가 만들어질 때까지 기다린다. (phase, 마지막 상태, 기다린 초)를 돌려준다.
+
+    reloading 이면 프레임을 다시 불러오는 중이라 상태를 잠시 읽지 못해도 계속 기다린다.
+    """
+    seconds = PLAYER_INIT_WAIT_SECONDS
+    started = time.monotonic()
+    state: dict[str, Any] | None = None
+    while True:
+        waited = time.monotonic() - started
+        if cancel_event is not None and cancel_event.is_set():
+            return "cancelled", state, waited
+        fresh = _player_state(page)
+        if fresh is not None:
+            state = fresh
+            phase = _player_phase(state)
+            # 다시 불러오는 중에는 아직 비어 있는 문서(unknown)도 기다린다.
+            if phase in ("ready", "error") or (phase == "unknown" and not reloading):
+                return phase, state, waited
+        elif not reloading:
+            return "unknown", state, waited
+        if _media_seen(capture) > 0:
+            return "ready", state, waited
+        if waited >= seconds:
+            return (_player_phase(state) if state is not None else "unknown"), state, waited
+        if popup_watch is not None:
+            popup_watch.close()
+        try:
+            page.wait_for_timeout(500)
+        except Exception:
+            return "unknown", state, time.monotonic() - started
+        if capture is not None:
+            capture.attach_frames(page)
+            capture.drain()
+
+
+def _frame_origin(frame) -> str:
+    try:
+        parts = urlsplit(str(getattr(frame, "url", "") or ""))
+    except ValueError:
+        return ""
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme in ("http", "https") and parts.netloc else ""
+
+
+def _find_frame_id(node, url: str) -> str:
+    if not isinstance(node, dict):
+        return ""
+    frame = node.get("frame") or {}
+    if str(frame.get("url") or "") == url.split("#", 1)[0]:
+        return str(frame.get("id") or "")
+    for child in node.get("childFrames") or []:
+        found = _find_frame_id(child, url)
+        if found:
+            return found
+    return ""
+
+
+def _reset_player_storage(page) -> dict[str, Any]:
+    """플레이어 프레임의 저장소(임베드 origin + 글 페이지 site 조합)만 지운다.
+
+    남아 있는 서비스워커·IndexedDB 상태 때문에 플레이어가 로더에서 멈추는 경우를 위한 것이다.
+    쿠키와 다른 사이트의 저장소는 건드리지 않는다. 저장소 키가 플레이어 origin 이 아니면 지우지 않는다.
+    """
+    result: dict[str, Any] = {"ok": False, "method": "", "storage_key": "", "errors": []}
+
+    def note(step: str, exc: Exception) -> None:
+        if len(result["errors"]) < 8:
+            result["errors"].append(f"{step}: {type(exc).__name__}: {mask_text(str(exc))[:160]}")
+
+    frame = _player_frame(page)
+    origin = _frame_origin(frame) if frame is not None else ""
+    if not origin:
+        result["errors"].append("player_frame_missing")
+        return result
+    context = getattr(page, "context", None)
+    sessions: list[Any] = []
+    frame_id = ""
+    try:
+        if context is not None and hasattr(context, "new_cdp_session"):
+            try:
+                own = context.new_cdp_session(frame)
+                sessions.append(own)
+                tree = own.send("Page.getFrameTree") or {}
+                frame_id = str(((tree.get("frameTree") or {}).get("frame") or {}).get("id") or "")
+            except Exception as exc:
+                # 같은 프로세스 iframe 은 별도 세션이 없다. 페이지 세션의 프레임 트리에서 찾는다.
+                note("frame_session", exc)
+            try:
+                top = context.new_cdp_session(page)
+                sessions.append(top)
+                if not frame_id:
+                    tree = top.send("Page.getFrameTree") or {}
+                    for child in (tree.get("frameTree") or {}).get("childFrames") or []:
+                        frame_id = _find_frame_id(child, str(frame.url))
+                        if frame_id:
+                            break
+            except Exception as exc:
+                note("page_session", exc)
+        for session in sessions if frame_id else []:
+            key = ""
+            for method in ("Storage.getStorageKeyForFrame", "Storage.getStorageKey"):
+                try:
+                    key = str((session.send(method, {"frameId": frame_id}) or {}).get("storageKey") or "")
+                except Exception as exc:
+                    note(method, exc)
+                    continue
+                if key:
+                    break
+            if not key:
+                continue
+            if not key.startswith(origin + "/"):
+                result["errors"].append("storage_key_origin_mismatch")
+                continue
+            try:
+                session.send("Storage.clearDataForStorageKey",
+                             {"storageKey": key, "storageTypes": PLAYER_RESET_STORAGE_TYPES})
+            except Exception as exc:
+                note("clear", exc)
+                continue
+            result.update(ok=True, method="cdp", storage_key=key)
+            break
+    finally:
+        for session in sessions:
+            try:
+                session.detach()
+            except Exception:
+                pass
+    if not result["ok"]:
+        try:
+            cleared = frame.evaluate(_CLEAR_PLAYER_STORAGE_JS)
+        except Exception as exc:
+            note("js_clear", exc)
+        else:
+            if isinstance(cleared, dict):
+                result.update(ok=True, method="js", cleared=cleared)
+    return result
+
+
+def _reload_player_frame(page) -> bool:
+    """플레이어 iframe 을 원래 주소로 다시 연다. 프레임이 오류 페이지로 바뀌어 있어도 되돌아온다."""
+    try:
+        return bool(page.evaluate("""() => {
+            const frame = document.getElementById('player_frame');
+            if (!frame) return false;
+            frame.src = frame.src;
+            return true;
+        }"""))
+    except Exception:
+        return False
+
+
+def _ensure_player_initialized(page, capture=None, popup_watch: _AdPopupWatch | None = None,
+                               cancel_event=None) -> dict[str, Any]:
+    """재생 시도 뒤 플레이어가 실제로 만들어졌는지 확인한다.
+
+    로더에서 멈춰 있으면 플레이어 저장소를 지우고 프레임을 한 번 다시 불러온다.
+    status: ready / stuck / error / unknown / cancelled. 상태를 읽을 수 없는 페이지는 unknown 으로 두고 건드리지 않는다.
+    """
+    info: dict[str, Any] = {"status": "unknown", "reset": False}
+    first = _player_state(page)
+    if first is None:
+        return info
+    late = _player_phase(first) == "loading"
+    phase, state, waited = _wait_player_init(page, capture, popup_watch, cancel_event)
+    info.update(status=phase, waited=round(waited, 1), state=state)
+    if phase == "ready":
+        log_event("playback_capture", "player_ready", _state_brief(state or {}),
+                  waited=round(waited, 1), late=late, player=state)
+        jw = (state or {}).get("jw")
+        if late and _media_seen(capture) <= 0 and isinstance(jw, dict) and jw.get("state") == "idle":
+            log("  [플레이어] 초기화가 재생 시도보다 늦게 끝나 재생을 다시 시도합니다.")
+            _prime_embed_player(page, popup_watch, capture)
+        return info
+    if phase == "error":
+        log(f"  [플레이어] 플레이어가 안내 창을 띄웠습니다: {mask_text(str((state or {}).get('notice') or ''))[:160]}")
+        _log_player_state(page, "player_notice", "플레이어가 안내 창을 띄움", level="ERROR", storage=True)
+        return info
+    if phase != "loading":
+        return info
+
+    info["status"] = "stuck"
+    storage = _player_storage_state(page)
+    log(f"  [플레이어] {waited:.0f}초가 지나도 로더에서 멈춰 있습니다 ({_state_brief(state or {})}). "
+        "플레이어 저장소(서비스워커·IndexedDB)를 지우고 다시 불러옵니다.")
+    log_event("playback_capture", "player_init_stuck", f"플레이어가 로더에서 멈춤 ({_state_brief(state or {})})",
+              level="WARNING", waited=round(waited, 1), player=state, storage=storage)
+    reset = _reset_player_storage(page)
+    try:
+        # 서비스워커 삭제가 끝나기 전에 다시 열면 탐색이 오류 페이지로 끝날 수 있다.
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+    reloaded = _reload_player_frame(page)
+    info.update(reset=True, reset_result=reset, before_reset={"player": state, "storage": storage})
+    log(f"  [플레이어] 저장소 초기화: {'성공' if reset.get('ok') else '실패'} "
+        f"(방법 {reset.get('method') or '-'}, 키 {reset.get('storage_key') or '-'}, "
+        f"오류 {' | '.join(reset.get('errors') or []) or '-'}), 다시 불러오기 {'요청함' if reloaded else '실패'}")
+    log_event("playback_capture", "player_storage_reset", "플레이어 저장소를 지우고 프레임을 다시 불러옴",
+              level="WARNING", reset=reset, reloaded=reloaded)
+    if capture is not None:
+        _attach_player_frame(page, capture)
+    phase, state, waited = _wait_player_init(page, capture, popup_watch, cancel_event, reloading=True)
+    if phase == "unknown":
+        # 플레이어 문서가 아니다(탐색 실패 등). 한 번만 더 연다.
+        log_event("playback_capture", "player_reload_retry", "다시 불러온 프레임이 플레이어 문서가 아니어서 한 번 더 엽니다",
+                  level="WARNING", player=state)
+        _reload_player_frame(page)
+        if capture is not None:
+            _attach_player_frame(page, capture)
+        phase, state, waited = _wait_player_init(page, capture, popup_watch, cancel_event, reloading=True)
+    info.update(waited_after_reset=round(waited, 1), state=state)
+    if phase == "ready":
+        info["status"] = "ready"
+        log(f"  [플레이어] 저장소 초기화 후 {waited:.0f}초 만에 플레이어가 만들어졌습니다. 재생을 시도합니다.")
+        log_event("playback_capture", "player_init_recovered", _state_brief(state or {}),
+                  waited=round(waited, 1), player=state)
+        _prime_embed_player(page, popup_watch, capture)
+        return info
+    if phase == "cancelled":
+        info["status"] = "cancelled"
+        return info
+    after = _player_storage_state(page)
+    info["after_reset"] = {"player": state, "storage": after}
+    log(f"  [플레이어] 저장소 초기화 후에도 플레이어가 만들어지지 않았습니다 "
+        f"({phase}, {_state_brief(state or {})}). 로그의 player_init_still_stuck 을 확인하세요.")
+    log_event("playback_capture", "player_init_still_stuck",
+              f"저장소 초기화 후에도 플레이어가 만들어지지 않음 ({phase}, {_state_brief(state or {})})",
+              level="ERROR", waited=round(waited, 1), phase=phase, player=state, storage=after)
+    return info
+
+
 def _open_background_tab(session, url: str) -> str | None:
     """download 페이지를 배경 탭으로 연다. 포커스를 가져오지 않는 쪽을 우선한다."""
     try:
@@ -779,6 +1252,8 @@ def open_download_handoff(
                                 "target_id": existing,
                             }
                         wrapper = context.new_page()
+                        # 재생 탭의 console 오류와 실패한 요청을 browser/ 로그에 남긴다.
+                        attach_page_diagnostics(wrapper, f"handoff:{slug}", console_filter=_keep_console_message)
                         popup_watch = _AdPopupWatch(wrapper)
                         popup_cleanup.callback(popup_watch.stop)
                         if capture_dir and ENABLE_STREAMING_FALLBACK:
@@ -792,6 +1267,8 @@ def open_download_handoff(
                                 + (f" ({tap_error})" if tap_error else "")
                             )
                         embed_host = _open_embed_frame(wrapper, embed_url, article_url)
+                        log_event("playback_capture", "embed_opened", f"임베드를 {embed_host} 위에 열었음",
+                                  page_url=embed_url, embed_host=embed_host)
                         if capture is not None:
                             _attach_player_frame(wrapper, capture)
                         if minimize_window and session is not None:
@@ -804,6 +1281,15 @@ def open_download_handoff(
                                 f"같은 세션 프레임 {getattr(capture, 'frame_attach_skipped', 0)}개"
                             )
                         time.sleep(2.0)
+                    # 플레이어가 로더에서 멈추면 버튼도 미디어 요청도 생기지 않는다. 판정 전에 확인하고 필요하면 되살린다.
+                    try:
+                        player_init = _ensure_player_initialized(wrapper, capture, popup_watch, cancel_event)
+                    except Exception as exc:
+                        # 확인·복구가 실패해도 기존 판정은 그대로 진행한다.
+                        player_init = {"status": "unknown", "reset": False,
+                                       "error": f"{type(exc).__name__}: {mask_text(str(exc))[:200]}"}
+                        log_event("playback_capture", "player_init_check_failed", player_init["error"],
+                                  level="WARNING", page_url=embed_url)
                     decision_ms = max(0, int(timeout_ms))
                     log(f"  [분기] download 버튼은 {decision_ms // 1000}초만 확인합니다.")
                     try:
@@ -821,11 +1307,14 @@ def open_download_handoff(
                                 level="ERROR",
                                 page_url=embed_url,
                             )
+                            _log_player_state(wrapper, "player_state_at_stop", "버튼 없음 판정 시점 플레이어 상태",
+                                              level="WARNING", storage=True, reason="no_download_button")
                             return {
                                 "ok": False,
                                 "no_download_button": True,
                                 "slug": slug,
                                 "download_page": None,
+                                "player_init": player_init,
                                 "reason": reason,
                             }
                         log(f"  [분기] {decision_ms // 1000}초 안에 download 버튼이 없어 스트리밍 다운로드를 유지합니다.")
@@ -836,6 +1325,8 @@ def open_download_handoff(
                             )
                         keep_capture = True
                         playback = capture.summary()
+                        if isinstance(playback, dict):
+                            playback["player_init"] = player_init
                         saved = len((playback or {}).get("files") or [])
                         log(
                             f"  [재생 캡처] download 버튼 없음. "
@@ -861,6 +1352,7 @@ def open_download_handoff(
                             "slug": slug,
                             "download_page": None,
                             "playback": playback,
+                            "player_init": player_init,
                             "reason": "임베드에 download 버튼이 없습니다",
                         }
                     player_ready = True

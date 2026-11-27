@@ -92,6 +92,16 @@ def diagnose(d: RunData) -> list[str]:
     n_fail = len(d.lines("browser/request_failures.jsonl"))
     if n_fail >= 10:
         hints.append(f"브라우저 요청 실패 {n_fail}건: 네트워크/프록시/차단 확인 (browser/request_failures.jsonl)")
+    player_events = {e.get("event") for e in d.jsonl("events.jsonl") if e.get("stage") == "playback_capture"}
+    if "player_init_still_stuck" in player_events:
+        hints.append("재생 탭 플레이어가 저장소 초기화 후에도 로더에서 멈춤: events.jsonl 의 player_init_still_stuck 의 "
+                     "player/storage(sw_registrations, idb_open) 와 browser/console.log 의 handoff: 줄 확인. "
+                     "9222 Chrome 의 chrome://serviceworker-internals, chrome://indexeddb-internals 도 확인")
+    elif "player_init_recovered" in player_events:
+        hints.append("재생 탭 플레이어가 로더에서 멈췄다가 저장소 초기화로 복구됨(player_storage_reset). "
+                     "반복되면 9222 Chrome 프로필의 해당 사이트 데이터를 정리")
+    if "player_notice" in player_events:
+        hints.append("재생 탭 플레이어가 안내 창을 띄움: events.jsonl 의 player_notice 의 notice 문구 확인")
     return hints
 
 
