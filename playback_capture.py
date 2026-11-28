@@ -127,6 +127,7 @@ def should_save_media(
 
 
 _BYTE_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
+_REQUEST_RANGE_RE = re.compile(r"bytes\s*=\s*(\d+)-(\d*)", re.IGNORECASE)
 
 
 def parse_byte_range(value: str) -> tuple[int, int, int | None] | None:
@@ -139,6 +140,16 @@ def parse_byte_range(value: str) -> tuple[int, int, int | None] | None:
         return None
     total = None if match.group(3) == "*" else int(match.group(3))
     return start, end, total
+
+
+def parse_request_range(value: str) -> tuple[int, int | None] | None:
+    """Request Range 헤더(bytes=start-end)를 반열림 구간 [start, end)로 해석한다."""
+    match = _REQUEST_RANGE_RE.search(value or "")
+    if not match:
+        return None
+    start = int(match.group(1))
+    end = int(match.group(2)) + 1 if match.group(2) else None
+    return start, end
 
 
 def request_range_from_response(value: str) -> str:
@@ -245,6 +256,13 @@ def media_group_key(url: str, total: int | None = None, content_type: str = "") 
     if total:
         return f"{stem}|{total}"
     return stem
+
+
+def media_stem(url: str) -> str:
+    """URL에서 토큰·쿼리를 제외한 파일명 stem만 반환한다. 그룹 병합 판단에 사용."""
+    path = urlsplit(url).path
+    name = Path(path).name or "media"
+    return _NAME_RE.sub("_", name).strip("._")[:80] or "media"
 
 
 def saved_media_name(url: str, index: int, content_range: str = "") -> str:
@@ -370,6 +388,8 @@ class PlaybackCapture:
         self._browser_fallback_failed = False
         self._untracked_media: list[str] = []
         self._player_reloaded = False
+        self._aborted_gaps: list[tuple[str, int, int]] = []
+        self._captured_headers: dict[str, dict[str, str]] = {}
         self.expected_total = 0
         self.capture_errors: list[str] = []
         self._pending_frames: list[Any] = []
@@ -702,6 +722,42 @@ class PlaybackCapture:
             if group["status"] != 200:
                 group["status"] = status
                 group["item"] = item
+        # 동일 stem(파일명)을 가진 그룹들을 병합한다 (토큰 변경/total 불일치 보정).
+        # 단, 광고 등 크기가 현저히 다른 파일(예: 1MB vs 500MB)은 오병합되지 않도록
+        # total이 없거나, 유사한(>=90%) 크기일 때만 합친다.
+        merged_groups: list[dict[str, Any]] = []
+        for grp in groups.values():
+            stem = media_stem(grp["url"])
+            t = grp.get("total") or 0
+            matched = None
+            for candidate in merged_groups:
+                c_stem = media_stem(candidate["url"])
+                if c_stem != stem:
+                    continue
+                c_t = candidate.get("total") or 0
+                if t == 0 or c_t == 0 or (min(t, c_t) / max(t, c_t) >= 0.9):
+                    matched = candidate
+                    break
+            if matched is None:
+                merged_groups.append(grp)
+            else:
+                c_t = matched.get("total") or 0
+                if t > c_t:
+                    matched["total"] = grp["total"]
+                    matched["key"] = grp["key"]
+                    matched["url"] = grp["url"]
+                matched["urls"].update(grp.get("urls", set()))
+                matched["spans"].extend(grp.get("spans", []))
+                matched["file_spans"].extend(grp.get("file_spans", []))
+                matched["size"] += grp.get("size", 0)
+                matched["items"].extend(grp.get("items", []))
+                if grp.get("status") == 200:
+                    matched["status"] = 200
+                elif matched.get("status") != 200 and grp.get("status"):
+                    matched["status"] = grp["status"]
+                if grp.get("pending") and not matched.get("pending"):
+                    matched["pending"] = True
+        groups = {g["key"]: g for g in merged_groups}
         extra = {
             "stream_bytes": self.stream_bytes,
             "expected_total": self.expected_total,
@@ -710,7 +766,7 @@ class PlaybackCapture:
         }
         if not groups:
             return {"complete": False, "covered": 0, "total": 0, "gap_ratio": None,
-                    "file_count": 0, "url": "", "group_key": "", "gaps": [], **extra}
+                    "file_count": 0, "url": "", "group_key": "", "gaps": [], "urls": [], "aborted_gaps": list(self._aborted_gaps), **extra}
         def rank(group: dict[str, Any]) -> tuple[int, int]:
             return int(group["total"] or 0), int(group["size"] or 0)
         target_key, group = max(groups.items(), key=lambda pair: rank(pair[1]))
@@ -737,12 +793,14 @@ class PlaybackCapture:
             "gap_ratio": gap_ratio,
             "file_count": len(files),
             "url": group["url"],
+            "urls": list(group.get("urls", [])),
             "group_key": target_key,
             "gaps": gaps,
+            "aborted_gaps": list(self._aborted_gaps),
             **extra,
         }
 
-    def fill_gaps(self) -> int:
+    def fill_gaps(self, max_bytes: int = 50 * 1024 * 1024) -> int:
         """가장 유력한 본편 그룹에 누락된 구간이 있으면 직접 Range 요청으로 채운다."""
         progress = self.media_progress()
         total = int(progress.get("total") or 0)
@@ -750,17 +808,48 @@ class PlaybackCapture:
         if not total or not url or progress.get("complete"):
             return 0
         gaps = progress.get("gaps") or []
+        if not gaps:
+            return 0
+
+        candidate_urls = [url]
+        for u in progress.get("urls") or []:
+            if u not in candidate_urls:
+                candidate_urls.append(u)
+
+        CHUNK_LIMIT = 10 * 1024 * 1024
         filled = 0
+        total_filled = 0
+
         for start, end in gaps:
+            if total_filled >= max_bytes:
+                break
             gap_len = end - start
-            if gap_len <= 0 or gap_len > 10 * 1024 * 1024:
+            if gap_len <= 0:
                 continue
-            content_range = f"bytes {start}-{end - 1}/{total}"
-            body = self._fetch_media_direct(url, content_range)
-            if body and len(body) == gap_len:
-                self._store(url, 206, "video/mp4", content_range, f"bytes={start}-{end - 1}", body, "media")
-                filled += 1
-                log(f"  [재생 패킷 복원] 누락된 구간({start}-{end - 1}, {gap_len} bytes)을 직접 수신하여 복원했습니다.")
+
+            sub_start = start
+            while sub_start < end and total_filled < max_bytes:
+                sub_end = min(sub_start + CHUNK_LIMIT, end)
+                sub_len = sub_end - sub_start
+                content_range = f"bytes {sub_start}-{sub_end - 1}/{total}"
+
+                body = b""
+                success_url = ""
+                for try_url in candidate_urls:
+                    body = self._fetch_media_direct(try_url, content_range)
+                    if body and len(body) == sub_len:
+                        success_url = try_url
+                        break
+
+                if body and len(body) == sub_len:
+                    self._store(success_url, 206, "video/mp4", content_range, f"bytes={sub_start}-{sub_end - 1}", body, "media")
+                    filled += 1
+                    total_filled += len(body)
+                    log(f"  [재생 패킷 복원] 누락 구간({sub_start}-{sub_end - 1}, {sub_len} bytes) 직접 수신 완료")
+                    sub_start = sub_end
+                else:
+                    break
+
         return filled
 
     def observed_media_urls(self) -> list[str]:
@@ -777,7 +866,9 @@ class PlaybackCapture:
             return None
         target_key = progress.get("group_key")
         total = int(progress["total"] or 0)
-        url = progress["url"]
+        url = progress.get("url") or ""
+        target_urls = set(progress.get("urls") or ([url] if url else []))
+        target_stem = media_stem(url) if url else ""
         pieces = []
         direct = None
         with self._io_lock:
@@ -787,7 +878,15 @@ class PlaybackCapture:
             parsed = parse_byte_range(str(item.get("content_range") or ""))
             p_total = parsed[2] if parsed and parsed[2] else None
             key = media_group_key(p_url, p_total, str(item.get("content_type") or ""))
-            if target_key and key != target_key:
+            is_match = False
+            if target_key and key == target_key:
+                is_match = True
+            elif p_url in target_urls:
+                is_match = True
+            elif target_stem and media_stem(p_url) == target_stem:
+                if not p_total or not total or (min(p_total, total) / max(p_total, total) >= 0.9):
+                    is_match = True
+            if not is_match:
                 continue
             if int(item.get("status") or 0) == 200:
                 direct = item
@@ -903,6 +1002,7 @@ class PlaybackCapture:
             "last_range_received": self.last_range_received,
             "chunks_attempted": self.chunks_attempted,
             "chunks_saved": len(self.files),
+            "aborted_gaps": len(self._aborted_gaps),
             "bytes": sum(item["size"] for item in self.files),
             "covered": progress["covered"],
             "total": progress["total"],
@@ -1101,6 +1201,8 @@ class PlaybackCapture:
         slot["fragment"] = str(request.get("urlFragment") or "")
         slot["resource_type"] = _cdp_resource_type(str(event.get("type") or slot.get("resource_type") or ""))
         slot["headers"] = dict(headers or {})
+        if isinstance(headers, dict) and headers:
+            self._captured_headers[url] = dict(headers)
         if (slot["method"] != "OPTIONS" and slot["resource_type"] != "preflight"
                 and looks_like_playback_request(url, slot["resource_type"], headers)):
             self._trace("cdp_request", session_id=sid, request_id=request_id, url=mask_url(url),
@@ -1427,6 +1529,13 @@ class PlaybackCapture:
             return body
 
         headers_to_try: list[dict[str, str]] = []
+        captured = self._captured_headers.get(url) or {}
+        if captured:
+            h_captured = {k: v for k, v in captured.items() if k.lower() not in ("content-length", "host", "accept-encoding")}
+            if range_header:
+                h_captured["Range"] = range_header
+            headers_to_try.append(h_captured)
+
         h_clean = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "*/*",
@@ -1775,8 +1884,35 @@ class PlaybackCapture:
                 status = 206
             else:
                 chunk = b""
+        saved = False
+        saved_bytes = 0
         if chunk and should_save_media(url, status or 206, ctype, chunk, resource_type):
             self._store(url, status or 206, ctype, content_range, request_range, chunk, resource_type)
+            saved = True
+            saved_bytes = len(chunk)
+
+        is_aborted = bool(event.get("canceled")) or "net::ERR_ABORTED" in str(event.get("errorText") or "")
+        if is_aborted and looks_like_playback_request(url, resource_type, {"range": request_range}):
+            parsed = parse_byte_range(content_range)
+            if parsed is not None:
+                req_start, req_end, _ = parsed
+            else:
+                parsed_req = parse_request_range(request_range)
+                req_start = parsed_req[0] if parsed_req else 0
+                req_end = parsed_req[1] if parsed_req and parsed_req[1] else (self.expected_total or None)
+
+            miss_start = (req_start or 0) + saved_bytes
+            miss_end = req_end
+            if miss_end is not None and miss_end > miss_start:
+                gap = (url, miss_start, miss_end)
+                if gap not in self._aborted_gaps:
+                    self._aborted_gaps.append(gap)
+                self._uncaptured.append(gap)
+                self._trace("cdp_aborted_gap", session_id=sid, failed_request_id=request_id, url=mask_url(url),
+                            missing_start=miss_start, missing_end=miss_end, saved_bytes=saved_bytes)
+                log(f"  [재생 캡처] 스트림 중단(ERR_ABORTED) 감지: 미수신 구간({miss_start}-{miss_end - 1}) 갭으로 추적")
+
+        if saved:
             self._cdp_meta.pop(key, None)
             return
         if slot.get("deferred"):

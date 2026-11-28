@@ -684,6 +684,7 @@ def _capture_until_full(
     last_log = 0.0
     last_duration_check = float("-inf")
     last_ended_check = 0.0
+    last_gap_fill = 0.0
     last_pause_check = float("-inf")
     paused_for_direct = False
     # 이 탭을 앞으로 가져오면 다른 재생 탭이 백그라운드로 내려가 요청이 멈출 수 있다.
@@ -765,6 +766,22 @@ def _capture_until_full(
                     log(f"  [재생 캡처] 브라우저 재생 종료 감지: 본편 수신 완료({c_covered}/{c_total} bytes)")
                     capture.stop_reason = "complete"
                     return
+
+        # 30초 이상 패킷 수신이 정체되었을 때 능동적으로 갭 복원 시도
+        if total > 0 and quiet >= 30.0 and now - last_gap_fill >= 20.0 and not progress.get("complete"):
+            last_gap_fill = now
+            if hasattr(capture, "fill_gaps"):
+                log("  [재생 캡처] 패킷 수신 정체 감지 (30s+): 누락된 구간(갭) 복원을 시도합니다...")
+                filled = capture.fill_gaps()
+                if filled:
+                    progress = capture.media_progress()
+                    c_covered = int(progress.get("covered") or 0)
+                    c_total = int(progress.get("total") or 0)
+                    if progress.get("complete") or (c_total and c_covered / c_total >= 0.99):
+                        log(f"  [재생 캡처] 갭 복원 성공: 본편 수신 완료({c_covered}/{c_total} bytes)")
+                        capture.stop_reason = "complete"
+                        return
+
         reason = streaming_stop_reason(
             quiet=quiet,
             complete=bool(progress.get("complete")),
@@ -781,6 +798,16 @@ def _capture_until_full(
             capture.stop_reason = reason
             return
         if reason:
+            if reason in ("stalled", "media_unreadable") and hasattr(capture, "fill_gaps") and not progress.get("complete"):
+                log(f"  [재생 캡처] 중단({reason}) 전 최종 갭 복원을 시도합니다...")
+                capture.fill_gaps()
+                progress = capture.media_progress()
+                c_covered = int(progress.get("covered") or 0)
+                c_total = int(progress.get("total") or 0)
+                if progress.get("complete") or (c_total and c_covered / c_total >= 0.99):
+                    log(f"  [재생 캡처] 최종 갭 복원 성공: 본편 수신 완료({c_covered}/{c_total} bytes)")
+                    capture.stop_reason = "complete"
+                    return
             capture.stop_reason = reason
             errors = " | ".join(progress.get("errors") or []) or getattr(capture, "cache_error", "") or "-"
             log(
@@ -831,6 +858,12 @@ def _capture_until_full(
                 iteration_seconds=round(iteration, 1), drain_seconds=round(drain_seconds, 1),
                 direct_state=direct_state if isinstance(direct_state, str) else "",
             )
+    if hasattr(capture, "fill_gaps") and not capture.media_progress().get("complete"):
+        capture.fill_gaps()
+        if capture.media_progress().get("complete"):
+            capture.stop_reason = "complete"
+            log("  [재생 캡처] 최종 갭 복원으로 본편 수신 완료")
+            return
     capture.stop_reason = getattr(capture, "stop_reason", "") or "limit"
     log("  [재생 캡처] 최대 대기 시간에 도달해 중단")
 

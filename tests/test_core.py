@@ -1367,6 +1367,73 @@ class StreamingDurationTests(unittest.TestCase):
             reloaded = HistoryManager(root / "history")
             self.assertTrue(reloaded.is_downloaded("https://article.test/movie"))
 
+    def test_media_group_key_merges_chunks_with_same_stem_and_token_changes(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            url1 = "https://storage.googleapis.com/mediastorage/111/tokenA/876845093.mp4"
+            url2 = "https://storage.googleapis.com/mediastorage/222/tokenB/876845093.mp4"
+            capture._store(url1, 206, "video/mp4", "bytes 0-4/10", "bytes=0-", b"12345", "media")
+            capture._store(url2, 206, "video/mp4", "bytes 5-9/10", "bytes=5-", b"67890", "media")
+            progress = capture.media_progress()
+            self.assertTrue(progress["complete"])
+            self.assertEqual(progress["covered"], 10)
+            self.assertEqual(progress["total"], 10)
+            assembled = capture.assemble()
+            self.assertIsNotNone(assembled)
+            self.assertEqual(Path(assembled["path"]).read_bytes(), b"1234567890")
+
+    def test_media_group_key_does_not_merge_unrelated_media_with_different_sizes(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            url_ad = "https://ad.test/video.mp4"
+            url_main = "https://cdn.test/video.mp4"
+            capture._store(url_ad, 206, "video/mp4", "bytes 0-99/100", "bytes=0-", b"A" * 100, "media")
+            capture._store(url_main, 206, "video/mp4", "bytes 0-99999/1000000", "bytes=0-", b"B" * 100000, "media")
+            progress = capture.media_progress()
+            self.assertEqual(progress["total"], 1000000)
+            self.assertEqual(progress["covered"], 100000)
+            self.assertFalse(progress["complete"])
+
+    def test_err_aborted_tracks_missing_range_in_aborted_gaps(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            url = "https://cdn.test/video.mp4"
+            capture._on_cdp_request(1, {
+                "requestId": "1", "type": "Media",
+                "request": {"url": url, "headers": {"Range": "bytes=0-"}},
+            })
+            capture._on_cdp_response(1, {
+                "requestId": "1", "type": "Media",
+                "response": {"url": url, "status": 206, "mimeType": "video/mp4",
+                             "headers": {"content-range": "bytes 0-99/100"}},
+            })
+            capture._on_cdp_failed(1, {
+                "requestId": "1", "errorText": "net::ERR_ABORTED", "canceled": True,
+            })
+            self.assertEqual(capture._aborted_gaps, [(url, 0, 100)])
+            self.assertIn((url, 0, 100), capture._uncaptured)
+
+    def test_fill_gaps_recovers_missing_chunks_and_completes(self):
+        import playback_capture
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = playback_capture.PlaybackCapture(Path(directory))
+            url = "https://cdn.test/video.mp4"
+            capture._store(url, 206, "video/mp4", "bytes 0-4/10", "bytes=0-", b"01234", "media")
+            self.assertFalse(capture.media_progress()["complete"])
+            with mock.patch.object(capture, "_fetch_media_direct", return_value=b"56789") as fetch:
+                filled = capture.fill_gaps()
+            self.assertEqual(filled, 1)
+            progress = capture.media_progress()
+            self.assertTrue(progress["complete"])
+            self.assertEqual(progress["covered"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()
