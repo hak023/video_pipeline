@@ -1434,6 +1434,64 @@ class StreamingDurationTests(unittest.TestCase):
             self.assertTrue(progress["complete"])
             self.assertEqual(progress["covered"], 10)
 
+    def test_player_quality_lock_script_and_helper(self):
+        import openx_handoff
+
+        self.assertIn("getQualityLevels", openx_handoff._PRIME_PLAYER_JS)
+        self.assertIn("setCurrentQuality", openx_handoff._PRIME_PLAYER_JS)
+        self.assertIn("autoLevelEnabled", openx_handoff._PRIME_PLAYER_JS)
+
+        page = mock.Mock()
+        page.is_closed.return_value = False
+        frame = mock.Mock()
+        frame.evaluate.return_value = True
+        handle = mock.Mock()
+        handle.content_frame.return_value = frame
+        page.query_selector.return_value = handle
+        page.frames = [frame]
+        page.main_frame = mock.Mock()
+
+        locked = openx_handoff._lock_highest_quality(page)
+        self.assertTrue(locked)
+        frame.evaluate.assert_called()
+
+    def test_seek_player_to_gap_calculates_correct_timestamp(self):
+        import openx_handoff
+
+        page = mock.Mock()
+        page.is_closed.return_value = False
+        frame = mock.Mock()
+        evaluated_args = []
+
+        def eval_fn(script, *args):
+            evaluated_args.extend(args)
+            return True
+
+        frame.evaluate.side_effect = eval_fn
+        handle = mock.Mock()
+        handle.content_frame.return_value = frame
+        page.query_selector.return_value = handle
+        page.frames = [frame]
+        page.main_frame = mock.Mock()
+
+        capture = mock.Mock()
+        capture.media_progress.return_value = {
+            "total": 1000,
+            "covered": 500,
+            "gaps": [(500, 1000)],
+        }
+        capture.video_duration = 100.0
+
+        # target_time = max(0.0, (500 / 1000) * 100.0 - 1.0) = 49.0
+        seeked = openx_handoff._seek_player_to_gap(page, capture)
+        self.assertTrue(seeked)
+        self.assertEqual(len(evaluated_args), 1)
+        self.assertAlmostEqual(evaluated_args[0], 49.0)
+
+        # 갭이 없는 경우 seek하지 않음
+        capture.media_progress.return_value = {"total": 1000, "covered": 1000, "gaps": []}
+        self.assertFalse(openx_handoff._seek_player_to_gap(page, capture))
+
 
 if __name__ == "__main__":
     unittest.main()

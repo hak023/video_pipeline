@@ -226,9 +226,54 @@ _PRIME_PLAYER_JS = """() => {
         }
     } catch (e) {}
     try {
+        if (typeof localStorage !== 'undefined') {
+            try { localStorage.setItem('jwplayer.quality', '1080p'); } catch (e) {}
+        }
+    } catch (e) {}
+    try {
         if (typeof jwplayer === 'function') {
             const jw = jwplayer();
             if (jw && typeof jw.play === 'function') { jw.play(); n++; }
+            if (jw && typeof jw.getQualityLevels === 'function' && typeof jw.setCurrentQuality === 'function') {
+                const pickBest = (levels) => {
+                    if (!Array.isArray(levels) || !levels.length) return -1;
+                    let bestIdx = -1, maxH = -1;
+                    for (let i = 0; i < levels.length; i++) {
+                        const lvl = levels[i] || {};
+                        if (/auto/i.test(lvl.label || '')) continue;
+                        const h = Number(lvl.height || lvl.width || 0) || (parseInt(lvl.label) || 0);
+                        if (h > maxH) { maxH = h; bestIdx = i; }
+                    }
+                    return bestIdx >= 0 ? bestIdx : 0;
+                };
+                const levels = jw.getQualityLevels() || [];
+                const best = pickBest(levels);
+                if (best >= 0) { jw.setCurrentQuality(best); n++; }
+                if (typeof jw.on === 'function' && !jw._quality_locked) {
+                    jw._quality_locked = true;
+                    jw.on('levels', (e) => {
+                        const lvls = (e && e.levels) || (jw.getQualityLevels && jw.getQualityLevels()) || [];
+                        const b = pickBest(lvls);
+                        if (b >= 0 && typeof jw.setCurrentQuality === 'function') jw.setCurrentQuality(b);
+                    });
+                    jw.on('levelsChanged', (e) => {
+                        const lvls = jw.getQualityLevels ? jw.getQualityLevels() : [];
+                        const b = pickBest(lvls);
+                        if (b >= 0 && e && e.currentQuality !== b && typeof jw.setCurrentQuality === 'function') {
+                            jw.setCurrentQuality(b);
+                        }
+                    });
+                }
+            }
+        }
+    } catch (e) {}
+    try {
+        if (typeof window !== 'undefined' && window.hls) {
+            window.hls.autoLevelEnabled = false;
+            if (Array.isArray(window.hls.levels) && window.hls.levels.length > 0) {
+                window.hls.currentLevel = window.hls.levels.length - 1;
+                n++;
+            }
         }
     } catch (e) {}
     document.querySelectorAll('video').forEach(v => {
@@ -635,6 +680,137 @@ def _player_playback_ended(page) -> bool:
         return False
 
 
+def _lock_highest_quality(page) -> bool:
+    """플레이어(JWPlayer, Hls.js 등)의 화질을 최고 화질로 고정하여 버퍼링 시 저화질 다운그레이드를 방지한다."""
+    try:
+        if page.is_closed():
+            return False
+        frames = []
+        handle = page.query_selector("#player_frame")
+        player_fr = handle.content_frame() if handle is not None else None
+        if player_fr is not None:
+            frames.append(player_fr)
+        for fr in getattr(page, "frames", []):
+            if fr not in frames and fr != getattr(page, "main_frame", None):
+                frames.append(fr)
+        locked = False
+        for fr in frames:
+            try:
+                res = fr.evaluate("""() => {
+                    let ok = false;
+                    try {
+                        if (typeof localStorage !== 'undefined') {
+                            localStorage.setItem('jwplayer.quality', '1080p');
+                        }
+                    } catch (e) {}
+                    try {
+                        if (typeof jwplayer === 'function') {
+                            const jw = jwplayer();
+                            if (jw && typeof jw.getQualityLevels === 'function' && typeof jw.setCurrentQuality === 'function') {
+                                const levels = jw.getQualityLevels() || [];
+                                let bestIdx = -1, maxH = -1;
+                                for (let i = 0; i < levels.length; i++) {
+                                    const lvl = levels[i] || {};
+                                    if (/auto/i.test(lvl.label || '')) continue;
+                                    const h = Number(lvl.height || lvl.width || 0) || (parseInt(lvl.label) || 0);
+                                    if (h > maxH) { maxH = h; bestIdx = i; }
+                                }
+                                if (bestIdx >= 0) {
+                                    jw.setCurrentQuality(bestIdx);
+                                    ok = true;
+                                }
+                            }
+                        }
+                    } catch (e) {}
+                    try {
+                        if (typeof window !== 'undefined' && window.hls) {
+                            window.hls.autoLevelEnabled = false;
+                            if (Array.isArray(window.hls.levels) && window.hls.levels.length > 0) {
+                                window.hls.currentLevel = window.hls.levels.length - 1;
+                                ok = true;
+                            }
+                        }
+                    } catch (e) {}
+                    return ok;
+                }""")
+                if res:
+                    locked = True
+            except Exception:
+                continue
+        return locked
+    except Exception:
+        return False
+
+
+def _seek_player_to_gap(page, capture) -> bool:
+    """누락된 갭이 있을 때 브라우저 플레이어의 재생 위치를 갭 시작 위치로 점프시켜 브라우저 Range 재수신을 유도한다."""
+    try:
+        if page.is_closed():
+            return False
+        progress = capture.media_progress()
+        total = int(progress.get("total") or 0)
+        gaps = progress.get("gaps") or []
+        if not total or not gaps:
+            return False
+
+        duration = getattr(capture, "video_duration", None)
+        if duration is None or duration <= 0:
+            duration = _player_duration(page, capture)
+            if duration is not None:
+                capture.video_duration = duration
+        if not duration or duration <= 0:
+            return False
+
+        gap_start, gap_end = gaps[0]
+        # 비트레이트 기준 시간(초) 환산, 재생 프리롤을 위해 1.0초 앞선 위치로 seek
+        target_time = max(0.0, (gap_start / total) * duration - 1.0)
+
+        handle = page.query_selector("#player_frame")
+        player_fr = handle.content_frame() if handle is not None else None
+        target_frames = []
+        if player_fr is not None:
+            target_frames.append(player_fr)
+        for fr in getattr(page, "frames", []):
+            if fr not in target_frames and fr != getattr(page, "main_frame", None):
+                target_frames.append(fr)
+
+        seeked = False
+        for fr in target_frames:
+            try:
+                res = fr.evaluate("""(targetTime) => {
+                    let done = false;
+                    try {
+                        if (typeof jwplayer === 'function') {
+                            const jw = jwplayer();
+                            if (jw && typeof jw.seek === 'function') {
+                                jw.seek(targetTime);
+                                if (typeof jw.play === 'function') jw.play();
+                                done = true;
+                            }
+                        }
+                    } catch (e) {}
+                    document.querySelectorAll('video').forEach(v => {
+                        try {
+                            v.currentTime = targetTime;
+                            const p = v.play();
+                            if (p && p.catch) p.catch(() => {});
+                            done = true;
+                        } catch (e) {}
+                    });
+                    return done;
+                }""", target_time)
+                if res:
+                    seeked = True
+            except Exception:
+                continue
+        if seeked:
+            log(f"  [재생 캡처] 누락 갭({gap_start:,}~{gap_end:,}) 브라우저 재수신 유도: {target_time:.1f}초 지점으로 seek")
+        return seeked
+    except Exception as exc:
+        log_event("playback_capture", "seek_to_gap_failed", mask_text(str(exc)), level="WARNING")
+        return False
+
+
 def _pause_player_for_direct(page, capture, url: str) -> int:
     """직접 다운로드가 같은 파일을 받는 동안 브라우저 재생을 멈춘다.
 
@@ -685,8 +861,12 @@ def _capture_until_full(
     last_duration_check = float("-inf")
     last_ended_check = 0.0
     last_gap_fill = 0.0
+    last_gap_seek = float("-inf")
+    last_quality_lock = float("-inf")
     last_pause_check = float("-inf")
     paused_for_direct = False
+    seek_attempts = 0
+    max_seek_attempts = 5
     # 이 탭을 앞으로 가져오면 다른 재생 탭이 백그라운드로 내려가 요청이 멈출 수 있다.
     log("  [재생 캡처] 다른 재생 탭을 멈추지 않도록 이 탭을 앞으로 가져오지 않습니다.")
     while time.monotonic() < deadline:
@@ -697,6 +877,9 @@ def _capture_until_full(
             return
         if popup_watch is not None:
             popup_watch.close()
+        if now - last_quality_lock >= 15.0:
+            last_quality_lock = now
+            _lock_highest_quality(page)
         if max_duration_seconds > 0 and now - last_duration_check >= DURATION_CHECK_SECONDS:
             last_duration_check = now
             duration = _player_duration(page, capture)
@@ -766,6 +949,12 @@ def _capture_until_full(
                     log(f"  [재생 캡처] 브라우저 재생 종료 감지: 본편 수신 완료({c_covered}/{c_total} bytes)")
                     capture.stop_reason = "complete"
                     return
+                # 재생이 끝났으나 누락된 갭이 있으면 브라우저 Seek으로 해당 구간 재수신 유도
+                if progress.get("gaps") and seek_attempts < max_seek_attempts and now - last_gap_seek >= 10.0:
+                    last_gap_seek = now
+                    seek_attempts += 1
+                    if _seek_player_to_gap(page, capture):
+                        quiet_since = now
 
         # 30초 이상 패킷 수신이 정체되었을 때 능동적으로 갭 복원 시도
         if total > 0 and quiet >= 30.0 and now - last_gap_fill >= 20.0 and not progress.get("complete"):
@@ -781,6 +970,12 @@ def _capture_until_full(
                         log(f"  [재생 캡처] 갭 복원 성공: 본편 수신 완료({c_covered}/{c_total} bytes)")
                         capture.stop_reason = "complete"
                         return
+            # 파이썬 직접 Range 요청이 실패(403 등)했거나 갭이 남아있을 때 브라우저 Seek으로 재수신 유도
+            if not progress.get("complete") and progress.get("gaps") and seek_attempts < max_seek_attempts and now - last_gap_seek >= 15.0:
+                last_gap_seek = now
+                seek_attempts += 1
+                if _seek_player_to_gap(page, capture):
+                    quiet_since = now
 
         reason = streaming_stop_reason(
             quiet=quiet,
@@ -798,9 +993,10 @@ def _capture_until_full(
             capture.stop_reason = reason
             return
         if reason:
-            if reason in ("stalled", "media_unreadable") and hasattr(capture, "fill_gaps") and not progress.get("complete"):
-                log(f"  [재생 캡처] 중단({reason}) 전 최종 갭 복원을 시도합니다...")
-                capture.fill_gaps()
+            if reason in ("stalled", "media_unreadable") and not progress.get("complete"):
+                if hasattr(capture, "fill_gaps"):
+                    log(f"  [재생 캡처] 중단({reason}) 전 최종 갭 복원을 시도합니다...")
+                    capture.fill_gaps()
                 progress = capture.media_progress()
                 c_covered = int(progress.get("covered") or 0)
                 c_total = int(progress.get("total") or 0)
@@ -808,6 +1004,13 @@ def _capture_until_full(
                     log(f"  [재생 캡처] 최종 갭 복원 성공: 본편 수신 완료({c_covered}/{c_total} bytes)")
                     capture.stop_reason = "complete"
                     return
+                # 중단 전 브라우저 Seek을 통한 마지막 재수신 시도
+                if progress.get("gaps") and seek_attempts < max_seek_attempts:
+                    seek_attempts += 1
+                    last_gap_seek = now
+                    if _seek_player_to_gap(page, capture):
+                        quiet_since = now
+                        continue
             capture.stop_reason = reason
             errors = " | ".join(progress.get("errors") or []) or getattr(capture, "cache_error", "") or "-"
             log(
